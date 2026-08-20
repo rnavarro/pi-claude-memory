@@ -1,0 +1,145 @@
+// Quick smoke test against the real Claude Code memory corpus
+// Run: node --import tsx test/smoke.test.ts
+
+import { existsSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { parseMemoryContent } from "../src/frontmatter.js";
+import { parseIndexContent } from "../src/index-parser.js";
+import { buildMemoryInjection } from "../src/injector.js";
+import { encodePath, resolveMemoryDirs } from "../src/resolver.js";
+
+const APP_CWD = "/home/user/workspace/my-app";
+const OTHER_CWD = "/home/user/workspace/other-project";
+const UNKNOWN_CWD = "/home/user/workspace/nonexistent-project";
+
+describe("resolver", () => {
+  it("encodes paths the way Claude Code does", () => {
+    expect(encodePath(APP_CWD)).toBe("-home-user-workspace-my-app");
+    expect(encodePath("/home/user/workspace/foo-bar")).toBe(
+      "-home-user-workspace-foo-bar",
+    );
+  });
+
+  it("resolves my-app project memory", () => {
+    const result = resolveMemoryDirs(APP_CWD);
+    expect(result.project).not.toBeNull();
+    expect(result.project?.tier).toBe("project");
+    expect(result.project?.dir).toContain("my-app");
+    expect(existsSync(result.project?.indexPath)).toBe(true);
+  });
+
+  it("resolves other-project (root-level MEMORY.md anomaly)", () => {
+    const result = resolveMemoryDirs(OTHER_CWD);
+    expect(result.project).not.toBeNull();
+    expect(existsSync(result.project?.indexPath)).toBe(true);
+  });
+
+  it("resolves global memory", () => {
+    const result = resolveMemoryDirs(APP_CWD);
+    expect(result.global).not.toBeNull();
+    expect(result.global?.dir).toContain(".claude/memory");
+  });
+
+  it("returns null project for unknown cwd", () => {
+    const result = resolveMemoryDirs(UNKNOWN_CWD);
+    expect(result.project).toBeNull();
+  });
+});
+
+describe("frontmatter", () => {
+  it("parses gen 1 (flat top-level type)", () => {
+    const content = `---
+name: Prefer jq for JSON
+description: Use jq for JSON processing
+type: feedback
+---
+
+Use \`jq\` for JSON parsing.`;
+    const parsed = parseMemoryContent(content, "feedback_prefer_jq.md", Date.now());
+    expect(parsed.name).toBe("Prefer jq for JSON");
+    expect(parsed.type).toBe("feedback");
+    expect(parsed.hasFrontmatter).toBe(true);
+    expect(parsed.body).toContain("Use `jq`");
+  });
+
+  it("parses gen 2 (nested metadata)", () => {
+    const content = `---
+name: never-push-to-the-default-branch
+description: "The default branch is protected"
+metadata:
+  node_type: memory
+  type: feedback
+  originSessionId: b203f5ed-2fbd-4995-805c-f0f8ca9e7fea
+  modified: 2026-08-11T01:17:02.742Z
+---
+
+NEVER push directly.`;
+    const parsed = parseMemoryContent(content, "feedback_never_push_master.md", Date.now());
+    expect(parsed.name).toBe("never-push-to-the-default-branch");
+    expect(parsed.type).toBe("feedback");
+    expect(parsed.modified).toBe("2026-08-11T01:17:02.742Z");
+  });
+
+  it("parses gen 3 (no frontmatter)", () => {
+    const content = `# Config Audit — 2026-02-27
+
+Three-persona audit across all 8 site routers.`;
+    const parsed = parseMemoryContent(content, "audit-2026-02-27.md", Date.now());
+    expect(parsed.hasFrontmatter).toBe(false);
+    expect(parsed.name).toBe("audit-2026-02-27");
+    expect(parsed.body).toContain("Three-persona audit");
+  });
+
+  it("infers type from filename when not in frontmatter", () => {
+    const content = `# Just a heading\n\nSome content.`;
+    const parsed = parseMemoryContent(content, "reference_firmware_dump.md", Date.now());
+    expect(parsed.type).toBe("reference");
+  });
+});
+
+describe("index-parser", () => {
+  it("parses link entries and non-link lines", () => {
+    const content = `# My App - Working Memory
+
+## Feedback
+- [No auth](feedback_no_auth.md) — owner decision
+- ⛔ [Agents must use worktrees](feedback_agents_use_worktrees.md) — shared checkout caused stale flash
+
+## Other`;
+    const parsed = parseIndexContent(content, "/fake/dir");
+    expect(parsed.entries).toHaveLength(2);
+    expect(parsed.entries[0].title).toBe("No auth");
+    expect(parsed.entries[0].href).toBe("feedback_no_auth.md");
+    expect(parsed.entries[0].summary).toBe("owner decision");
+    expect(parsed.entries[0].pinned).toBe(false);
+    expect(parsed.entries[1].pinned).toBe(true);
+    expect(parsed.lines).toHaveLength(7); // all 7 lines including blanks
+  });
+
+  it("handles cross-tier absolute hrefs", () => {
+    const content = `- [Prefer jq](/home/user/.claude/memory/feedback_prefer_jq.md) — use jq`;
+    const parsed = parseIndexContent(content, "/home/user/.claude/projects/whatever/memory");
+    expect(parsed.entries[0].filePath).toBe("/home/user/.claude/memory/feedback_prefer_jq.md");
+  });
+});
+
+describe("injector", () => {
+  it("builds injection for my-app", () => {
+    const result = resolveMemoryDirs(APP_CWD);
+    const { text } = buildMemoryInjection(result.project, result.global);
+    expect(text).toContain("## Memory");
+    expect(text).toContain("APP");
+    expect(text).toContain("Prefer jq");
+    // Should have the index section
+    expect(text).toContain("#### Index");
+    // Should have some full-text files loaded
+    expect(text).toContain("#### Full Text");
+  });
+
+  it("builds injection for global-only project", () => {
+    const result = resolveMemoryDirs(UNKNOWN_CWD);
+    const { text } = buildMemoryInjection(result.project, result.global);
+    expect(text).toContain("Global");
+    expect(text).toContain("Prefer jq");
+  });
+});
