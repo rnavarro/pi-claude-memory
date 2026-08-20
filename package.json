@@ -1,0 +1,51 @@
+{
+  "name": "pi-claude-memory",
+  "version": "0.1.0",
+  "description": "Pi extension: shared Claude Code memory store with project-scoped resolution and background auto-learning.",
+  "type": "module",
+  "license": "MIT",
+  "author": "rnavarro",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "memory",
+    "claude-code",
+    "auto-learning"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check --error-on-warnings",
+    "format": "biome check --write",
+    "test": "vitest run",
+    "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "prepare": "git config --unset core.hooksPath || true; git config hooks.dispatchRepoHooks true || true"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-tui": "^0.84.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.7"
+  }
+}

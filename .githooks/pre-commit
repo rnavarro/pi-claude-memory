@@ -1,0 +1,42 @@
+#!/bin/bash
+# Pre-commit hook for pi-claude-memory
+# Wired via the global hook dispatcher: `git config hooks.dispatchRepoHooks true`
+# (set by the package.json "prepare" script). Branch protection is enforced
+# upstream by ~/.config/git/hooks/protected-branch-guard before this hook runs.
+
+set -e
+
+# Fresh clone before dependencies are installed: skip checks rather than fail.
+if [ ! -d node_modules ]; then
+    echo "pre-commit: no node_modules — skipping repo checks"
+    exit 0
+fi
+
+# Block commits directly to main — must use feature branches.
+# git symbolic-ref works even before the first commit; rev-parse --abbrev-ref does not.
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "unknown")
+if [ "$branch" = "main" ] || [ "$branch" = "integration" ] || [ "$branch" = "master" ]; then
+    echo "ERROR: Direct commits to protected branch '$branch' are not allowed."
+    echo "Create a feature branch first: git checkout -b fix/<name> or feat/<name>"
+    exit 1
+fi
+
+echo "Running pre-commit checks..."
+
+# Auto-format staged TS/JSON files with biome and re-stage them.
+echo "Formatting..."
+STAGED=$(git diff --name-only --cached --diff-filter=d -- '*.ts' '*.json')
+if [ -n "$STAGED" ]; then
+    echo "$STAGED" | xargs npx biome check --write --no-errors-on-unmatched
+    echo "$STAGED" | xargs git add
+fi
+
+# Typecheck
+echo "Typechecking..."
+npm run --silent typecheck
+
+# Lint — verify the whole tree, fail on errors AND warnings.
+echo "Linting..."
+npx biome check --error-on-warnings --no-errors-on-unmatched .
+
+echo "All checks passed!"
