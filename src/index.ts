@@ -26,6 +26,10 @@ import type { ResolveResult } from "./types.js";
 // Resolution involves glob probes which are expensive to repeat every turn.
 let cachedResolve: { cwd: string; result: ResolveResult } | null = null;
 
+// Capture the ExtensionAPI at registration time so event handlers can call
+// pi.getAllTools() to check if ctx_search is registered.
+let api: ExtensionAPI | null = null;
+
 // Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
 let turnCount = 0;
 
@@ -35,6 +39,7 @@ const CHUNK_MAX_CHARS = 12000;
 let conversationChunk = "";
 
 export default function piClaudeMemory(pi: ExtensionAPI): void {
+  api = pi;
   // Phase 1: inject memory into the system prompt on every before_agent_start.
   // Pi rebuilds the system prompt from scratch each turn, so we must inject
   // every turn — skipping means the memory is entirely absent from that turn.
@@ -76,8 +81,18 @@ async function handleBeforeAgentStart(
   // the first memory in this project.
   const resolved = getCachedResolve(cwd);
 
+  // Check if ctx_search is registered so the anchor only references it when available.
+  // This is cache-safe: the tool set doesn't change mid-session, so the result
+  // is deterministic across turns.
+  const hasCtxSearch = api?.getAllTools().some((t) => t.name === "ctx_search") ?? false;
+
   // Build the injection text (always includes the routing anchor)
-  const { text, warnings } = buildMemoryInjection(resolved.project, resolved.global);
+  const { text, warnings } = buildMemoryInjection(
+    resolved.project,
+    resolved.global,
+    5000,
+    hasCtxSearch,
+  );
 
   // Log warnings to stderr for debugging (never block the turn)
   if (warnings.length > 0) {
@@ -178,4 +193,16 @@ function getCachedResolve(cwd: string): ResolveResult {
   const result = resolveMemoryDirs(cwd);
   cachedResolve = { cwd, result };
   return result;
+}
+
+/** Invalidate the resolver cache.
+ *
+ * Called after write_memory/remove_memory modifies the memory dir structure
+ * (e.g., creates a new project dir). The next before_agent_start will re-resolve
+ * from disk and pick up the new dir.
+ *
+ * This is a one-time cache miss on the next turn (system prompt changes because
+ * new memory content appears). That's acceptable — the user explicitly wrote. */
+export function invalidateResolveCache(): void {
+  cachedResolve = null;
 }

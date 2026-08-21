@@ -23,13 +23,16 @@ export interface AutoLearnConfig {
   everyTurns: number;
   /** Model provider/id. */
   model: { provider: string; id: string };
+  /** Thinking level: "off" omits reasoning entirely (like pi-observational-memory). */
+  thinking: "off" | "minimal" | "low" | "medium" | "high";
   /** Max output tokens for the review call. */
   maxOutputTokens: number;
 }
 
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
-  model: { provider: "neuralwatt", id: "glm-5.2-flex-fast" },
+  model: { provider: "neuralwatt", id: "glm-5.2-flex" },
+  thinking: "off",
   maxOutputTokens: 2048,
 };
 
@@ -121,12 +124,20 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     ],
   };
 
+  // Follow pi-observational-memory's pattern: only pass reasoning if the
+  // model supports it AND thinking is not "off". When thinking is "off",
+  // omit the field entirely rather than passing a sentinel.
+  const modelSupportsReasoning = Boolean((model as { reasoning?: unknown }).reasoning);
+  const thinkingLevel = cfg.thinking;
+  const reasoningOption =
+    modelSupportsReasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {};
+
   let replyText: string;
   try {
     const reply = await completeSimple(model, context, {
       apiKey: auth.apiKey,
       headers: auth.headers,
-      reasoning: "minimal",
+      ...reasoningOption,
       maxTokens: cfg.maxOutputTokens,
       temperature: 0,
       signal: ctx.signal,
