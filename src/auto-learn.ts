@@ -147,7 +147,16 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
 
   let replyText: string;
   try {
-    const reply = await completeSimple(model, context, {
+    // Resolve the stream function from the model registry's provider.
+    // Since pi 0.81, the compat completeSimple only resolves builtin API IDs
+    // (openai, anthropic, etc.). A provider-registered custom API (e.g.
+    // neuralwatt) is unknown to it and throws "No API provider registered for
+    // api: ...". Routing through the registry's composed provider avoids that
+    // crash. Falls back to compat completeSimple for builtin providers.
+    // Pattern copied from pi-observational-memory's resolveStreamFn.
+    const streamFn = resolveStreamFn(ctx, model);
+    const doComplete = streamFn ?? completeSimple;
+    const reply = await doComplete(model, context, {
       apiKey: auth.apiKey,
       headers: auth.headers,
       ...reasoningOption,
@@ -284,4 +293,41 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
     }
   }
   return lines.join("\n");
+}
+
+/** Resolve a stream/complete function from the model registry's provider.
+ *
+ * Since pi 0.81, the compat completeSimple only resolves builtin API IDs.
+ * A provider-registered custom API (e.g. neuralwatt) is unknown to it and
+ * throws. Routing through the registry's composed provider avoids that.
+ * Returns undefined if the provider has no streamSimple (caller falls back
+ * to compat completeSimple).
+ *
+ * Pattern copied from pi-observational-memory's resolveStreamFn. */
+function resolveStreamFn(
+  ctx: ExtensionContext,
+  model: unknown,
+):
+  | ((
+      model: unknown,
+      context: Context,
+      options: Record<string, unknown>,
+    ) => Promise<{ content: Array<{ type: string; text?: string }> }>)
+  | undefined {
+  const providerName = (model as { provider?: string }).provider;
+  if (!providerName) return undefined;
+  try {
+    const provider =
+      typeof ctx.modelRegistry.getProvider === "function"
+        ? ctx.modelRegistry.getProvider(providerName)
+        : undefined;
+    const streamSimple = provider?.streamSimple;
+    if (typeof streamSimple !== "function") return undefined;
+    debugLog("auto_learn.stream_resolved", { providerName, source: "registry" });
+    return (m, c, o) =>
+      streamSimple(m as Model<Api>, c as Context, o as Record<string, unknown>).result();
+  } catch (err) {
+    debugLog("auto_learn.stream_resolve_failed", { providerName, error: String(err) });
+    return undefined;
+  }
 }
