@@ -113,6 +113,14 @@ const writeTool = defineTool({
         description: "If true, always injected in full regardless of size. Default: false.",
       }),
     ),
+    priority: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: 5,
+        description:
+          "Priority 1-5 (5=highest). Controls injection order when budget is tight. Defaults to type: feedback=5, user=4, project=3, reference=2.",
+      }),
+    ),
   }),
   promptSnippet:
     "write_memory - Write a Claude Code memory entry (auto-learned fact or reference). Shares store with Claude Code.",
@@ -129,6 +137,7 @@ const writeTool = defineTool({
       type: params.type,
       tier: params.tier ?? "project",
       pinned: params.pinned ?? false,
+      priority: params.priority ?? null,
       bodyChars: params.body.length,
     });
     const tier = params.tier ?? "project";
@@ -154,6 +163,7 @@ const writeTool = defineTool({
       body: params.body,
       pinned: params.pinned ?? false,
       tier,
+      priority: params.priority ?? null,
       allowOverwrite: true, // tool is user-initiated, overwrite is expected
     });
     // Invalidate the resolver cache so the next before_agent_start picks up

@@ -302,7 +302,13 @@ function buildFullTextSection(
   };
 }
 
-/** Prioritize files: pinned first, then feedback/user type, then most recently modified. */
+/** Prioritize files: pinned first, then effective priority (explicit priority
+ * or type-derived default), then most recently modified.
+ *
+ * Per consult (GPT-5.6): priority replaces type as the admission-order signal,
+ * not merely a tie-breaker within type. A priority-5 project fact can outrank
+ * an old feedback entry. Type supplies the default when no explicit priority
+ * is set: feedback=5, user=4, project=3, reference=2. */
 function prioritizeFiles(files: Map<string, MemoryFile>, entries: IndexEntry[]): MemoryFile[] {
   // Build a map of filePath → pinned status from index entries
   const pinnedMap = new Map<string, boolean>();
@@ -316,9 +322,9 @@ function prioritizeFiles(files: Map<string, MemoryFile>, entries: IndexEntry[]):
     const bPinned = b.frontmatter.pinned || (pinnedMap.get(b.filePath) ?? false);
     if (aPinned !== bPinned) return aPinned ? -1 : 1;
 
-    // Then feedback/user type
-    const aPriority = typePriority(a.frontmatter.type);
-    const bPriority = typePriority(b.frontmatter.type);
+    // Then effective priority (explicit frontmatter priority, or type default)
+    const aPriority = a.frontmatter.priority ?? typeDefaultPriority(a.frontmatter.type);
+    const bPriority = b.frontmatter.priority ?? typeDefaultPriority(b.frontmatter.type);
     if (aPriority !== bPriority) return bPriority - aPriority;
 
     // Then most recently modified
@@ -326,19 +332,20 @@ function prioritizeFiles(files: Map<string, MemoryFile>, entries: IndexEntry[]):
   });
 }
 
-/** Priority score: feedback and user types get highest priority. */
-function typePriority(type: MemoryType): number {
+/** Default priority derived from memory type when no explicit priority is set.
+ * feedback=5 (behavioral rules, highest), user=4, project=3, reference=2. */
+function typeDefaultPriority(type: MemoryType): number {
   switch (type) {
     case "feedback":
-      return 3;
+      return 5;
     case "user":
-      return 2;
+      return 4;
     case "project":
-      return 1;
+      return 3;
     case "reference":
-      return 0;
+      return 2;
     default:
-      return 0;
+      return 2; // untyped defaults to reference level
   }
 }
 
