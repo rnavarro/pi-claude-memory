@@ -14,7 +14,7 @@ import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writeMemory } from "./memory-writer.js";
-import { resolveMemoryDirs } from "./resolver.js";
+import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
 /** Configuration for auto-learning. */
@@ -153,7 +153,10 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   // Write each candidate. Count successes.
   let written = 0;
   for (const c of candidates) {
-    const dir: MemoryDir | null = c.tier === "global" ? resolved.global : resolved.project;
+    let dir: MemoryDir | null = c.tier === "global" ? resolved.global : resolved.project;
+    if (!dir && c.tier === "project") {
+      dir = createProjectMemoryDir(cwd);
+    }
     if (!dir) {
       // Requested tier unavailable — skip silently. The model will learn from
       // the absence in the next cycle's index.
