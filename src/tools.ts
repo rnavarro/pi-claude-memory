@@ -114,7 +114,7 @@ const writeTool = defineTool({
   promptSnippet:
     "write_memory - Write a Claude Code memory entry (auto-learned fact or reference). Shares store with Claude Code.",
   promptGuidelines: [
-    "Use write_memory to persist facts worth remembering across sessions: user preferences, project conventions, verified solutions, reference material.",
+    "Use write_memory proactively only for explicit signals: user corrections, stated preferences, or verified fixes. A background reviewer sweeps every 10 turns for routine learning — don't duplicate it.",
     "Do NOT write memories for ephemeral state, TODOs, or debugging steps — those belong in session notes, not durable memory.",
     "Pick the right type: feedback=behavioral rule (always inject), reference=lookup material (on-demand), project=project-specific fact, user=user preference.",
     "Keep descriptions to one line — they appear in the MEMORY.md index that is injected every turn.",

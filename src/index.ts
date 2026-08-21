@@ -70,13 +70,13 @@ async function handleBeforeAgentStart(
 ): Promise<BeforeAgentStartEventResult | undefined> {
   const cwd = ctx.cwd;
 
-  // Resolve (or use cached) memory directories
+  // Resolve (or use cached) memory directories.
+  // Even when no memory dirs exist yet (new project), we still inject the
+  // routing anchor so the model knows write_memory is available to create
+  // the first memory in this project.
   const resolved = getCachedResolve(cwd);
-  if (!resolved.project && !resolved.global) {
-    return; // no memory for this cwd — nothing to inject
-  }
 
-  // Build the injection text
+  // Build the injection text (always includes the routing anchor)
   const { text, warnings } = buildMemoryInjection(resolved.project, resolved.global);
 
   // Log warnings to stderr for debugging (never block the turn)

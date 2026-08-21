@@ -1,11 +1,12 @@
 // Injector: bimodal memory injection into Pi's system prompt
 //
 // Strategy:
-// 1. Always inject MEMORY.md content (index entries + hand-authored sections)
-// 2. Greedily inject full file bodies up to a token cap (default 5000)
-// 3. Priority: pinned entries → feedback/user type → most recently modified
-// 4. Large files get index-only (model can fetch via recall_memory tool)
-// 5. Global tier injected first, then project tier
+// 1. Always inject the routing anchor (even when no memory exists yet)
+// 2. Always inject MEMORY.md content (index entries + hand-authored sections)
+// 3. Greedily inject full file bodies up to a token cap (default 5000)
+// 4. Priority: pinned entries → feedback/user type → most recently modified
+// 5. Large files get index-only with ⟨index-only⟩ marker (model can fetch via recall_memory)
+// 6. Global tier injected first, then project tier
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
@@ -17,10 +18,24 @@ const DEFAULT_TOKEN_CAP = 5000;
 const CHARS_PER_TOKEN = 4; // rough estimate
 const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candidates for full injection
 
+/**
+ * Routing anchor — emitted every turn, even when no memory exists yet.
+ * Tells the model how to use memory tools and how they coexist with ctx_search.
+ * Matches context-mode's terse, directive arrow-syntax.
+ */
+export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. The memory below is already in context — never re-read a loaded entry.
+Index entry marked ⟨index-only⟩ → recall_memory(name); unmarked entries are already in full.
+User correction, stated preference, or verified fix → write_memory this turn. A background reviewer sweeps the conversation every 10 turns for everything else — don't duplicate it.
+Memory that is now wrong → remove_memory (never leave it to rot).
+Durable facts across sessions → the index below. What happened in a prior session (errors, commands, prompts) → ctx_search.
+Never store ephemeral state, TODOs, or commit hashes.`;
+
 /** Result of building an injection block for a tier. */
 export interface InjectionBlock {
   /** The formatted markdown to append to the system prompt. */
   text: string;
+  /** Set of file paths loaded in full (for index marker rendering). */
+  loadedPaths: Set<string>;
   /** Number of topic files loaded in full. */
   filesLoaded: number;
   /** Estimated token count for this block. */
@@ -32,6 +47,8 @@ export interface InjectionBlock {
 /**
  * Build the full memory injection text for both tiers.
  * Returns the combined text to append to event.systemPrompt.
+ * Always returns the routing anchor even when no memory blocks exist,
+ * so the model knows write_memory is available for new projects.
  */
 export function buildMemoryInjection(
   project: MemoryDir | null,
@@ -55,12 +72,8 @@ export function buildMemoryInjection(
     }
   }
 
-  if (blocks.length === 0) {
-    return { text: "", warnings };
-  }
-
   return {
-    text: `\n\n## Memory\n\n${blocks.join("\n\n")}`,
+    text: `\n\n## Memory\n\n${MEMORY_ROUTING_ANCHOR}\n\n${blocks.join("\n\n")}`.trimEnd(),
     warnings,
   };
 }
@@ -74,7 +87,7 @@ function buildTierInjection(
 ): InjectionBlock {
   const parsed = parseIndexFile(dir);
   if (!parsed) {
-    return { text: "", filesLoaded: 0, tokens: 0, warnings };
+    return { text: "", loadedPaths: new Set(), filesLoaded: 0, tokens: 0, warnings };
   }
 
   // Reconcile index with disk
@@ -98,23 +111,21 @@ function buildTierInjection(
     );
   }
 
-  // Build the index section (always injected — it's cheap and information-dense)
-  const indexSection = renderIndexSection(parsed);
-
-  // Build the full-text section (greedy, budget-limited)
+  // Build the full-text section FIRST (greedy, budget-limited) so we know
+  // which files are loaded in full — the index renderer marks the rest.
   const {
     text: fullTextSection,
-    filesLoaded,
+    loadedPaths,
     tokens,
   } = buildFullTextSection(files, parsed.entries, tokenCap);
 
+  // Build the index section (always injected — it's cheap and information-dense)
+  // Mark entries whose bodies are NOT loaded with ⟨index-only⟩ so the model
+  // knows which entries to recall_memory vs which are already in full text.
+  const indexSection = renderIndexSection(parsed, loadedPaths);
+
   const parts: string[] = [];
   parts.push(`### Memory (${label})\n`);
-  parts.push(
-    `The following is your persistent ${label === "Global" ? "global" : "project"} memory, ` +
-      "shared with Claude Code. Topic files listed in the index can be read on-demand " +
-      "via the `recall_memory` tool.\n",
-  );
 
   if (indexSection) {
     parts.push(`#### Index\n\n${indexSection}`);
@@ -126,7 +137,8 @@ function buildTierInjection(
 
   return {
     text: parts.join("\n"),
-    filesLoaded,
+    loadedPaths,
+    filesLoaded: loadedPaths.size,
     tokens,
     warnings,
   };
@@ -168,14 +180,19 @@ function getFileMtime(filePath: string): number {
   }
 }
 
-/** Render the MEMORY.md index section (all lines, preserving structure). */
-function renderIndexSection(parsed: { lines: (IndexEntry | IndexLine)[] }): string {
+/** Render the MEMORY.md index section (all lines, preserving structure).
+ *  Entries whose bodies are NOT loaded in full are marked ⟨index-only⟩. */
+function renderIndexSection(
+  parsed: { lines: (IndexEntry | IndexLine)[] },
+  loadedPaths: Set<string>,
+): string {
   return parsed.lines
     .map((line) => {
       if ("title" in line) {
         // IndexEntry — reconstruct the link line
         const pin = line.pinned ? "⛔ " : "";
-        return `- ${pin}[${line.title}](${line.href}) — ${line.summary}`;
+        const marker = loadedPaths.has(line.filePath) ? "" : " ⟨index-only⟩";
+        return `- ${pin}[${line.title}](${line.href}) — ${line.summary}${marker}`;
       }
       return line.text;
     })
@@ -191,12 +208,13 @@ function buildFullTextSection(
   files: Map<string, MemoryFile>,
   entries: IndexEntry[],
   tokenCap: number,
-): { text: string; filesLoaded: number; tokens: number } {
+): { text: string; loadedPaths: Set<string>; filesLoaded: number; tokens: number } {
   // Build a priority-ordered list of candidate files
   const candidates = prioritizeFiles(files, entries);
 
   let tokensUsed = 0;
   const parts: string[] = [];
+  const loadedPaths = new Set<string>();
   let filesLoaded = 0;
 
   for (const file of candidates) {
@@ -212,10 +230,12 @@ function buildFullTextSection(
     parts.push(formatFileBlock(file));
     tokensUsed += bodyTokens;
     filesLoaded++;
+    loadedPaths.add(file.filePath);
   }
 
   return {
     text: parts.join("\n\n"),
+    loadedPaths,
     filesLoaded,
     tokens: tokensUsed,
   };
