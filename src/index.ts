@@ -18,7 +18,9 @@ import type {
   ToolResultEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { buildExistingIndexSummary, DEFAULT_AUTOLEARN_CONFIG, runAutoLearn } from "./auto-learn.js";
+import { type AutoLearnConfig, buildExistingIndexSummary, runAutoLearn } from "./auto-learn.js";
+import { loadConfig, type PiClaudeMemoryConfig } from "./config.js";
+import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { buildMemoryInjection } from "./injector.js";
 import { resolveMemoryDirs } from "./resolver.js";
 import { registerMemoryTools } from "./tools.js";
@@ -54,22 +56,42 @@ let frozenInjection: FrozenInjection | null = null;
 // pi.getAllTools() to check if ctx_search is registered.
 let api: ExtensionAPI | null = null;
 
+// Loaded config (debugLog, autoLearn, reviewIntervalTurns, etc.)
+let config: PiClaudeMemoryConfig = loadConfig();
+
 // Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
 let turnCount = 0;
 
 // Recent tool results captured for auto-learn context.
-// The session branch (from ctx.sessionManager.getBranch()) gives us user +
-// assistant messages, but tool results are truncated. This supplements them.
 const TOOL_RESULT_MAX_CHARS = 8000;
 let toolResultChunk = "";
 
+// Session ID for debug log file naming.
+let currentSessionId: string | undefined;
+
+/** Extract session ID from extension context (best-effort). */
+function getSessionId(ctx: ExtensionContext): string | undefined {
+  try {
+    return ctx.sessionManager?.getSessionId?.() ?? currentSessionId;
+  } catch {
+    return currentSessionId;
+  }
+}
+
 export default function piClaudeMemory(pi: ExtensionAPI): void {
   api = pi;
+  config = loadConfig();
+
+  debugLog("extension.register", {
+    debugLog: config.debugLog,
+    autoLearn: config.autoLearn,
+    reviewIntervalTurns: config.reviewIntervalTurns,
+    injectTokenCap: config.injectTokenCap,
+    reviewModel: `${config.reviewModel.provider}/${config.reviewModel.id}`,
+    reviewThinking: config.reviewThinking,
+  });
 
   // Phase 1: inject memory into the system prompt on every before_agent_start.
-  // Pi rebuilds the system prompt from scratch each turn, so we must inject
-  // every turn — but the text is frozen at session start so the prompt cache
-  // prefix stays byte-identical across turns.
   pi.on("before_agent_start", handleBeforeAgentStart);
 
   // Phase 2: register memory tools.
@@ -77,18 +99,33 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
 
   // Phase 3: auto-learning. Count turns and capture tool results, then fire
   // a background review every N turns after the agent settles.
-  pi.on("turn_end", handleTurnEnd);
-  pi.on("tool_result", handleToolResult);
-  pi.on("agent_settled", handleAgentSettled);
+  if (config.autoLearn) {
+    pi.on("turn_end", handleTurnEnd);
+    pi.on("tool_result", handleToolResult);
+    pi.on("agent_settled", handleAgentSettled);
+  }
 
   // Reset caches on session lifecycle events
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
+    currentSessionId = getSessionId(ctx);
     frozenInjection = null;
     turnCount = 0;
     toolResultChunk = "";
+    withDebugLogContext(
+      { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+      () => {
+        debugLog("session.start", { cwd: ctx.cwd, sessionId: getSessionId(ctx) });
+      },
+    );
   });
 
-  pi.on("session_before_compact", () => {
+  pi.on("session_before_compact", (_event, ctx) => {
+    withDebugLogContext(
+      { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+      () => {
+        debugLog("session.before_compact", { turnCount });
+      },
+    );
     // Freeze is still valid post-compaction — memory files haven't changed.
     // Just reset the tool result buffer to avoid feeding stale context to
     // the next auto-learn cycle.
@@ -103,43 +140,49 @@ async function handleBeforeAgentStart(
 ): Promise<BeforeAgentStartEventResult | undefined> {
   const cwd = ctx.cwd;
 
-  // Use frozen injection if available and cwd hasn't changed.
-  // This keeps the system prompt byte-identical across turns → prompt cache hit.
-  let frozen = frozenInjection;
-  if (!frozen || frozen.cwd !== cwd) {
-    frozen = computeInjection(cwd);
-    frozenInjection = frozen;
-  }
+  return withDebugLogContext(
+    { enabled: config.debugLog, cwd, sessionId: getSessionId(ctx) },
+    async () => {
+      // Use frozen injection if available and cwd hasn't changed.
+      let frozen = frozenInjection;
+      if (!frozen || frozen.cwd !== cwd) {
+        frozen = computeInjection(cwd);
+        frozenInjection = frozen;
+        debugLog("injector.freeze", {
+          cwd,
+          textLength: frozen.text.length,
+          hasProject: !!frozen.resolved.project,
+          hasGlobal: !!frozen.resolved.global,
+        });
+      }
 
-  if (!frozen.text) {
-    return; // nothing to inject
-  }
+      if (!frozen.text) {
+        return;
+      }
 
-  // Log warnings to stderr for debugging (never block the turn)
-  // (warnings are only logged on first compute, not every turn)
-
-  // Append memory to the system prompt
-  return {
-    systemPrompt: event.systemPrompt + frozen.text,
-  };
+      return {
+        systemPrompt: event.systemPrompt + frozen.text,
+      };
+    },
+  );
 }
 
 /** Compute and freeze the injection text for a cwd. */
 function computeInjection(cwd: string): FrozenInjection {
   const resolved = resolveMemoryDirs(cwd);
 
-  // Check if ctx_search is registered so the anchor only references it when available.
   const hasCtxSearch = api?.getAllTools().some((t) => t.name === "ctx_search") ?? false;
 
   const { text, warnings } = buildMemoryInjection(
     resolved.project,
     resolved.global,
-    5000,
+    config.injectTokenCap,
     hasCtxSearch,
   );
 
   if (warnings.length > 0) {
     for (const w of warnings) {
+      debugLog("injector.warning", { warning: w });
       console.error(`[pi-claude-memory] ${w}`);
     }
   }
@@ -148,58 +191,96 @@ function computeInjection(cwd: string): FrozenInjection {
 }
 
 /** Handle turn_end: increment counter. */
-function handleTurnEnd(_event: TurnEndEvent, _ctx: ExtensionContext): void {
+function handleTurnEnd(_event: TurnEndEvent, ctx: ExtensionContext): void {
   turnCount++;
+  withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    () => debugLog("turn.end", { turnCount }),
+  );
 }
 
 /** Handle tool_result: capture tool output text for auto-learn context. */
-function handleToolResult(event: ToolResultEvent, _ctx: ExtensionContext): void {
+function handleToolResult(event: ToolResultEvent, ctx: ExtensionContext): void {
   const text = toolResultToText(event);
   if (text) {
     appendToToolResultChunk(text);
+    withDebugLogContext(
+      { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+      () => debugLog("tool_result.captured", { toolName: event.toolName, chars: text.length }),
+    );
   }
 }
 
 /** Handle agent_settled: fire background auto-learn every N turns. */
 function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): void {
-  if (turnCount < DEFAULT_AUTOLEARN_CONFIG.everyTurns) {
-    return;
-  }
-  // Reset the counter so we count the next N turns
-  turnCount = 0;
-
-  // Build conversation text from the session branch — this gives us user
-  // prompts, assistant text, and tool calls (tool results are truncated in
-  // the branch, so we supplement with the toolResultChunk).
-  const branchText = serializeBranch(ctx);
-  const toolText = toolResultChunk;
-  toolResultChunk = "";
-
-  // Combine: branch has the conversation flow, toolText has the full tool outputs
-  const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
-
-  if (!chunk.trim()) return;
-
-  // Use the frozen resolve result if available (avoids re-resolving).
-  // Fall back to fresh resolve if the freeze was somehow lost.
-  const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
-  const existingIndex = buildExistingIndexSummary(resolved);
-
-  // Fire-and-forget: never block the user's next turn.
-  void runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, ctx.cwd, chunk, existingIndex).then(
-    (written) => {
-      if (written > 0) {
-        console.error(
-          `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
-        );
+  withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    () => {
+      if (turnCount < config.reviewIntervalTurns) {
+        debugLog("auto_learn.skip", { turnCount, threshold: config.reviewIntervalTurns });
+        return;
       }
-      // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
-      // take effect next session — the model already has this context from
-      // the conversation. Invalidating here would bust the prompt cache for
-      // facts the model just saw.
-    },
-    (err) => {
-      console.error(`[pi-claude-memory] auto-learn: unexpected error: ${String(err)}`);
+      // Reset the counter so we count the next N turns
+      turnCount = 0;
+
+      // Build conversation text from the session branch — this gives us user
+      // prompts, assistant text, and tool calls (tool results are truncated in
+      // the branch, so we supplement with the toolResultChunk).
+      const branchText = serializeBranch(ctx);
+      const toolText = toolResultChunk;
+      toolResultChunk = "";
+
+      // Combine: branch has the conversation flow, toolText has the full tool outputs
+      const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+
+      if (!chunk.trim()) {
+        debugLog("auto_learn.skip_empty_chunk", {});
+        return;
+      }
+
+      // Truncate chunk to configured max
+      const truncated =
+        chunk.length > config.reviewMaxChunkChars
+          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
+          : chunk;
+
+      debugLog("auto_learn.trigger", {
+        chunkChars: truncated.length,
+        branchChars: branchText.length,
+        toolResultChars: toolText.length,
+      });
+
+      // Use the frozen resolve result if available (avoids re-resolving).
+      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
+      const existingIndex = buildExistingIndexSummary(resolved);
+
+      // Build config for this run from the loaded config
+      const autoLearnCfg: AutoLearnConfig = {
+        everyTurns: config.reviewIntervalTurns,
+        model: config.reviewModel,
+        thinking: config.reviewThinking,
+        maxOutputTokens: config.reviewMaxOutputTokens,
+      };
+
+      // Fire-and-forget: never block the user's next turn.
+      void runAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex).then(
+        (written) => {
+          debugLog("auto_learn.result", { written });
+          if (written > 0) {
+            console.error(
+              `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
+            );
+          }
+          // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
+          // take effect next session — the model already has this context from
+          // the conversation. Invalidating here would bust the prompt cache for
+          // facts the model just saw.
+        },
+        (err) => {
+          debugLog("auto_learn.error", { error: String(err) });
+          console.error(`[pi-claude-memory] auto-learn: unexpected error: ${String(err)}`);
+        },
+      );
     },
   );
 }

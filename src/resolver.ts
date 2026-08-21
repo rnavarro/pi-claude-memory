@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve, sep } from "node:path";
+import { debugLog } from "./debug-log.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
 const CLAUDE_PROJECTS_DIR = `${homedir()}/.claude/projects`;
@@ -83,6 +84,16 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
     };
   }
 
+  debugLog("resolver.resolve", {
+    cwd: absCwd,
+    encoded,
+    projectDir: project?.dir ?? null,
+    projectLabel: project?.label ?? null,
+    globalDir: global?.dir ?? null,
+    warningCount: warnings.length,
+    warnings,
+  });
+
   return { project, global, warnings };
 }
 
@@ -99,6 +110,7 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
 
   try {
     mkdirSync(memorySubdir, { recursive: true });
+    debugLog("resolver.create_project_dir", { cwd: absCwd, encoded, memorySubdir });
     return {
       tier: "project",
       dir: memorySubdir,
@@ -106,7 +118,9 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
       label: absCwd.split(sep).pop() ?? absCwd,
     };
   } catch (err) {
-    console.error(`[pi-claude-memory] failed to create project memory dir: ${String(err)}`);
+    const errorMsg = String(err);
+    debugLog("resolver.create_project_dir_error", { cwd: absCwd, encoded, error: errorMsg });
+    console.error(`[pi-claude-memory] failed to create project memory dir: ${errorMsg}`);
     return null;
   }
 }

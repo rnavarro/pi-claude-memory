@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { parse, stringify } from "yaml";
+import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 
@@ -138,6 +139,7 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
 
   // Collision guard: if the file exists and caller didn't allow overwrite, skip.
   if (existsSync(filePath) && !req.allowOverwrite) {
+    debugLog("writer.write_skip_collision", { slug, filename, tier: dir.tier, label: dir.label });
     return {
       ok: false,
       message: `Memory ${filename} already exists in ${dir.label} tier (auto-learn skipped to avoid clobbering)`,
@@ -165,6 +167,7 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   const frontmatterYaml = buildFrontmatterYaml(req, modified, preservedMetadata);
 
   if (!roundTripValidate(frontmatterYaml, req)) {
+    debugLog("writer.write_validation_failed", { slug, filename, tier: dir.tier });
     return { ok: false, message: `YAML round-trip validation failed for ${filename}` };
   }
 
@@ -183,6 +186,17 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
     title: deriveTitle(req.name, req.description),
     summary: req.description,
     pinned: req.pinned,
+  });
+
+  debugLog("writer.write_ok", {
+    slug,
+    filename,
+    type: req.type,
+    tier: dir.tier,
+    label: dir.label,
+    pinned: req.pinned,
+    overwrote: preservedMetadata && Object.keys(preservedMetadata).length > 0,
+    filePath,
   });
 
   return {
@@ -260,6 +274,7 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   }
 
   if (!filePath || !existsSync(filePath)) {
+    debugLog("writer.remove_not_found", { slug, name: req.name, tier: dir.tier, label: dir.label });
     return { ok: false, message: `Memory not found: ${req.name} in ${dir.label} tier` };
   }
 
@@ -272,6 +287,8 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
 
   // Remove the link entry from MEMORY.md
   removeFromIndex(dir, filename);
+
+  debugLog("writer.remove_ok", { filename, tier: dir.tier, label: dir.label, trashPath });
 
   return {
     ok: true,
@@ -339,13 +356,24 @@ export function readMemory(
     }
   }
   if (!filePath || !existsSync(filePath)) {
+    debugLog("writer.read_not_found", { slug, name, tier: dir.tier, label: dir.label });
     return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
   }
 
   const content = readFileSync(filePath, "utf8");
   const filename = basename(filePath);
   const frontmatter = parseMemoryContent(content, filename, Date.now());
-  const { text } = resolveWikilinks(frontmatter.body, dir);
+  const { text, resolved, unresolved } = resolveWikilinks(frontmatter.body, dir);
+
+  debugLog("writer.read_ok", {
+    slug,
+    filename,
+    tier: dir.tier,
+    label: dir.label,
+    contentLength: content.length,
+    wikilinksResolved: resolved.length,
+    wikilinksUnresolved: unresolved.length,
+  });
 
   return {
     ok: true,
