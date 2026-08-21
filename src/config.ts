@@ -29,6 +29,14 @@ export interface PiClaudeMemoryConfig {
   reviewMaxOutputTokens: number;
   /** Max chars of conversation to send to auto-learn. */
   reviewMaxChunkChars: number;
+  /** Fire auto-learn on session shutdown (catches short sessions). */
+  reviewOnShutdown: boolean;
+  /** Minimum chunk chars to trigger shutdown auto-learn. */
+  shutdownMinChunkChars: number;
+  /** Timeout (ms) for shutdown auto-learn LLM call. */
+  shutdownTimeoutMs: number;
+  /** Fire auto-learn on session_before_compact (catches pre-compaction loss). */
+  reviewOnCompact: boolean;
 }
 
 export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
@@ -40,6 +48,10 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   reviewThinking: "off",
   reviewMaxOutputTokens: 2048,
   reviewMaxChunkChars: 50000,
+  reviewOnShutdown: true,
+  shutdownMinChunkChars: 1000,
+  shutdownTimeoutMs: 5000,
+  reviewOnCompact: true,
 };
 
 const SETTINGS_KEY = "pi-claude-memory";
@@ -72,6 +84,14 @@ export function loadConfig(): PiClaudeMemoryConfig {
       ...(typeof n.reviewMaxChunkChars === "number"
         ? { reviewMaxChunkChars: n.reviewMaxChunkChars }
         : {}),
+      ...(typeof n.reviewOnShutdown === "boolean" ? { reviewOnShutdown: n.reviewOnShutdown } : {}),
+      ...(typeof n.shutdownMinChunkChars === "number"
+        ? { shutdownMinChunkChars: n.shutdownMinChunkChars }
+        : {}),
+      ...(typeof n.shutdownTimeoutMs === "number"
+        ? { shutdownTimeoutMs: n.shutdownTimeoutMs }
+        : {}),
+      ...(typeof n.reviewOnCompact === "boolean" ? { reviewOnCompact: n.reviewOnCompact } : {}),
     };
   } catch {
     return { ...DEFAULT_CONFIG };
