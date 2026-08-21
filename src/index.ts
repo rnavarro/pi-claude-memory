@@ -6,13 +6,17 @@
 //
 // Phase 1: read-only harness — injection only, no writes.
 // Phase 2: tools — recall_memory, write_memory, remove_memory.
+// Phase 3: auto-learning — periodic background review via completeSimple.
 
 import type {
+  AgentSettledEvent,
   BeforeAgentStartEvent,
   BeforeAgentStartEventResult,
   ExtensionAPI,
   ExtensionContext,
+  TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
+import { buildExistingIndexSummary, DEFAULT_AUTOLEARN_CONFIG, runAutoLearn } from "./auto-learn.js";
 import { buildMemoryInjection } from "./injector.js";
 import { resolveMemoryDirs } from "./resolver.js";
 import { registerMemoryTools } from "./tools.js";
@@ -21,6 +25,14 @@ import type { ResolveResult } from "./types.js";
 // Cache the resolved memory dirs for the session.
 // Resolution involves glob probes which are expensive to repeat every turn.
 let cachedResolve: { cwd: string; result: ResolveResult } | null = null;
+
+// Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
+let turnCount = 0;
+
+// Rolling buffer of recent conversation text for the next auto-learn cycle.
+// Capped to keep memory bounded; the LLM only needs the recent window.
+const CHUNK_MAX_CHARS = 12000;
+let conversationChunk = "";
 
 export default function piClaudeMemory(pi: ExtensionAPI): void {
   // Phase 1: inject memory into the system prompt on every before_agent_start.
@@ -31,9 +43,16 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
   // Phase 2: register memory tools.
   registerMemoryTools(pi);
 
+  // Phase 3: auto-learning. Count turns and accumulate conversation text,
+  // then fire a background review every N turns after the agent settles.
+  pi.on("turn_end", handleTurnEnd);
+  pi.on("agent_settled", handleAgentSettled);
+
   // Reset the resolver cache on session lifecycle events (cwd may change)
   pi.on("session_start", () => {
     cachedResolve = null;
+    turnCount = 0;
+    conversationChunk = "";
   });
 
   pi.on("session_before_compact", () => {
@@ -75,6 +94,79 @@ async function handleBeforeAgentStart(
   return {
     systemPrompt: event.systemPrompt + text,
   };
+}
+
+/** Handle turn_end: increment counter and append message text to the chunk buffer. */
+function handleTurnEnd(event: TurnEndEvent, _ctx: ExtensionContext): void {
+  turnCount++;
+  const text = messageToText(event.message);
+  if (text) {
+    appendToChunk(text);
+  }
+}
+
+/** Handle agent_settled: fire background auto-learn every N turns. */
+function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): void {
+  if (turnCount < DEFAULT_AUTOLEARN_CONFIG.everyTurns) {
+    return;
+  }
+  // Reset the counter so we count the next N turns
+  turnCount = 0;
+  // Snapshot the chunk and reset the buffer
+  const chunk = conversationChunk;
+  conversationChunk = "";
+
+  // Fire-and-forget: never block the user's next turn.
+  // Errors are caught inside runAutoLearn and logged to stderr.
+  const resolved = resolveMemoryDirs(ctx.cwd);
+  const existingIndex = buildExistingIndexSummary(resolved);
+  void runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, ctx.cwd, chunk, existingIndex).then(
+    (written) => {
+      if (written > 0) {
+        console.error(
+          `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
+        );
+      } else if (written === 0) {
+        // No-op — silent on the common case of nothing to learn
+      }
+    },
+    (err) => {
+      console.error(`[pi-claude-memory] auto-learn: unexpected error: ${String(err)}`);
+    },
+  );
+}
+
+/** Convert an AgentMessage to plain text for the conversation chunk. */
+function messageToText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const m = message as { role?: string; content?: unknown };
+  const role = m.role ?? "unknown";
+  const content = m.content;
+  if (typeof content === "string") return `### ${role}\n${content}`;
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((c) => {
+        if (!c || typeof c !== "object") return "";
+        const part = c as { type?: string; text?: string };
+        if (part.type === "text" && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .filter(Boolean);
+    if (parts.length === 0) return "";
+    return `### ${role}\n${parts.join("\n")}`;
+  }
+  return "";
+}
+
+/** Append text to the rolling chunk buffer, capping total size. */
+function appendToChunk(text: string): void {
+  if (!text) return;
+  if (conversationChunk.length + text.length > CHUNK_MAX_CHARS) {
+    // Drop the oldest content: keep the tail of the existing buffer
+    const overflow = conversationChunk.length + text.length - CHUNK_MAX_CHARS;
+    conversationChunk = conversationChunk.slice(overflow + 1);
+  }
+  conversationChunk += `${conversationChunk ? "\n\n" : ""}${text}`;
 }
 
 /** Get cached or fresh resolve result for a cwd. */
