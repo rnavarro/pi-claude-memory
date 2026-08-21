@@ -67,6 +67,7 @@ describe("writeMemory", () => {
       body: "Always use `jq` for parsing JSON in shell scripts.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     expect(result.ok).toBe(true);
     expect(existsSync(join(tmpDir, "prefer-jq-for-json.md"))).toBe(true);
@@ -87,6 +88,7 @@ describe("writeMemory", () => {
       body: "Always use worktrees.",
       pinned: true,
       tier: "project",
+      allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
     expect(idx).toContain("⛔");
@@ -100,6 +102,7 @@ describe("writeMemory", () => {
       body: "First body.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     writeMemory(dir, {
       name: "test-entry",
@@ -108,6 +111,7 @@ describe("writeMemory", () => {
       body: "Updated body.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
     // Should have exactly one link line
@@ -125,6 +129,7 @@ describe("writeMemory", () => {
       body: "Body.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
     expect(idx).toContain("# Project Notes");
@@ -140,6 +145,7 @@ describe("writeMemory", () => {
       body: "x",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     expect(result.ok).toBe(false);
   });
@@ -152,6 +158,7 @@ describe("writeMemory", () => {
       body: "Some reference content.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const content = readFileSync(join(tmpDir, "round-trip-test.md"), "utf8");
     const parsed = parseMemoryContent(content, "round-trip-test.md", Date.now());
@@ -160,6 +167,72 @@ describe("writeMemory", () => {
     expect(parsed.type).toBe("reference");
     expect(parsed.hasFrontmatter).toBe(true);
     expect(parsed.body).toContain("Some reference content.");
+  });
+
+  it("skips when allowOverwrite=false and file exists (auto-learn collision guard)", () => {
+    // First write succeeds
+    writeMemory(dir, {
+      name: "existing-entry",
+      description: "Original",
+      type: "feedback",
+      body: "Original body.",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    const originalContent = readFileSync(join(tmpDir, "existing-entry.md"), "utf8");
+
+    // Second write with allowOverwrite=false should skip
+    const result = writeMemory(dir, {
+      name: "existing-entry",
+      description: "Attempted overwrite",
+      type: "feedback",
+      body: "New body that should NOT be written.",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: false,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("already exists");
+
+    // Original file is untouched
+    const afterContent = readFileSync(join(tmpDir, "existing-entry.md"), "utf8");
+    expect(afterContent).toBe(originalContent);
+    expect(afterContent).toContain("Original body.");
+    expect(afterContent).not.toContain("New body");
+  });
+
+  it("preserves originSessionId from existing file on overwrite", () => {
+    // Simulate a Claude Code-authored file with originSessionId
+    const claudeContent =
+      "---\n" +
+      "name: claude-authored\n" +
+      "description: Written by Claude Code\n" +
+      "metadata:\n" +
+      "  node_type: memory\n" +
+      "  type: feedback\n" +
+      "  originSessionId: abc-123-def\n" +
+      "  modified: 2026-01-01T00:00:00.000Z\n" +
+      "---\n\nOriginal Claude body.\n";
+    writeFileSync(join(tmpDir, "claude-authored.md"), claudeContent, "utf8");
+
+    // Overwrite via tool (allowOverwrite=true)
+    const result = writeMemory(dir, {
+      name: "claude-authored",
+      description: "Updated by Pi",
+      type: "feedback",
+      body: "Updated body.",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(result.ok).toBe(true);
+
+    // originSessionId should survive
+    const content = readFileSync(join(tmpDir, "claude-authored.md"), "utf8");
+    expect(content).toContain("originSessionId: abc-123-def");
+    expect(content).toContain("Updated body.");
+    expect(content).toContain("Updated by Pi");
   });
 });
 
@@ -172,6 +245,7 @@ describe("removeMemory", () => {
       body: "Body.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const result = removeMemory(dir, { name: "to-remove", tier: "project" });
     expect(result.ok).toBe(true);
@@ -196,6 +270,7 @@ describe("readMemory", () => {
       body: "Content here.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const result = readMemory(dir, "findable");
     if (!result.ok) throw new Error("expected ok");
@@ -218,6 +293,7 @@ describe("resolveWikilinks", () => {
       body: "Target content.",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const body = "See [[target]] for details.";
     const { text, resolved, unresolved } = resolveWikilinks(body, dir);
@@ -242,6 +318,7 @@ describe("resolveWikilinks", () => {
       body: "x",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     const body = "See [[piped-target|the target]] for more.";
     const { text, resolved } = resolveWikilinks(body, dir);
@@ -260,6 +337,7 @@ describe("end-to-end: write then read then parse index", () => {
       body: "Alpha content. See [[beta]].",
       pinned: false,
       tier: "project",
+      allowOverwrite: true,
     });
     writeMemory(dir, {
       name: "beta",
@@ -268,6 +346,7 @@ describe("end-to-end: write then read then parse index", () => {
       body: "Beta content.",
       pinned: true,
       tier: "project",
+      allowOverwrite: true,
     });
 
     // Read alpha and check wikilink resolution

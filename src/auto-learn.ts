@@ -169,6 +169,7 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       body: c.body,
       pinned: c.pinned,
       tier: c.tier,
+      allowOverwrite: false, // auto-learn never clobbers existing memories
     });
     if (result.ok) written++;
   }
