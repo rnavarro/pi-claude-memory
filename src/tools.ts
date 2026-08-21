@@ -144,6 +144,7 @@ const writeTool = defineTool({
       body: params.body,
       pinned: params.pinned ?? false,
       tier,
+      allowOverwrite: true, // tool is user-initiated, overwrite is expected
     });
     return {
       content: [

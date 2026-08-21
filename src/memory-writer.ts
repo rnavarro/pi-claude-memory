@@ -25,6 +25,11 @@ export interface WriteMemoryRequest {
   pinned: boolean;
   /** Tier: "project" or "global". */
   tier: "project" | "global";
+  /** Whether to overwrite an existing entry with the same slug.
+   * The write_memory tool sets true (user explicitly asked).
+   * Auto-learn sets false (skip + log on collision to avoid clobbering
+   * Claude Code-authored memories). */
+  allowOverwrite: boolean;
 }
 
 /** A remove-memory request. */
@@ -62,24 +67,33 @@ function slugify(name: string): string {
   );
 }
 
-/** Build YAML frontmatter matching Claude Code gen-2 nested-metadata format. */
+/** Build YAML frontmatter matching Claude Code gen-2 nested-metadata format.
+ *
+ * If preservedMetadata contains fields from an existing file (originSessionId,
+ * etc.), they are merged into the new metadata block so provenance survives
+ * across overwrites.
+ */
 export function buildFrontmatterYaml(
   entry: Pick<WriteMemoryRequest, "name" | "description" | "type" | "pinned">,
   modified: string,
+  preservedMetadata: Record<string, unknown> = {},
 ): string {
   // Use the yaml package so output is guaranteed valid (never string-template).
+  // Spread preserved first, then our values override fields we own
+  const metadata: Record<string, unknown> = {
+    ...preservedMetadata,
+    node_type: "memory",
+    type: entry.type,
+    modified,
+  };
+  if (entry.pinned) {
+    metadata.pinned = true;
+  }
   const doc: Record<string, unknown> = {
     name: entry.name,
     description: entry.description,
-    metadata: {
-      node_type: "memory",
-      type: entry.type,
-      modified,
-    },
+    metadata,
   };
-  if (entry.pinned) {
-    (doc.metadata as Record<string, unknown>).pinned = true;
-  }
   // stringify returns clean YAML with no trailing newline
   return `---\n${stringify(doc).trimEnd()}\n---\n`;
 }
@@ -105,7 +119,15 @@ function roundTripValidate(
   }
 }
 
-/** Write a memory topic file + patch MEMORY.md index. Add-only for v1. */
+/** Write a memory topic file + patch MEMORY.md index.
+ *
+ * Collision behavior controlled by req.allowOverwrite:
+ * - false (auto-learn): if the file exists, skip and return ok=false.
+ *   This prevents clobbering Claude Code-authored memories on slug collision.
+ * - true (write_memory tool): if the file exists, overwrite it but preserve
+ *   originSessionId and original modified timestamp from the existing file's
+ *   raw frontmatter, so Claude Code's provenance metadata survives.
+ */
 export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpResult {
   const slug = slugify(req.name);
   if (!slug) {
@@ -114,8 +136,33 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   const filename = `${slug}.md`;
   const filePath = join(dir.dir, filename);
 
+  // Collision guard: if the file exists and caller didn't allow overwrite, skip.
+  if (existsSync(filePath) && !req.allowOverwrite) {
+    return {
+      ok: false,
+      message: `Memory ${filename} already exists in ${dir.label} tier (auto-learn skipped to avoid clobbering)`,
+    };
+  }
+
   const modified = new Date().toISOString();
-  const frontmatterYaml = buildFrontmatterYaml(req, modified);
+
+  // If overwriting, preserve originSessionId from the existing file's raw frontmatter.
+  // This is critical for the shared store: Claude Code's provenance metadata
+  // must survive a Pi-initiated overwrite.
+  let preservedMetadata: Record<string, unknown> = {};
+  if (existsSync(filePath)) {
+    try {
+      const existing = readFileSync(filePath, "utf8");
+      const parsed = parseMemoryContent(existing, filename, Date.now());
+      if (parsed.hasFrontmatter && parsed.raw?.metadata) {
+        preservedMetadata = parsed.raw.metadata as Record<string, unknown>;
+      }
+    } catch {
+      // If we can't read the existing file, proceed with a fresh write
+    }
+  }
+
+  const frontmatterYaml = buildFrontmatterYaml(req, modified, preservedMetadata);
 
   if (!roundTripValidate(frontmatterYaml, req)) {
     return { ok: false, message: `YAML round-trip validation failed for ${filename}` };
@@ -127,8 +174,8 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // Ensure the directory exists
   mkdirSync(dir.dir, { recursive: true });
 
-  // Write the topic file (overwrite if exists — user asked for a write)
-  writeFileSync(filePath, fullContent, "utf8");
+  // Write the topic file (atomic: write to temp, then rename)
+  atomicWriteFile(filePath, fullContent);
 
   // Patch MEMORY.md: append a link entry if not already present.
   patchIndexAppend(dir, {
@@ -156,7 +203,10 @@ function deriveTitle(name: string, description: string): string {
     .join(" ");
 }
 
-/** Append a link entry to MEMORY.md without destroying hand-authored content. */
+/** Append a link entry to MEMORY.md without destroying hand-authored content.
+ *
+ * Uses atomic write (temp-file + rename) so a concurrent Claude Code reader
+ * never observes a truncated MEMORY.md. */
 function patchIndexAppend(
   dir: MemoryDir,
   entry: { filename: string; title: string; summary: string; pinned: boolean },
@@ -167,7 +217,7 @@ function patchIndexAppend(
   if (!existsSync(indexPath)) {
     const pin = entry.pinned ? "⛔ " : "";
     const line = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}\n`;
-    writeFileSync(indexPath, line, "utf8");
+    atomicWriteFile(indexPath, line);
     return;
   }
 
@@ -186,13 +236,13 @@ function patchIndexAppend(
   if (existingIdx >= 0) {
     // Replace the existing line in place
     lines[existingIdx] = newLine;
-    writeFileSync(indexPath, lines.join("\n"), "utf8");
+    atomicWriteFile(indexPath, lines.join("\n"));
     return;
   }
 
   // Append at end. Preserve trailing newline state.
   const ending = content.endsWith("\n") ? "" : "\n";
-  writeFileSync(indexPath, `${content}${ending}${newLine}\n`, "utf8");
+  atomicWriteFile(indexPath, `${content}${ending}${newLine}\n`);
 }
 
 /** Remove a memory: move file to .trash/ and remove its MEMORY.md entry. */
@@ -230,7 +280,8 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   };
 }
 
-/** Remove a link entry from MEMORY.md by filename. */
+/** Remove a link entry from MEMORY.md by filename.
+ * Uses atomic write (temp-file + rename). */
 function removeFromIndex(dir: MemoryDir, filename: string): void {
   const indexPath = dir.indexPath;
   if (!existsSync(indexPath)) return;
@@ -242,7 +293,7 @@ function removeFromIndex(dir: MemoryDir, filename: string): void {
   );
   const filtered = lines.filter((l) => !linkRegex.test(l));
   if (filtered.length !== lines.length) {
-    writeFileSync(indexPath, filtered.join("\n"), "utf8");
+    atomicWriteFile(indexPath, filtered.join("\n"));
   }
 }
 
@@ -302,6 +353,19 @@ export function readMemory(
     filePath,
     frontmatter,
   };
+}
+
+/** Write a file atomically: write to a temp file in the same directory, then rename.
+ *
+ * rename is atomic on POSIX when source and destination are on the same
+ * filesystem (same directory). This prevents a concurrent reader (Claude
+ * Code) from observing a truncated file. */
+function atomicWriteFile(filePath: string, content: string): void {
+  const dir = dirname(filePath);
+  const tmpName = `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`;
+  const tmpPath = join(dir, tmpName);
+  writeFileSync(tmpPath, content, "utf8");
+  renameSync(tmpPath, filePath);
 }
 
 /** Escape a string for safe embedding in a RegExp. */
