@@ -5,6 +5,7 @@
 //   ~/.claude/memory/                        (global tier)
 //
 // Phase 1: read-only harness — injection only, no writes.
+// Phase 2: tools — recall_memory, write_memory, remove_memory.
 
 import type {
   BeforeAgentStartEvent,
@@ -14,6 +15,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { buildMemoryInjection } from "./injector.js";
 import { resolveMemoryDirs } from "./resolver.js";
+import { registerMemoryTools } from "./tools.js";
 import type { ResolveResult } from "./types.js";
 
 // Cache the resolved memory dirs for the session.
@@ -25,6 +27,9 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
   // Pi rebuilds the system prompt from scratch each turn, so we must inject
   // every turn — skipping means the memory is entirely absent from that turn.
   pi.on("before_agent_start", handleBeforeAgentStart);
+
+  // Phase 2: register memory tools.
+  registerMemoryTools(pi);
 
   // Reset the resolver cache on session lifecycle events (cwd may change)
   pi.on("session_start", () => {
