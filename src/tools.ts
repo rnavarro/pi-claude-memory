@@ -7,6 +7,7 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { invalidateResolveCache } from "./index.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { ResolveResult } from "./types.js";
@@ -146,6 +147,10 @@ const writeTool = defineTool({
       tier,
       allowOverwrite: true, // tool is user-initiated, overwrite is expected
     });
+    // Invalidate the resolver cache so the next before_agent_start picks up
+    // any newly created project dir or index changes. This causes a one-time
+    // cache miss on the next turn (user explicitly wrote, one miss is fine).
+    invalidateResolveCache();
     return {
       content: [
         { type: "text", text: result.message + (result.filePath ? ` (${result.filePath})` : "") },
@@ -184,6 +189,9 @@ const removeTool = defineTool({
     }
 
     const result = removeMemory(dir, { name: params.name, tier });
+    // Invalidate the resolver cache so the next before_agent_start reflects
+    // the removed entry in the index.
+    invalidateResolveCache();
     return {
       content: [{ type: "text", text: result.message }],
       details: { ok: result.ok, tier: dir.tier, trashPath: result.filePath } as unknown,

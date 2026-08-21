@@ -19,8 +19,8 @@ const CHARS_PER_TOKEN = 4; // rough estimate
 const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candidates for full injection
 
 /**
- * Routing anchor — emitted every turn, even when no memory exists yet.
- * Tells the model how to use memory tools and how they coexist with ctx_search.
+ * Routing anchor for when memory entries exist. Tells the model how to use
+ * memory tools and how they coexist with ctx_search.
  * Matches context-mode's terse, directive arrow-syntax.
  */
 export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. The memory below is already in context — never re-read a loaded entry.
@@ -28,6 +28,14 @@ Index entry marked ⟨index-only⟩ → recall_memory(name); unmarked entries ar
 User correction, stated preference, or verified fix → write_memory this turn. A background reviewer sweeps the conversation every 10 turns for everything else — don't duplicate it.
 Memory that is now wrong → remove_memory (never leave it to rot).
 Durable facts across sessions → the index below. What happened in a prior session (errors, commands, prompts) → ctx_search.
+Never store ephemeral state, TODOs, or commit hashes.`;
+
+/**
+ * Short anchor for when no memory entries exist yet (new project).
+ * Just tells the model the system is active and what qualifies for write_memory.
+ */
+export const MEMORY_ROUTING_ANCHOR_EMPTY = `pi-claude-memory active. No memories yet for this project.
+User correction, stated preference, or verified fix → write_memory. A background reviewer sweeps every 10 turns for routine learning.
 Never store ephemeral state, TODOs, or commit hashes.`;
 
 /** Result of building an injection block for a tier. */
@@ -38,8 +46,10 @@ export interface InjectionBlock {
   loadedPaths: Set<string>;
   /** Number of topic files loaded in full. */
   filesLoaded: number;
-  /** Estimated token count for this block. */
+  /** Estimated token count for this block (full text only, excludes index). */
   tokens: number;
+  /** Whether this tier has any index entries (even if none loaded in full). */
+  hasEntries: boolean;
   /** Warnings (missing files, unindexed files, etc.) */
   warnings: string[];
 }
@@ -49,45 +59,69 @@ export interface InjectionBlock {
  * Returns the combined text to append to event.systemPrompt.
  * Always returns the routing anchor even when no memory blocks exist,
  * so the model knows write_memory is available for new projects.
+ *
+ * @param project Project memory dir, or null
+ * @param global Global memory dir, or null
+ * @param tokenCap Total token budget shared across BOTH tiers (not per-tier)
+ * @param hasCtxSearch Whether ctx_search tool is registered (gates the
+ *        ctx_search clause in the anchor). When false, the clause is omitted
+ *        so the anchor doesn't reference an unavailable tool.
  */
 export function buildMemoryInjection(
   project: MemoryDir | null,
   global: MemoryDir | null,
   tokenCap = DEFAULT_TOKEN_CAP,
+  hasCtxSearch = true,
 ): { text: string; warnings: string[] } {
   const warnings: string[] = [];
   const blocks: string[] = [];
 
-  if (global) {
-    const block = buildTierInjection(global, "Global", tokenCap, warnings);
-    if (block.text) {
-      blocks.push(block.text);
-    }
-  }
+  // Shared mutable budget across both tiers. Project tier goes first so it
+  // wins when competing for the same budget.
+  const budget = { remaining: tokenCap };
+  let hasAnyEntries = false;
 
   if (project) {
-    const block = buildTierInjection(project, project.label, tokenCap, warnings);
-    if (block.text) {
-      blocks.push(block.text);
-    }
+    const block = buildTierInjection(project, project.label, budget, warnings);
+    if (block.text) blocks.push(block.text);
+    if (block.hasEntries) hasAnyEntries = true;
   }
 
+  if (global) {
+    const block = buildTierInjection(global, "Global", budget, warnings);
+    if (block.text) blocks.push(block.text);
+    if (block.hasEntries) hasAnyEntries = true;
+  }
+
+  // Choose anchor variant based on whether any entries exist
+  const anchor = hasAnyEntries ? MEMORY_ROUTING_ANCHOR : MEMORY_ROUTING_ANCHOR_EMPTY;
+
+  // Gate the ctx_search clause when the tool isn't registered
+  const finalAnchor = hasCtxSearch ? anchor : anchor.replace(/\n.*ctx_search\..*$/m, "");
+
   return {
-    text: `\n\n## Memory\n\n${MEMORY_ROUTING_ANCHOR}\n\n${blocks.join("\n\n")}`.trimEnd(),
+    text: `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}`.trimEnd(),
     warnings,
   };
 }
 
-/** Build injection text for a single tier. */
+/** Build injection text for a single tier. Mutates the shared budget object. */
 function buildTierInjection(
   dir: MemoryDir,
   label: string,
-  tokenCap: number,
+  budget: { remaining: number },
   warnings: string[],
 ): InjectionBlock {
   const parsed = parseIndexFile(dir);
   if (!parsed) {
-    return { text: "", loadedPaths: new Set(), filesLoaded: 0, tokens: 0, warnings };
+    return {
+      text: "",
+      loadedPaths: new Set(),
+      filesLoaded: 0,
+      tokens: 0,
+      hasEntries: false,
+      warnings,
+    };
   }
 
   // Reconcile index with disk
@@ -117,7 +151,7 @@ function buildTierInjection(
     text: fullTextSection,
     loadedPaths,
     tokens,
-  } = buildFullTextSection(files, parsed.entries, tokenCap);
+  } = buildFullTextSection(files, parsed.entries, budget);
 
   // Build the index section (always injected — it's cheap and information-dense)
   // Mark entries whose bodies are NOT loaded with ⟨index-only⟩ so the model
@@ -140,6 +174,7 @@ function buildTierInjection(
     loadedPaths,
     filesLoaded: loadedPaths.size,
     tokens,
+    hasEntries: parsed.entries.length > 0,
     warnings,
   };
 }
@@ -200,14 +235,18 @@ function renderIndexSection(
 }
 
 /**
- * Build the full-text section by greedily injecting file bodies under the token cap.
- * Priority: pinned → feedback/user → most recently modified.
+ * Build the full-text section by greedily injecting file bodies under the
+ * shared budget. Priority: pinned → feedback/user → most recently modified.
  * Only small files (≤ line threshold) are candidates.
+ *
+ * Uses continue (not break) so a large low-priority file doesn't block a
+ * smaller high-priority file later in the sort — this is greedy best-fit,
+ * not a priority guarantee.
  */
 function buildFullTextSection(
   files: Map<string, MemoryFile>,
   entries: IndexEntry[],
-  tokenCap: number,
+  budget: { remaining: number },
 ): { text: string; loadedPaths: Set<string>; filesLoaded: number; tokens: number } {
   // Build a priority-ordered list of candidate files
   const candidates = prioritizeFiles(files, entries);
@@ -223,12 +262,13 @@ function buildFullTextSection(
     }
 
     const bodyTokens = estimateTokens(file.frontmatter.body);
-    if (tokensUsed + bodyTokens > tokenCap) {
-      continue; // would exceed budget
+    if (bodyTokens > budget.remaining) {
+      continue; // would exceed shared budget
     }
 
     parts.push(formatFileBlock(file));
     tokensUsed += bodyTokens;
+    budget.remaining -= bodyTokens;
     filesLoaded++;
     loadedPaths.add(file.filePath);
   }
