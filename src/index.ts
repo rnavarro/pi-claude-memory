@@ -14,7 +14,10 @@ import type {
   BeforeAgentStartEventResult,
   ExtensionAPI,
   ExtensionContext,
+  SessionBeforeCompactEvent,
+  SessionEntry,
   SessionMessageEntry,
+  SessionShutdownEvent,
   ToolResultEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -62,6 +65,12 @@ let config: PiClaudeMemoryConfig = loadConfig();
 // Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
 let turnCount = 0;
 
+// Single-flight tracking for auto-learn. The periodic (agent_settled) trigger
+// is fire-and-forget, but session_shutdown must await any in-flight review
+// before starting its own, to avoid two concurrent runs over overlapping
+// branches. Null when no review is running.
+let autoLearnInFlight: Promise<number> | null = null;
+
 // Recent tool results captured for auto-learn context.
 const TOOL_RESULT_MAX_CHARS = 8000;
 let toolResultChunk = "";
@@ -103,6 +112,20 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     pi.on("turn_end", handleTurnEnd);
     pi.on("tool_result", handleToolResult);
     pi.on("agent_settled", handleAgentSettled);
+
+    // Fire auto-learn before compaction so pre-compaction conversation detail
+    // is not permanently lost (after compaction getBranch() returns the
+    // compaction summary, not raw messages).
+    if (config.reviewOnCompact) {
+      pi.on("session_before_compact", handleSessionBeforeCompact);
+    }
+
+    // Fire auto-learn on shutdown to catch short sessions that never reached
+    // the turn threshold. Pi awaits shutdown handlers with no timeout of its
+    // own, so we await and apply our own deadline.
+    if (config.reviewOnShutdown) {
+      pi.on("session_shutdown", handleSessionShutdown);
+    }
   }
 
   // Reset caches on session lifecycle events
@@ -111,6 +134,7 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     frozenInjection = null;
     turnCount = 0;
     toolResultChunk = "";
+    autoLearnInFlight = null;
     withDebugLogContext(
       { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
       () => {
@@ -118,19 +142,138 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
       },
     );
   });
+}
 
-  pi.on("session_before_compact", (_event, ctx) => {
-    withDebugLogContext(
-      { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
-      () => {
-        debugLog("session.before_compact", { turnCount });
-      },
-    );
-    // Freeze is still valid post-compaction — memory files haven't changed.
-    // Just reset the tool result buffer to avoid feeding stale context to
-    // the next auto-learn cycle.
-    toolResultChunk = "";
-  });
+/** Handle session_before_compact: fire auto-learn over the pre-compaction
+ * branch before compaction destroys the raw messages.
+ *
+ * MUST NOT await the LLM call — session_before_compact is awaited by Pi and
+ * can fire mid-turn; blocking here stalls the user's turn. Snapshot the
+ * branch synchronously, void the run, return immediately. */
+function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: ExtensionContext): void {
+  withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    () => {
+      debugLog("session.before_compact", {
+        turnCount,
+        reason: event.reason,
+        willRetry: event.willRetry,
+        branchEntryCount: event.branchEntries?.length ?? 0,
+      });
+
+      // Snapshot the pre-compaction branch synchronously — after compaction
+      // getBranch() returns the compaction summary, not these raw messages.
+      const branchText = serializeEntries(event.branchEntries);
+      const toolText = toolResultChunk;
+      // Do NOT clear toolResultChunk here yet — the periodic trigger may still
+      // want it. It gets cleared after the periodic trigger drains it.
+      const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+
+      if (chunk.trim().length < config.shutdownMinChunkChars) {
+        debugLog("auto_learn.skip_compact", {
+          chunkChars: chunk.length,
+          threshold: config.shutdownMinChunkChars,
+        });
+        return;
+      }
+
+      // Truncate to configured max
+      const truncated =
+        chunk.length > config.reviewMaxChunkChars
+          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
+          : chunk;
+
+      debugLog("auto_learn.trigger_compact", {
+        chunkChars: truncated.length,
+        branchChars: branchText.length,
+        toolResultChars: toolText.length,
+      });
+
+      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
+      const existingIndex = buildExistingIndexSummary(resolved);
+      const autoLearnCfg: AutoLearnConfig = {
+        everyTurns: config.reviewIntervalTurns,
+        model: config.reviewModel,
+        thinking: config.reviewThinking,
+        maxOutputTokens: config.reviewMaxOutputTokens,
+      };
+
+      // Fire-and-forget: must not block compaction. Do not await.
+      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex);
+    },
+  );
+}
+
+/** Handle session_shutdown: await any in-flight auto-learn, then fire one
+ * final review for short sessions that never hit the turn threshold.
+ *
+ * Pi awaits shutdown handlers with no timeout of its own, so a hung LLM call
+ * would hang /quit forever. We apply our own deadline via AbortSignal.timeout. */
+async function handleSessionShutdown(
+  event: SessionShutdownEvent,
+  ctx: ExtensionContext,
+): Promise<void> {
+  await withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    async () => {
+      debugLog("session.shutdown", { reason: event.reason, turnCount });
+
+      // If a periodic or compact-triggered review is still running, await it
+      // first under a deadline so a hung provider cannot block shutdown.
+      if (autoLearnInFlight) {
+        debugLog("auto_learn.shutdown_await_inflight", {});
+        try {
+          await autoLearnInFlight;
+        } catch {
+          // already logged inside launchAutoLearn
+        }
+      }
+
+      // Now build a final chunk from whatever conversation we have. At
+      // shutdown the agent is not streaming, so ctx.signal is undefined —
+      // we supply our own abort signal with a deadline.
+      const branchText = serializeBranch(ctx);
+      const toolText = toolResultChunk;
+      const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+
+      if (chunk.trim().length < config.shutdownMinChunkChars) {
+        debugLog("auto_learn.skip_shutdown", {
+          chunkChars: chunk.length,
+          threshold: config.shutdownMinChunkChars,
+        });
+        return;
+      }
+
+      const truncated =
+        chunk.length > config.reviewMaxChunkChars
+          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
+          : chunk;
+
+      debugLog("auto_learn.trigger_shutdown", {
+        chunkChars: truncated.length,
+        branchChars: branchText.length,
+        toolResultChars: toolText.length,
+      });
+
+      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
+      const existingIndex = buildExistingIndexSummary(resolved);
+      const autoLearnCfg: AutoLearnConfig = {
+        everyTurns: config.reviewIntervalTurns,
+        model: config.reviewModel,
+        thinking: config.reviewThinking,
+        maxOutputTokens: config.reviewMaxOutputTokens,
+      };
+
+      // Await with our own timeout — Pi provides none.
+      const signal = AbortSignal.timeout(config.shutdownTimeoutMs);
+      try {
+        await launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, signal);
+      } catch (err) {
+        debugLog("auto_learn.shutdown_error", { error: String(err) });
+        // Swallow — never block shutdown on an LLM error.
+      }
+    },
+  );
 }
 
 /** Handle before_agent_start: inject frozen memory into the system prompt. */
@@ -250,11 +393,9 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
         toolResultChars: toolText.length,
       });
 
-      // Use the frozen resolve result if available (avoids re-resolving).
       const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
       const existingIndex = buildExistingIndexSummary(resolved);
 
-      // Build config for this run from the loaded config
       const autoLearnCfg: AutoLearnConfig = {
         everyTurns: config.reviewIntervalTurns,
         model: config.reviewModel,
@@ -263,24 +404,7 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
       };
 
       // Fire-and-forget: never block the user's next turn.
-      void runAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex).then(
-        (written) => {
-          debugLog("auto_learn.result", { written });
-          if (written > 0) {
-            console.error(
-              `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
-            );
-          }
-          // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
-          // take effect next session — the model already has this context from
-          // the conversation. Invalidating here would bust the prompt cache for
-          // facts the model just saw.
-        },
-        (err) => {
-          debugLog("auto_learn.error", { error: String(err) });
-          console.error(`[pi-claude-memory] auto-learn: unexpected error: ${String(err)}`);
-        },
-      );
+      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex);
     },
   );
 }
@@ -295,7 +419,19 @@ function serializeBranch(ctx: ExtensionContext): string {
   } catch {
     return "";
   }
+  return serializeMessageEntries(entries);
+}
 
+/** Serialize a list of session entries (from session_before_compact event) to
+ * text. Filters to message entries, takes the last ~20. */
+function serializeEntries(entries: SessionEntry[] | undefined): string {
+  if (!entries || entries.length === 0) return "";
+  const messages = entries.filter((e): e is SessionMessageEntry => e.type === "message");
+  return serializeMessageEntries(messages);
+}
+
+/** Shared serializer for a list of message entries. */
+function serializeMessageEntries(entries: SessionMessageEntry[]): string {
   // Take the last ~20 messages to stay within a reasonable size for the LLM.
   const recent = entries.slice(-20);
   const parts: string[] = [];
@@ -350,6 +486,54 @@ function appendToToolResultChunk(text: string): void {
     toolResultChunk = toolResultChunk.slice(overflow + 1);
   }
   toolResultChunk += `${toolResultChunk ? "\n\n" : ""}${text}`;
+}
+
+/** Launch an auto-learn review with single-flight tracking.
+ *
+ * If a review is already in-flight, skip launching a new one to avoid two
+ * concurrent runs over overlapping branches. The promise is stored in
+ * autoLearnInFlight so the session_shutdown handler can await it before
+ * starting its own final review. */
+function launchAutoLearn(
+  ctx: ExtensionContext,
+  cfg: AutoLearnConfig,
+  cwd: string,
+  chunk: string,
+  existingIndex: string,
+  signal?: AbortSignal,
+): Promise<number> {
+  if (autoLearnInFlight) {
+    debugLog("auto_learn.skip_inflight", {});
+    // Return a resolved promise so callers awaiting this (shutdown) proceed.
+    return Promise.resolve(0);
+  }
+
+  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, signal);
+  autoLearnInFlight = promise;
+  promise
+    .then((written) => {
+      debugLog("auto_learn.result", { written });
+      if (written > 0) {
+        console.error(
+          `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
+        );
+      }
+      // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
+      // take effect next session — the model already has this context from
+      // the conversation. Invalidating here would bust the prompt cache for
+      // facts the model just saw.
+      return written;
+    })
+    .catch((err) => {
+      debugLog("auto_learn.error", { error: String(err) });
+      console.error(`[pi-claude-memory] auto-learn: unexpected error: ${String(err)}`);
+      return -1;
+    })
+    .finally(() => {
+      if (autoLearnInFlight === promise) autoLearnInFlight = null;
+    });
+
+  return promise;
 }
 
 /** Invalidate the frozen injection.

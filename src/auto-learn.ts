@@ -88,6 +88,7 @@ export async function runAutoLearn(
   cwd: string,
   chunk: string,
   existingIndex: string,
+  signal?: AbortSignal,
 ): Promise<number> {
   if (!chunk.trim()) return 0;
 
@@ -162,7 +163,7 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       ...reasoningOption,
       maxTokens: cfg.maxOutputTokens,
       temperature: 0,
-      signal: ctx.signal,
+      signal: signal ?? ctx.signal,
     });
     replyText = reply.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
