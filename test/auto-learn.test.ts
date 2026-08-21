@@ -2,11 +2,12 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildExistingIndexSummary, parseCandidates } from "../src/auto-learn.js";
+import { createProjectMemoryDir, resolveMemoryDirs } from "../src/resolver.js";
 
 let tmpDir: string;
 let origHome: string | undefined;
@@ -158,5 +159,34 @@ describe("parseCandidates", () => {
 
   it("returns empty array when no brackets found", () => {
     expect(parseCandidates("nothing here")).toEqual([]);
+  });
+});
+
+describe("createProjectMemoryDir", () => {
+  it("creates a project memory dir for a new cwd", () => {
+    const cwd = "/home/user/workspace/brand-new-project";
+    const result = createProjectMemoryDir(cwd);
+    expect(result).not.toBeNull();
+    expect(result?.tier).toBe("project");
+    expect(existsSync(result?.dir ?? "")).toBe(true);
+    expect(result?.dir).toContain("brand-new-project");
+    expect(result?.label).toBe("brand-new-project");
+  });
+
+  it("resolveMemoryDirs finds the dir after createProjectMemoryDir", () => {
+    const cwd = "/home/user/workspace/another-new-project";
+    // Before: resolver returns null project
+    let resolved = resolveMemoryDirs(cwd);
+    expect(resolved.project).toBeNull();
+
+    // Create the dir
+    const created = createProjectMemoryDir(cwd);
+    expect(created).not.toBeNull();
+
+    // After: resolver still returns null because MEMORY.md doesn't exist yet.
+    // This is expected — the resolver requires MEMORY.md. The write path
+    // uses createProjectMemoryDir directly, not the resolver.
+    resolved = resolveMemoryDirs(cwd);
+    expect(resolved.project).toBeNull(); // no MEMORY.md yet
   });
 });

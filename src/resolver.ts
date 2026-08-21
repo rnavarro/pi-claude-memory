@@ -8,7 +8,7 @@
 // Encoding: replace "/" with "-" in the absolute path.
 // e.g. /home/user/workspace/my-app → -home-user-workspace-my-app
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { MemoryDir, ResolveResult } from "./types.js";
@@ -73,17 +73,42 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
   let global: MemoryDir | null = null;
   if (existsSync(CLAUDE_GLOBAL_DIR)) {
     const globalIndexPath = `${CLAUDE_GLOBAL_DIR}/MEMORY.md`;
-    if (existsSync(globalIndexPath)) {
-      global = {
-        tier: "global",
-        dir: CLAUDE_GLOBAL_DIR,
-        indexPath: globalIndexPath,
-        label: "Global",
-      };
-    }
+    // Return the global dir even if MEMORY.md doesn't exist yet —
+    // write_memory needs the dir to create it on first write.
+    global = {
+      tier: "global",
+      dir: CLAUDE_GLOBAL_DIR,
+      indexPath: globalIndexPath,
+      label: "Global",
+    };
   }
 
   return { project, global, warnings };
+}
+
+/**
+ * Create the project memory directory structure for a cwd that has no existing
+ * memory. Creates ~/.claude/projects/<encoded-cwd>/memory/ and returns the
+ * resolved MemoryDir. Used by write_memory when the project tier is null.
+ */
+export function createProjectMemoryDir(cwd: string): MemoryDir | null {
+  const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
+  const encoded = encodePath(absCwd);
+  const projectDir = `${CLAUDE_PROJECTS_DIR}/${encoded}`;
+  const memorySubdir = `${projectDir}/memory`;
+
+  try {
+    mkdirSync(memorySubdir, { recursive: true });
+    return {
+      tier: "project",
+      dir: memorySubdir,
+      indexPath: `${memorySubdir}/MEMORY.md`,
+      label: absCwd.split(sep).pop() ?? absCwd,
+    };
+  } catch (err) {
+    console.error(`[pi-claude-memory] failed to create project memory dir: ${String(err)}`);
+    return null;
+  }
 }
 
 /** Check both memory layouts for a project directory. */

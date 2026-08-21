@@ -8,7 +8,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
-import { resolveMemoryDirs } from "./resolver.js";
+import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { ResolveResult } from "./types.js";
 
 /** Pick a tier dir from a resolve result. */
@@ -123,7 +123,11 @@ const writeTool = defineTool({
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     const tier = params.tier ?? "project";
     const resolved = resolveMemoryDirs(ctx.cwd);
-    const dir = pickTier(resolved, tier);
+    let dir = pickTier(resolved, tier);
+    // For project-tier writes, create the dir if it doesn't exist yet.
+    if (!dir && tier === "project") {
+      dir = createProjectMemoryDir(ctx.cwd);
+    }
     if (!dir) {
       return {
         content: [
