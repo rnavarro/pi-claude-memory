@@ -98,6 +98,8 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     injectTokenCap: config.injectTokenCap,
     reviewModel: `${config.reviewModel.provider}/${config.reviewModel.id}`,
     reviewThinking: config.reviewThinking,
+    reviewOnShutdown: config.reviewOnShutdown,
+    reviewOnCompact: config.reviewOnCompact,
   });
 
   // Phase 1: inject memory into the system prompt on every before_agent_start.
@@ -213,6 +215,9 @@ async function handleSessionShutdown(
   event: SessionShutdownEvent,
   ctx: ExtensionContext,
 ): Promise<void> {
+  console.error(
+    `[pi-claude-memory] session_shutdown fired: reason=${event.reason} turnCount=${turnCount}`,
+  );
   await withDebugLogContext(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     async () => {
