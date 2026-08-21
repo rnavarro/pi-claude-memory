@@ -30,6 +30,8 @@ export interface ParsedFrontmatter {
   description: string;
   /** Memory type. null if not present. */
   type: MemoryType;
+  /** Priority 1-5 (5=highest). null if not set in frontmatter. */
+  priority: number | null;
   /** ISO timestamp of last modification. Falls back to file mtime. */
   modified: string;
   /** Whether this entry is pinned (always injected in full). */

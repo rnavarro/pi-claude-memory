@@ -49,6 +49,7 @@ export function parseMemoryContent(
       name: filename.replace(/\.md$/, ""),
       description: extractFirstHeading(body) || filename.replace(/\.md$/, ""),
       type: inferTypeFromFilename(filename),
+      priority: null,
       modified: new Date(mtimeMs).toISOString(),
       pinned: false,
       raw: {},
@@ -61,6 +62,7 @@ export function parseMemoryContent(
   const name = extractString(raw, "name") ?? filename.replace(/\.md$/, "");
   const description = extractString(raw, "description") ?? "";
   const type = extractType(raw, filename);
+  const priority = extractPriority(raw);
   const modified = extractModified(raw, mtimeMs);
   const pinned = extractBoolean(raw, "pinned") ?? false;
 
@@ -68,6 +70,7 @@ export function parseMemoryContent(
     name,
     description,
     type,
+    priority,
     modified,
     pinned,
     raw,
@@ -190,6 +193,18 @@ function extractBoolean(raw: Record<string, unknown>, key: string): boolean | un
   }
 
   return undefined;
+}
+
+/** Extract priority (1-5) from top-level or metadata. Returns null if absent or invalid. */
+function extractPriority(raw: Record<string, unknown>): number | null {
+  for (const source of [raw, raw.metadata as Record<string, unknown> | undefined]) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    const val = source.priority;
+    if (typeof val === "number" && Number.isInteger(val) && val >= 1 && val <= 5) {
+      return val;
+    }
+  }
+  return null;
 }
 
 /** Extract the first markdown heading as a fallback description. */

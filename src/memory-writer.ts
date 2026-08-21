@@ -26,6 +26,8 @@ export interface WriteMemoryRequest {
   pinned: boolean;
   /** Tier: "project" or "global". */
   tier: "project" | "global";
+  /** Priority 1-5 (5=highest). Optional; null/undefined means derive from type. */
+  priority?: number | null;
   /** Whether to overwrite an existing entry with the same slug.
    * The write_memory tool sets true (user explicitly asked).
    * Auto-learn sets false (skip + log on collision to avoid clobbering

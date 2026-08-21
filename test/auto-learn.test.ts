@@ -82,6 +82,33 @@ describe("buildExistingIndexSummary", () => {
     const summary = buildExistingIndexSummary(resolved);
     expect(summary).toContain("(no entries)");
   });
+
+  it("emits title: description from parsed MEMORY.md entries (not filenames)", () => {
+    const claudeDir = join(tmpDir, ".claude", "memory");
+    const { mkdirSync } = require("node:fs");
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(join(claudeDir, "prefer-jq.md"), "---\nname: prefer-jq\n---\nbody");
+    writeFileSync(
+      join(claudeDir, "MEMORY.md"),
+      "# Global Memory Index\n\n- [Prefer jq](prefer-jq.md) — Use jq for JSON processing\n",
+    );
+
+    const resolved = {
+      global: {
+        tier: "global",
+        dir: claudeDir,
+        indexPath: join(claudeDir, "MEMORY.md"),
+        label: "Global",
+      },
+      project: null,
+      warnings: [],
+    };
+
+    const summary = buildExistingIndexSummary(resolved);
+    // Should contain the title and description, not just the filename
+    expect(summary).toContain("Prefer jq");
+    expect(summary).toContain("Use jq for JSON processing");
+  });
 });
 
 describe("parseCandidates", () => {
@@ -151,6 +178,25 @@ describe("parseCandidates", () => {
     const cands = parseCandidates(reply);
     expect(cands).toHaveLength(1);
     expect(cands[0].name).toBe("good");
+  });
+
+  it("parses overwrite and priority optional fields", () => {
+    const reply = JSON.stringify([
+      {
+        name: "supersede-old",
+        description: "Corrected fact",
+        type: "feedback",
+        body: "new body",
+        tier: "project",
+        pinned: false,
+        overwrite: true,
+        priority: 5,
+      },
+    ]);
+    const cands = parseCandidates(reply);
+    expect(cands).toHaveLength(1);
+    expect(cands[0].overwrite).toBe(true);
+    expect(cands[0].priority).toBe(5);
   });
 
   it("returns empty array for empty array input", () => {

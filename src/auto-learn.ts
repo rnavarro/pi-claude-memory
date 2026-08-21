@@ -9,11 +9,12 @@
 // Fire-and-forget: never blocks the user's turn. All errors are caught and
 // logged to stderr.
 
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
+import { parseIndexFile } from "./index-parser.js";
 import { writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
@@ -40,12 +41,14 @@ export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
 const SYSTEM_PROMPT = `You are a memory extraction agent. Your job is to read a recent conversation chunk and extract durable facts worth remembering across sessions.
 
 You return a JSON array of memory candidates. Each candidate has:
-- name: short slug (kebab-case, e.g. "prefer-jq-for-json")
+- name: short slug (kebab-case, e.g. "prefer-jq-for-json") — match existing entry name for supersession
 - description: one-line summary
 - type: one of "feedback" (behavioral rule), "reference" (lookup material), "project" (project-specific fact), "user" (user preference)
 - body: markdown body, 1-10 lines
 - tier: "project" or "global"
 - pinned: boolean (true only for critical behavioral rules)
+- overwrite: boolean (true if this supersedes/replaces an existing entry — see SUPERSESSION below)
+- priority: optional integer 1-5 (5=highest). Omit to use type default (feedback=5, user=4, project=3, reference=2)
 
 What to extract:
 - User preferences and conventions explicitly stated
@@ -59,6 +62,13 @@ What NOT to extract:
 - Code patterns that are obvious from the code itself
 - Anything already covered by existing memory entries
 
+SUPERSESSION:
+If a candidate contradicts or supersedes an existing entry (e.g. a bug fix that
+resolves an earlier "unproven" note, or a corrected fact), return it with the
+SAME name as the existing entry so it replaces the old content. Do NOT create a
+new entry under a different slug — that creates duplicates. Match the existing
+entry's name exactly (use the title before the colon in the existing index).
+
 If there is nothing worth extracting, return an empty array: []
 
 Return ONLY the JSON array. No prose, no code fence.`;
@@ -70,6 +80,11 @@ interface MemoryCandidate {
   body: string;
   tier: "project" | "global";
   pinned: boolean;
+  /** If true, overwrite an existing entry with the same slug (supersession).
+   * The LLM sets this when a candidate contradicts/replaces an existing entry. */
+  overwrite?: boolean;
+  /** Priority 1-5 (5=highest). Optional; defaults to type-derived value. */
+  priority?: number;
 }
 
 /**
@@ -211,7 +226,9 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       body: c.body,
       pinned: c.pinned,
       tier: c.tier,
-      allowOverwrite: false, // auto-learn never clobbers existing memories
+      priority: c.priority ?? null,
+      // Auto-learn overwrites only when the LLM signals supersession
+      allowOverwrite: c.overwrite === true,
     });
     if (result.ok) written++;
   }
@@ -263,30 +280,48 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
       c.type === "user") &&
     typeof c.body === "string" &&
     (c.tier === "project" || c.tier === "global") &&
-    typeof c.pinned === "boolean"
+    typeof c.pinned === "boolean" &&
+    // overwrite is optional (defaults to false)
+    (c.overwrite === undefined || typeof c.overwrite === "boolean") &&
+    // priority is optional (defaults to type-derived value)
+    (c.priority === undefined ||
+      (typeof c.priority === "number" && c.priority >= 1 && c.priority <= 5))
   );
 }
 
-/** Build a compact summary of the existing memory index for the LLM. */
+/** Build a compact summary of the existing memory index for the LLM.
+ *
+ * Parses MEMORY.md (not a raw readdir) so the LLM sees entry descriptions,
+ * not just filenames. This is critical for dedup: without descriptions, the
+ * LLM cannot tell what an existing entry covers and creates near-duplicate
+ * slugs instead of recognizing the same topic.
+ *
+ * Falls back to readdir filenames only if MEMORY.md is unparseable. */
 export function buildExistingIndexSummary(resolved: ResolveResult): string {
   const lines: string[] = [];
   for (const dir of [resolved.global, resolved.project]) {
     if (!dir) continue;
     lines.push(`## ${dir.label} tier`);
-    // We don't re-parse MEMORY.md here — the injector already does that work.
-    // For the LLM summary, just list the file names in the dir.
     try {
-      const files = readdirSync(dir.dir).filter(
-        (f: string) => f.endsWith(".md") && f !== "MEMORY.md",
-      );
-      if (files.length === 0) {
-        lines.push("(no entries)");
-      } else {
-        for (const f of files.slice(0, 50)) {
-          lines.push(`- ${f}`);
+      const parsed = parseIndexFile(dir);
+      if (parsed && parsed.entries.length > 0) {
+        for (const entry of parsed.entries.slice(0, 50)) {
+          lines.push(`- ${entry.title}: ${entry.summary}`);
         }
-        if (files.length > 50) {
-          lines.push(`... and ${files.length - 50} more`);
+        if (parsed.entries.length > 50) {
+          lines.push(`... and ${parsed.entries.length - 50} more`);
+        }
+      } else {
+        // Fallback: no parseable index, list filenames if any files exist
+        const files = existsSync(dir.dir)
+          ? readdirSync(dir.dir).filter((f: string) => f.endsWith(".md") && f !== "MEMORY.md")
+          : [];
+        if (files.length === 0) {
+          lines.push("(no entries)");
+        } else {
+          for (const f of files.slice(0, 50)) {
+            lines.push(`- ${f}`);
+          }
         }
       }
     } catch {
