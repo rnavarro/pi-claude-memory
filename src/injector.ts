@@ -10,6 +10,7 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
+import { debugLog } from "./debug-log.js";
 import { parseMemoryFile } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
 import type { IndexEntry, IndexLine, MemoryDir, MemoryFile, MemoryType } from "./types.js";
@@ -99,6 +100,16 @@ export function buildMemoryInjection(
   // Gate the ctx_search clause when the tool isn't registered
   const finalAnchor = hasCtxSearch ? anchor : anchor.replace(/\n.*ctx_search\..*$/m, "");
 
+  debugLog("injector.build", {
+    hasProject: !!project,
+    hasGlobal: !!global,
+    hasAnyEntries,
+    hasCtxSearch,
+    tokenCap,
+    warningCount: warnings.length,
+    textLength: `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}`.trimEnd().length,
+  });
+
   return {
     text: `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}`.trimEnd(),
     warnings,
@@ -168,6 +179,16 @@ function buildTierInjection(
   if (fullTextSection) {
     parts.push(`#### Full Text (always loaded)\n\n${fullTextSection}`);
   }
+
+  debugLog("injector.tier", {
+    label,
+    entryCount: parsed.entries.length,
+    filesLoaded: loadedPaths.size,
+    tokensUsed: tokens,
+    budgetRemaining: budget.remaining,
+    missingCount: recon.missing.length,
+    unindexedCount: recon.unindexed.length,
+  });
 
   return {
     text: parts.join("\n"),

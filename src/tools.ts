@@ -7,6 +7,7 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache } from "./index.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
@@ -39,6 +40,7 @@ const recallTool = defineTool({
   promptSnippet:
     "recall_memory - Read a Claude Code memory entry by name with [[wikilink]] resolution.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    debugLog("tool.recall_memory", { name: params.name, tier: params.tier ?? "project" });
     const tier = params.tier ?? "project";
     const resolved = resolveMemoryDirs(ctx.cwd);
 
@@ -122,6 +124,13 @@ const writeTool = defineTool({
     "Prefer the global tier for cross-project facts (user preferences, tool conventions). Use project tier for project-specific facts.",
   ],
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    debugLog("tool.write_memory", {
+      name: params.name,
+      type: params.type,
+      tier: params.tier ?? "project",
+      pinned: params.pinned ?? false,
+      bodyChars: params.body.length,
+    });
     const tier = params.tier ?? "project";
     const resolved = resolveMemoryDirs(ctx.cwd);
     let dir = pickTier(resolved, tier);
@@ -177,6 +186,7 @@ const removeTool = defineTool({
   promptSnippet:
     "remove_memory - Move a memory entry to .trash/ and remove its MEMORY.md link. Recoverable, never hard-deletes.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    debugLog("tool.remove_memory", { name: params.name, tier: params.tier ?? "project" });
     const tier = params.tier ?? "project";
     const resolved = resolveMemoryDirs(ctx.cwd);
     const dir =

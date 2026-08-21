@@ -13,6 +13,7 @@ import { readdirSync } from "node:fs";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { debugLog } from "./debug-log.js";
 import { writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
@@ -93,6 +94,7 @@ export async function runAutoLearn(
   // Resolve the model
   const model = ctx.modelRegistry.find(cfg.model.provider, cfg.model.id) as Model<Api> | undefined;
   if (!model) {
+    debugLog("auto_learn.model_not_found", { provider: cfg.model.provider, id: cfg.model.id });
     console.error(
       `[pi-claude-memory] auto-learn: model ${cfg.model.provider}/${cfg.model.id} not found`,
     );
@@ -101,6 +103,7 @@ export async function runAutoLearn(
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
+    debugLog("auto_learn.no_api_key", { provider: cfg.model.provider });
     console.error(`[pi-claude-memory] auto-learn: no API key for ${cfg.model.provider}`);
     return -1;
   }
@@ -132,6 +135,16 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   const reasoningOption =
     modelSupportsReasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {};
 
+  debugLog("auto_learn.model_call", {
+    provider: cfg.model.provider,
+    id: cfg.model.id,
+    thinking: cfg.thinking,
+    modelSupportsReasoning,
+    reasoningPassed: thinkingLevel !== "off" && modelSupportsReasoning,
+    chunkChars: chunk.length,
+    maxOutputTokens: cfg.maxOutputTokens,
+  });
+
   let replyText: string;
   try {
     const reply = await completeSimple(model, context, {
@@ -148,12 +161,20 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       .join("\n")
       .trim();
   } catch (err) {
+    debugLog("auto_learn.llm_error", { error: String(err) });
     console.error(`[pi-claude-memory] auto-learn: LLM call failed: ${String(err)}`);
     return -1;
   }
 
   // Parse the JSON array — tolerate code fences and leading/trailing prose.
   const candidates = parseCandidates(replyText);
+
+  debugLog("auto_learn.llm_response", {
+    replyChars: replyText.length,
+    replyPreview: replyText.slice(0, 200),
+    candidatesParsed: candidates.length,
+  });
+
   if (candidates.length === 0) {
     return 0;
   }
@@ -184,6 +205,13 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     });
     if (result.ok) written++;
   }
+
+  debugLog("auto_learn.complete", {
+    candidates: candidates.length,
+    written,
+    skipped: candidates.length - written,
+  });
+
   return written;
 }
 
