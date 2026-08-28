@@ -55,10 +55,6 @@ interface FrozenInjection {
 
 let frozenInjection: FrozenInjection | null = null;
 
-// Capture the ExtensionAPI at registration time so event handlers can call
-// pi.getAllTools() to check if ctx_search is registered.
-let api: ExtensionAPI | null = null;
-
 // Loaded config (debugLog, autoLearn, reviewIntervalTurns, etc.)
 let config: PiClaudeMemoryConfig = loadConfig();
 
@@ -88,7 +84,6 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 }
 
 export default function piClaudeMemory(pi: ExtensionAPI): void {
-  api = pi;
   config = loadConfig();
 
   debugLog("extension.register", {
@@ -294,7 +289,9 @@ async function handleBeforeAgentStart(
       // Use frozen injection if available and cwd hasn't changed.
       let frozen = frozenInjection;
       if (!frozen || frozen.cwd !== cwd) {
-        frozen = computeInjection(cwd);
+        const hasCtxSearch =
+          event.systemPromptOptions.selectedTools?.includes("ctx_search") ?? false;
+        frozen = computeInjection(cwd, hasCtxSearch);
         frozenInjection = frozen;
         debugLog("injector.freeze", {
           cwd,
@@ -316,10 +313,8 @@ async function handleBeforeAgentStart(
 }
 
 /** Compute and freeze the injection text for a cwd. */
-function computeInjection(cwd: string): FrozenInjection {
+function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
   const resolved = resolveMemoryDirs(cwd);
-
-  const hasCtxSearch = api?.getAllTools().some((t) => t.name === "ctx_search") ?? false;
 
   const { text, warnings } = buildMemoryInjection(
     resolved.project,
