@@ -61,6 +61,18 @@ let config: PiClaudeMemoryConfig = loadConfig();
 // Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
 let turnCount = 0;
 
+// Monotonic revision of unreviewed material: bumped by every event that adds
+// conversation the reviewer has not covered (turn end, tool result, queued
+// compaction snapshot). Unlike turnCount, it never resets on review LAUNCH,
+// so "the last review succeeded and nothing arrived since" stays expressible.
+let materialRevision = 0;
+
+// The materialRevision value the last SUCCESSFULLY completed review covered
+// at its launch. -1 = no review has completed this session. The shutdown
+// skip compares the two: equal means every turn and tool result has been
+// seen by a finished review, and a final one would re-review the same bytes.
+let reviewedRevision = -1;
+
 // Single-flight tracking for auto-learn. The periodic (agent_settled) trigger
 // is fire-and-forget, but session_shutdown must await any in-flight review
 // before starting its own, to avoid two concurrent runs over overlapping
@@ -165,6 +177,10 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     frozenInjection = null;
     turnCount = 0;
     toolResultChunk = "";
+    // A fresh session means fresh unreviewed material: revision state must
+    // not leak the previous branch's "already reviewed" conclusion.
+    materialRevision = 0;
+    reviewedRevision = -1;
     // A new session invalidates the previous generation: an in-flight review
     // belongs to the old session and must not write while the new one runs.
     // Abort it, bump the generation so its completion handler leaves the
@@ -242,6 +258,9 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
       // pre-compaction branch.
       if (autoLearnInFlight) {
         debugLog("auto_learn.compact_queued", { chunkChars: truncated.length });
+        // Queued pre-compaction material is unreviewed: bump the revision so
+        // the shutdown skip cannot fire while a snapshot is waiting.
+        materialRevision++;
         pendingCompact = {
           ctx,
           cfg: autoLearnCfg,
@@ -271,6 +290,10 @@ async function handleSessionShutdown(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     async () => {
       debugLog("session.shutdown", { reason: event.reason, turnCount });
+      // True handler wall time: the review-phase event timestamps clip at
+      // the deadline, so this is the only place the ACTUAL shutdown cost
+      // (astra's measurement gap) gets recorded.
+      const shutdownStartMs = Date.now();
 
       // Single shared absolute deadline: the in-flight wait and the final
       // review COMBINED must not exceed shutdownTimeoutMs (Pi provides no
@@ -315,6 +338,7 @@ async function handleSessionShutdown(
           console.error(
             "[pi-claude-memory] auto-learn: in-flight review exceeded shutdown deadline; aborted, final review skipped",
           );
+          debugLog("session.shutdown_complete", { elapsedMs: Date.now() - shutdownStartMs });
           return;
         }
         // The review settled (wrote, errored, or aborted elsewhere). Its
@@ -338,6 +362,25 @@ async function handleSessionShutdown(
         // that path skips the final review entirely to avoid a double writer.
       }
 
+      // Skip the final review entirely when the last SUCCESSFUL review
+      // covered every event this session produced and nothing is queued.
+      // The shutdown chunk is the FULL branch (serializeBranch, never
+      // windowed by earlier reviews), so the min-chunk check below can never
+      // detect "nothing new" — without this check every reload pays for an
+      // LLM call that mostly re-reviews already-reviewed material (observed:
+      // median 5.0s handler span across 231 shutdowns, nearly half ending
+      // with zero writes). The pendingCompact === null half is a hard guard:
+      // a queued snapshot is pre-compaction material that no longer exists
+      // in the branch and must never be dropped from review.
+      if (shouldSkipShutdownReview(reviewedRevision, materialRevision, pendingCompact !== null)) {
+        debugLog("auto_learn.skip_shutdown_no_new", {
+          reviewedRevision,
+          materialRevision,
+        });
+        debugLog("session.shutdown_complete", { elapsedMs: Date.now() - shutdownStartMs });
+        return;
+      }
+
       // Now build a final chunk from whatever conversation we have. At
       // shutdown the agent is not streaming, so ctx.signal is undefined —
       // we supply our own abort signal with a deadline.
@@ -352,7 +395,6 @@ async function handleSessionShutdown(
       // by a tail-truncation spends the entire budget on it and drops 100%
       // of the post-compaction material. Budget the two explicitly instead.
       const snapshotChunk = pendingCompact?.chunk ?? null;
-      pendingCompact = null;
       const chunk = composeShutdownChunk(snapshotChunk, liveChunk, config.reviewMaxChunkChars);
 
       if (chunk.trim().length < config.shutdownMinChunkChars) {
@@ -360,8 +402,15 @@ async function handleSessionShutdown(
           chunkChars: chunk.length,
           threshold: config.shutdownMinChunkChars,
         });
+        // pendingCompact is deliberately NOT consumed on this skip path: a
+        // queued snapshot is pre-compaction material that no longer exists
+        // in the branch, so nulling it before this return dropped it
+        // forever (pre-existing bug — the snapshot now survives to the next
+        // session).
+        debugLog("session.shutdown_complete", { elapsedMs: Date.now() - shutdownStartMs });
         return;
       }
+      pendingCompact = null;
 
       // composeShutdownChunk already applied the cap; no further truncation.
       const truncated = chunk;
@@ -406,6 +455,8 @@ async function handleSessionShutdown(
       } finally {
         clearTimeout(shutdownTimer);
       }
+
+      debugLog("session.shutdown_complete", { elapsedMs: Date.now() - shutdownStartMs });
     },
   );
 }
@@ -481,6 +532,7 @@ function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
 /** Handle turn_end: increment counter. */
 function handleTurnEnd(_event: TurnEndEvent, ctx: ExtensionContext): void {
   turnCount++;
+  materialRevision++;
   withDebugLogContext(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     () => debugLog("turn.end", { turnCount }),
@@ -492,6 +544,7 @@ function handleToolResult(event: ToolResultEvent, ctx: ExtensionContext): void {
   const text = toolResultToText(event);
   if (text) {
     toolResultChunk = appendToToolResultChunk(toolResultChunk, text);
+    materialRevision++;
     withDebugLogContext(
       { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
       () => debugLog("tool_result.captured", { toolName: event.toolName, chars: text.length }),
@@ -683,6 +736,9 @@ function launchAutoLearn(
   // caller controller (shutdown) is registered the same way — autoLearnAbort
   // must point at the controller whose signal the review actually holds.
   const controller = callerController ?? new AbortController();
+  // Snapshot the material revision at launch: the completion handler below
+  // advances reviewedRevision only if nothing new arrived DURING the review.
+  const revAtLaunch = materialRevision;
   const promise = runAutoLearn(ctx, cfg, cwd, chunk, controller.signal);
   const gen = autoLearnGeneration;
   autoLearnInFlight = promise;
@@ -695,6 +751,20 @@ function launchAutoLearn(
       // already gated by config.debugLog, which is where background-work
       // chatter belongs.
       debugLog("auto_learn.result", { written });
+      // Mark the covered material only for a genuinely successful review.
+      // written === 0 counts (the material WAS examined; zero writes can be
+      // legitimate), but -1 (model not found, or an error caught below) does
+      // not. An aborted review, or one whose material changed mid-flight
+      // (new turns or tool results arrived after launch), also leaves the
+      // material unreviewed so the shutdown review still covers it.
+      if (
+        written >= 0 &&
+        gen === autoLearnGeneration &&
+        !controller.signal.aborted &&
+        materialRevision === revAtLaunch
+      ) {
+        reviewedRevision = revAtLaunch;
+      }
       // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
       // take effect next session — the model already has this context from
       // the conversation. Invalidating here would bust the prompt cache for
@@ -760,6 +830,23 @@ export function truncateReviewChunk(chunk: string, maxChars: number): string {
   if (chunk.length <= maxChars) return chunk;
   if (maxChars <= 0) return "";
   return `... [truncated]\n${chunk.slice(-maxChars)}`;
+}
+
+/**
+ * Whether the shutdown final review can be skipped. True only when the last
+ * successful review covered every event that arrived since (reviewed ===
+ * current revision) AND no pre-compaction snapshot is queued — a snapshot is
+ * pre-compaction material that no longer exists in the branch and must never
+ * be skipped. Pure so the skip decision is directly testable.
+ */
+export function shouldSkipShutdownReview(
+  reviewedRevision: number,
+  materialRevision: number,
+  hasQueuedCompactSnapshot: boolean,
+): boolean {
+  return (
+    reviewedRevision >= 0 && reviewedRevision === materialRevision && !hasQueuedCompactSnapshot
+  );
 }
 
 export function composeShutdownChunk(
