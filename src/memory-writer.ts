@@ -11,6 +11,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -91,6 +92,31 @@ export function isUnsafeMemoryName(name: string): boolean {
   );
 }
 
+/** Validate one candidate filename as a plain, contained, non-reserved child
+ * of `base`, returning its absolute path or null. */
+function containedChild(base: string, c: string): string | null {
+  // Direct children only: a separator-bearing candidate is a nested path —
+  // lexically contained here, but this store never writes nested topics,
+  // and restricting it flattens a whole class of containment tricks.
+  if (c.includes("/") || c.includes("\\") || c.includes("..")) return null;
+  const p = resolve(base, c);
+  // Containment: must be within the base dir (defense in depth on top of
+  // the direct-children rule).
+  if (p !== base && !p.startsWith(`${base}${sep}`)) return null;
+  // Reserved: never touch the index file.
+  if (basename(p).toLowerCase() === "memory.md") return null;
+  let st: import("node:fs").Stats;
+  try {
+    st = lstatSync(p);
+  } catch {
+    return null;
+  }
+  // Only plain regular files: a symlinked "topic" could point outside the
+  // store (read would leak, removal semantics get murky).
+  if (st.isSymbolicLink() || !st.isFile()) return null;
+  return p;
+}
+
 function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   // Unsafe names are rejected outright — never slugified. Slugify would
   // neutralize the separator and silently resolve a different topic than
@@ -106,28 +132,46 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   for (const c of name.endsWith(".md")
     ? [rawCandidate, `${slug}.md`]
     : [`${slug}.md`, rawCandidate]) {
-    // Direct children only: a separator-bearing candidate is a nested path —
-    // lexically contained here, but this store never writes nested topics,
-    // and restricting it flattens a whole class of containment tricks.
-    if (c.includes("/") || c.includes("\\") || c.includes("..")) continue;
-    const p = resolve(dir.dir, c);
-    // Containment: must be within the base dir (defense in depth on top of
-    // the direct-children rule).
-    if (p !== base && !p.startsWith(`${base}${sep}`)) continue;
-    // Reserved: never touch the index file.
-    if (basename(p).toLowerCase() === "memory.md") continue;
-    let st: import("node:fs").Stats;
-    try {
-      st = lstatSync(p);
-    } catch {
-      continue;
-    }
-    // Only plain regular files: a symlinked "topic" could point outside the
-    // store (read would leak, removal semantics get murky).
-    if (st.isSymbolicLink() || !st.isFile()) continue;
-    return p;
+    const p = containedChild(base, c);
+    if (p) return p;
   }
-  return null;
+
+  // Slug scan: a topic whose stem is not slug-normal ("Foo Bar.md", or
+  // uppercase) is unreachable by the candidates above — its slug differs from
+  // its stem, so `foo-bar.md` does not exist. Without this, supersession of
+  // such a topic silently no-opped: the snapshot lookup hit, then the stat of
+  // the slug path threw ENOENT and the candidate was skipped as "deleted".
+  // Ambiguous matches (two files slugifying alike) resolve to nothing rather
+  // than to an arbitrary one.
+  if (!slug) return null;
+  let found: string | null = null;
+  let matches = 0;
+  try {
+    for (const e of readdirSync(base, { withFileTypes: true })) {
+      if (!e.isFile() || !e.name.endsWith(".md") || e.name === "MEMORY.md") continue;
+      if (slugify(e.name.replace(/\.md$/, "")) !== slug) continue;
+      matches++;
+      found = containedChild(base, e.name);
+    }
+  } catch {
+    return null;
+  }
+  return matches === 1 ? found : null;
+}
+
+/** The filename a write of `name` should target: the EXISTING on-disk topic
+ * for that name (whatever its stem), else the slug-derived name.
+ *
+ * Exported because the auto-learn stale-overwrite guard must stat exactly the
+ * file writeMemory is about to write. Previously the guard stat'd the slug
+ * path while writeMemory also wrote the slug path: for a non-slug-normal stem
+ * both were wrong together, so the guard failed closed (a safe but silent
+ * no-op) and a write that DID proceed created a duplicate rather than
+ * superseding. Resolving the existing file aligns the guard, the write, and
+ * the advertised stem. */
+export function resolveWriteTarget(dir: MemoryDir, name: string): string {
+  const existing = resolveTopicFile(dir, name);
+  return existing ? basename(existing) : `${slugify(name)}.md`;
 }
 
 /** Sanitize a name into a safe filename slug. */
@@ -277,7 +321,15 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
       message: `Reserved memory name: ${req.name} — the slug "memory" collides with the reserved index filename`,
     };
   }
-  const filename = `${slug}.md`;
+  // Target the EXISTING file when one already exists for this name, so an
+  // overwrite supersedes that topic in place instead of creating a
+  // slug-named duplicate beside a non-slug-normal stem ("Foo Bar.md" +
+  // "foo-bar.md"). Resolution is NOT gated on allowOverwrite: the collision
+  // check below must also see that the name resolves to a file, otherwise a
+  // plain write of "Foo Bar" would not notice "Foo Bar.md" exists and would
+  // quietly create the same duplicate. The auto-learn stale-overwrite guard
+  // resolves identically, so it stats exactly the file this writes.
+  const filename = resolveWriteTarget(dir, req.name);
   const filePath = join(dir.dir, filename);
 
   const wasExisting = existsSync(filePath);
