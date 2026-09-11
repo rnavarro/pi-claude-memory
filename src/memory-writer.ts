@@ -383,6 +383,29 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // Build the full file content
   const fullContent = `${frontmatterYaml}\n${req.body.trimStart()}\n`;
 
+  // Refuse a topic the read paths would reject. Both readers cap at
+  // TOPIC_FILE_MAX_BYTES (the injector silently drops an oversize file from
+  // the prompt; recall_memory refuses it), so publishing past the cap produced
+  // an entry that reported success, got an index line, and could never be read
+  // through any interface this extension offers. Byte length, not string
+  // length: the cap is applied to bytes on the read side.
+  const contentBytes = Buffer.byteLength(fullContent, "utf8");
+  if (contentBytes > TOPIC_FILE_MAX_BYTES) {
+    debugLog("writer.write_oversize", {
+      slug,
+      filename,
+      tier: dir.tier,
+      bytes: contentBytes,
+      cap: TOPIC_FILE_MAX_BYTES,
+    });
+    return {
+      ok: false,
+      message:
+        `Memory ${filename} is too large to write (${contentBytes} bytes, cap ${TOPIC_FILE_MAX_BYTES}). ` +
+        `It would be unreadable by recall_memory and dropped from injection.`,
+    };
+  }
+
   // Ensure the directory exists
   mkdirSync(dir.dir, { recursive: true });
 
@@ -895,6 +918,17 @@ export function withIndexRetry(
     if (verifyGuard && !verifyGuard()) {
       debugLog("writer.index_publish_vetoed", { indexPath, attempt });
       return;
+    }
+    // Refuse to publish an index past the cap the parser enforces.
+    // parseIndexFile returns null for an oversize index, which hides EVERY
+    // entry in that tier — so appending a long description that crosses the
+    // threshold silently unindexes the whole store. Throwing surfaces it as a
+    // degraded write instead, and leaves the existing index untouched.
+    const indexBytes = Buffer.byteLength(next, "utf8");
+    if (indexBytes > INDEX_MAX_BYTES) {
+      throw new Error(
+        `index update would exceed the ${INDEX_MAX_BYTES}-byte cap (${indexBytes} bytes): ${indexPath}`,
+      );
     }
     atomicWriteFile(indexPath, next);
     verifyIndexPublish(indexPath, next, fn, verifyGuard);
