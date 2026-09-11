@@ -67,6 +67,19 @@ let turnCount = 0;
 // branches. Null when no review is running.
 let autoLearnInFlight: Promise<number> | null = null;
 
+// A compaction snapshot waiting for the in-flight review to finish, so the
+// pre-compaction branch is not silently dropped when compact fires during a
+// running review. Drained in launchAutoLearn's completion handler. Last
+// compact wins (coalesce) if several queue while a review runs.
+interface PendingCompact {
+  ctx: ExtensionContext;
+  cfg: AutoLearnConfig;
+  cwd: string;
+  chunk: string;
+  existingIndex: string;
+}
+let pendingCompact: PendingCompact | null = null;
+
 // Recent tool results captured for auto-learn context.
 const TOOL_RESULT_MAX_CHARS = 8000;
 let toolResultChunk = "";
@@ -132,6 +145,7 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     turnCount = 0;
     toolResultChunk = "";
     autoLearnInFlight = null;
+    pendingCompact = null;
     withDebugLogContext(
       { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
       () => {
@@ -195,7 +209,21 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         maxOutputTokens: config.reviewMaxOutputTokens,
       };
 
-      // Fire-and-forget: must not block compaction. Do not await.
+      // Fire-and-forget: must not block compaction. Do not await. If a review
+      // is already in flight, queue the snapshot to run when it finishes
+      // (coalesce — last compact wins) instead of silently dropping the
+      // pre-compaction branch.
+      if (autoLearnInFlight) {
+        debugLog("auto_learn.compact_queued", { chunkChars: truncated.length });
+        pendingCompact = {
+          ctx,
+          cfg: autoLearnCfg,
+          cwd: ctx.cwd,
+          chunk: truncated,
+          existingIndex,
+        };
+        return;
+      }
       void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex);
     },
   );
@@ -223,10 +251,18 @@ async function handleSessionShutdown(
       if (autoLearnInFlight) {
         debugLog("auto_learn.shutdown_await_inflight", {});
         try {
-          await autoLearnInFlight;
+          await raceTimeout(autoLearnInFlight, config.shutdownTimeoutMs);
         } catch {
-          // already logged inside launchAutoLearn
+          // timed out or errored — proceed to the final review regardless
         }
+        // The in-flight review's .finally clears the flag, but it may not
+        // have run yet (our await continuation can resume before the chained
+        // .finally in the same microtask wave). Clear explicitly so the final
+        // launchAutoLearn below does not bail on the stale non-null flag and
+        // silently skip the shutdown review.
+        autoLearnInFlight = null;
+        // A queued compact snapshot is superseded by this shutdown review.
+        pendingCompact = null;
       }
 
       // Now build a final chunk from whatever conversation we have. At
@@ -363,6 +399,13 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
         debugLog("auto_learn.skip", { turnCount, threshold: config.reviewIntervalTurns });
         return;
       }
+      // If a review is already running, do NOT reset the counter or drain the
+      // tool-result chunk — preserve them so the next settle fires with the
+      // accumulated context instead of starting from an empty window.
+      if (autoLearnInFlight) {
+        debugLog("auto_learn.skip_inflight", { turnCount });
+        return;
+      }
       // Reset the counter so we count the next N turns
       turnCount = 0;
 
@@ -480,12 +523,16 @@ function toolResultToText(event: ToolResultEvent): string {
 /** Append text to the tool result chunk, capping total size. */
 function appendToToolResultChunk(text: string): void {
   if (!text) return;
-  if (toolResultChunk.length + text.length > TOOL_RESULT_MAX_CHARS) {
-    // Drop the oldest content: keep the tail of the existing buffer
-    const overflow = toolResultChunk.length + text.length - TOOL_RESULT_MAX_CHARS;
-    toolResultChunk = toolResultChunk.slice(overflow + 1);
+  const sep = toolResultChunk ? "\n\n" : "";
+  let combined = toolResultChunk + sep + text;
+  // Clamp to the cap by keeping the most recent content (tail). This also
+  // bounds the buffer when a single result exceeds the cap (the previous
+  // slice(overflow+1) math left the buffer at MAX+1 and could exceed it
+  // entirely for an oversized single result).
+  if (combined.length > TOOL_RESULT_MAX_CHARS) {
+    combined = combined.slice(combined.length - TOOL_RESULT_MAX_CHARS);
   }
-  toolResultChunk += `${toolResultChunk ? "\n\n" : ""}${text}`;
+  toolResultChunk = combined;
 }
 
 /** Launch an auto-learn review with single-flight tracking.
@@ -530,10 +577,39 @@ function launchAutoLearn(
       return -1;
     })
     .finally(() => {
+      // Clear the flag first, then drain a queued compaction snapshot. The
+      // clear must happen here (not only in the shutdown await) so periodic
+      // triggers see a clean slate.
       if (autoLearnInFlight === promise) autoLearnInFlight = null;
+      drainPendingCompact();
     });
 
   return promise;
+}
+
+/** Launch a queued compaction snapshot if one is waiting. Called from
+ * launchAutoLearn's completion handler so a compact that arrived while a
+ * review was running is not silently dropped. */
+function drainPendingCompact(): void {
+  if (!pendingCompact) return;
+  const p = pendingCompact;
+  pendingCompact = null;
+  debugLog("auto_learn.compact_drain", { chunkChars: p.chunk.length });
+  void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk, p.existingIndex);
+}
+
+/** Race a promise against a timeout. Resolves with the promise's value, or
+ * rejects with a timeout Error after ms. Used so an in-flight review cannot
+ * block shutdown indefinitely. The timer is unref'd so it never keeps the
+ * process alive on its own. */
+function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      const t = setTimeout(() => reject(new Error("auto-learn in-flight await timed out")), ms);
+      t.unref?.();
+    }),
+  ]);
 }
 
 /** Invalidate the frozen injection.
