@@ -44,7 +44,7 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   autoLearn: true,
   reviewIntervalTurns: 10,
   injectTokenCap: 5000,
-  reviewModel: { provider: "neuralwatt", id: "glm-5.2-flex" },
+  reviewModel: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   reviewThinking: "off",
   reviewMaxOutputTokens: 2048,
   reviewMaxChunkChars: 50000,

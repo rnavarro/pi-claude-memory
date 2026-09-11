@@ -34,7 +34,7 @@ export interface AutoLearnConfig {
 
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
-  model: { provider: "neuralwatt", id: "glm-5.2-flex" },
+  model: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   thinking: "off",
   maxOutputTokens: 2048,
 };
