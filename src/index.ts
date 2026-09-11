@@ -319,16 +319,17 @@ async function handleSessionShutdown(
       // we supply our own abort signal with a deadline.
       const branchText = serializeBranch(ctx);
       const toolText = toolResultChunk;
-      let chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+      const liveChunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
 
-      // A queued pre-compaction snapshot must NOT be discarded: compaction
-      // already destroyed the raw messages it captured, so the current
-      // post-compaction branch is not a substitute for its material. Prepend
-      // it to the final review input (bounded by the same shared deadline).
-      if (pendingCompact) {
-        chunk = `### Pre-compaction snapshot\n${pendingCompact.chunk}\n\n${chunk}`;
-        pendingCompact = null;
-      }
+      // A queued pre-compaction snapshot must NOT be discarded (compaction
+      // already destroyed the raw messages it captured) and it must not
+      // swamp the live branch either. It arrives here ALREADY truncated to
+      // reviewMaxChunkChars when it was queued, so a naive prepend followed
+      // by a tail-truncation spends the entire budget on it and drops 100%
+      // of the post-compaction material. Budget the two explicitly instead.
+      const snapshotChunk = pendingCompact?.chunk ?? null;
+      pendingCompact = null;
+      const chunk = composeShutdownChunk(snapshotChunk, liveChunk, config.reviewMaxChunkChars);
 
       if (chunk.trim().length < config.shutdownMinChunkChars) {
         debugLog("auto_learn.skip_shutdown", {
@@ -338,15 +339,14 @@ async function handleSessionShutdown(
         return;
       }
 
-      const truncated =
-        chunk.length > config.reviewMaxChunkChars
-          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
-          : chunk;
+      // composeShutdownChunk already applied the cap; no further truncation.
+      const truncated = chunk;
 
       debugLog("auto_learn.trigger_shutdown", {
         chunkChars: truncated.length,
         branchChars: branchText.length,
         toolResultChars: toolText.length,
+        snapshotChars: snapshotChunk?.length ?? 0,
       });
 
       const autoLearnCfg: AutoLearnConfig = {
@@ -684,6 +684,44 @@ function drainPendingCompact(): void {
   // supersession.
   debugLog("auto_learn.compact_drain", { chunkChars: p.chunk.length });
   void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk);
+}
+
+/** Compose the shutdown review input from an optional queued pre-compaction
+ * snapshot and the live post-compaction chunk, within a hard character cap.
+ *
+ * The snapshot arrives already truncated to the cap by the compaction path,
+ * so simply prepending it and truncating the tail spends the whole budget on
+ * pre-compaction material and drops the live branch entirely — the exact
+ * material this shutdown review exists to capture. Instead the snapshot is
+ * held to at most half the budget and the live chunk takes the remainder
+ * (and is itself capped to whatever is left). Both halves get a truncation
+ * marker so the reviewer can tell it is seeing a prefix. */
+export function composeShutdownChunk(
+  snapshot: string | null,
+  live: string,
+  maxChars: number,
+): string {
+  const cap = Math.max(0, maxChars);
+  let liveOut = live;
+  if (live.length > cap) {
+    liveOut = `${live.slice(0, cap)}\n... [truncated]`;
+  }
+
+  if (!snapshot) return liveOut;
+
+  // Reserve at least half the budget for the live branch. A snapshot shorter
+  // than its share hands the leftover room to the live chunk.
+  const snapshotShare = Math.floor(cap / 2);
+  let snapshotOut = snapshot;
+  if (snapshotOut.length > snapshotShare) {
+    snapshotOut = `${snapshotOut.slice(0, snapshotShare)}\n... [truncated]`;
+  }
+  const liveBudget = Math.max(0, cap - snapshotOut.length);
+  if (liveOut.length > liveBudget) {
+    liveOut = `${liveOut.slice(0, liveBudget)}\n... [truncated]`;
+  }
+
+  return `### Pre-compaction snapshot\n${snapshotOut}\n\n${liveOut}`;
 }
 
 /** Race a promise against a timeout. Resolves with the promise's value, or
