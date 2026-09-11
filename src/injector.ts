@@ -22,11 +22,17 @@ const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candi
 /**
  * Routing anchor for when memory entries exist. Tells the model how to use
  * memory tools and how they coexist with ctx_search.
+/**
  * Matches context-mode's terse, directive arrow-syntax.
+ *
+ * The reviewer sentence is generated per-session rather than hardcoded: with
+ * autoLearn disabled the model is the ONLY writer, and telling it to withhold
+ * routine memories in favour of a reviewer that never runs is a silent
+ * memory-loss mode. The interval is likewise real config, not the literal 10.
  */
 export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. The memory below is already in context — never re-read a loaded entry.
 Index entry marked ⟨index-only⟩ → recall_memory(name); unmarked entries are already in full.
-User correction, stated preference, or verified fix → write_memory this turn. A background reviewer sweeps the conversation every 10 turns for everything else — don't duplicate it.
+User correction, stated preference, or verified fix → write_memory this turn.{{REVIEWER}}
 Memory that is now wrong → remove_memory (never leave it to rot).
 Durable facts across sessions → the index below. What happened in a prior session (errors, commands, prompts) → ctx_search.
 Never store ephemeral state, TODOs, or commit hashes.`;
@@ -36,8 +42,21 @@ Never store ephemeral state, TODOs, or commit hashes.`;
  * Just tells the model the system is active and what qualifies for write_memory.
  */
 export const MEMORY_ROUTING_ANCHOR_EMPTY = `pi-claude-memory active. No memories yet for this project.
-User correction, stated preference, or verified fix → write_memory. A background reviewer sweeps every 10 turns for routine learning.
+User correction, stated preference, or verified fix → write_memory.{{REVIEWER}}
 Never store ephemeral state, TODOs, or commit hashes.`;
+
+/** Describe the reviewer honestly for the current config. */
+export function reviewerClause(autoLearn: boolean, reviewIntervalTurns: number): string {
+  if (!autoLearn) {
+    return " Nothing sweeps this conversation automatically — write_memory is the only way a fact survives.";
+  }
+  return ` A background reviewer sweeps the conversation every ${reviewIntervalTurns} turns for everything else — don't duplicate it.`;
+}
+
+/** Fill in the reviewer sentence for the resolved config. */
+function withReviewer(template: string, autoLearn: boolean, reviewIntervalTurns: number): string {
+  return template.replace("{{REVIEWER}}", reviewerClause(autoLearn, reviewIntervalTurns));
+}
 
 /** Result of building an injection block for a tier. */
 export interface InjectionBlock {
@@ -67,12 +86,20 @@ export interface InjectionBlock {
  * @param hasCtxSearch Whether ctx_search tool is registered (gates the
  *        ctx_search clause in the anchor). When false, the clause is omitted
  *        so the anchor doesn't reference an unavailable tool.
+ * @param autoLearn Whether the background reviewer is enabled. When false the
+ *        anchor must NOT promise a reviewer that never runs, or the model
+ *        withholds routine memories from a sweep that does not exist.
+ * @param reviewIntervalTurns Interval stated in the anchor when autoLearn is
+ *        on, so the prompt matches the configured cadence rather than a
+ *        hardcoded value.
  */
 export function buildMemoryInjection(
   project: MemoryDir | null,
   global: MemoryDir | null,
   tokenCap = DEFAULT_TOKEN_CAP,
   hasCtxSearch = true,
+  autoLearn = true,
+  reviewIntervalTurns = 10,
 ): { text: string; warnings: string[] } {
   const warnings: string[] = [];
   const blocks: string[] = [];
@@ -94,8 +121,13 @@ export function buildMemoryInjection(
     if (block.hasEntries) hasAnyEntries = true;
   }
 
-  // Choose anchor variant based on whether any entries exist
-  const anchor = hasAnyEntries ? MEMORY_ROUTING_ANCHOR : MEMORY_ROUTING_ANCHOR_EMPTY;
+  // Choose anchor variant based on whether any entries exist, and state the
+  // reviewer situation truthfully for the resolved config.
+  const anchor = withReviewer(
+    hasAnyEntries ? MEMORY_ROUTING_ANCHOR : MEMORY_ROUTING_ANCHOR_EMPTY,
+    autoLearn,
+    reviewIntervalTurns,
+  );
 
   // Gate the ctx_search clause when the tool isn't registered
   const finalAnchor = hasCtxSearch ? anchor : anchor.replace(/\n.*ctx_search\..*$/m, "");

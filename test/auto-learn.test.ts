@@ -2,13 +2,14 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildExistingIndexSummary, parseCandidates, snapshotMtimes } from "../src/auto-learn.js";
+import { withDebugLogContext } from "../src/debug-log.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
-import type { ResolveResult } from "../src/types.js";
+import type { MemoryDir as MemoryDirType, ResolveResult } from "../src/types.js";
 
 let tmpDir: string;
 let origHome: string | undefined;
@@ -300,34 +301,47 @@ describe("createProjectMemoryDir", () => {
   });
 });
 
-describe("createProjectMemoryDir split-brain warning", () => {
-  it("warns loudly (and still creates) when a basename-matched store already exists", () => {
+describe("createProjectMemoryDir split-brain notice", () => {
+  it("records a candidate-store notice in the debug log (not the TUI) and still creates", () => {
     // An existing store for a *different* cwd sharing the basename "app":
     // the exact store for cwdB does not exist, but a basename glob would
     // match the customer-a store. Mutations resolve exact-only, so creating
-    // here shadows those memories — the operator must see that.
+    // here shadows those memories — record it for the operator.
+    //
+    // This is advisory and fires per candidate, so it goes to the debug log
+    // rather than the console: a console line would land inside the rendered
+    // conversation. See the no-console-ui-noise memory.
     const otherEncoded = `-${encodePath(join(tmpDir, "work", "customer-a", "app")).slice(1)}`;
     const projectsRoot = join(tmpDir, ".claude", "projects");
     mkdirSync(join(projectsRoot, otherEncoded), { recursive: true });
     writeFileSync(join(projectsRoot, otherEncoded, "MEMORY.md"), "# Customer A\n- [x](x.md) — x\n");
 
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const logDir = join(tmpDir, ".pi", "agent", "pi-claude-memory", "debug");
+    const sid = `split-${Date.now()}`;
+    const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
+    let created: MemoryDirType | null = null;
     try {
-      const cwdB = join(tmpDir, "work", "customer-b", "app");
-      const created = createProjectMemoryDir(cwdB);
-      if (!created) throw new Error("expected createProjectMemoryDir to return a dir");
-      // Warning fired: names the shadowed store and the adopt-by-rename hint
-      const errCalls = vi.mocked(console.error).mock.calls.map((c) => String(c[0]));
-      expect(
-        errCalls.some((m) => m.includes("NEW project store") && m.includes(otherEncoded)),
-      ).toBe(true);
-      expect(errCalls.some((m) => m.includes("split-brain"))).toBe(true);
-      // The new exact store dir was created anyway (writes must succeed;
-      // MEMORY.md itself appears on first write).
-      expect(existsSync(created.dir)).toBe(true);
+      created = withDebugLogContext({ enabled: true, cwd: tmpDir, sessionId: sid }, () => {
+        const cwdB = join(tmpDir, "work", "customer-b", "app");
+        return createProjectMemoryDir(cwdB);
+      });
     } finally {
-      vi.mocked(console.error).mockRestore();
+      consoleErr.mockRestore();
     }
+    if (!created) throw new Error("expected createProjectMemoryDir to return a dir");
+
+    // The new exact store dir was created (MEMORY.md appears on first write).
+    expect(existsSync(created.dir)).toBe(true);
+
+    // No console noise went to the TUI.
+    expect(consoleErr).not.toHaveBeenCalled();
+
+    // The notice is recorded in the debug log, naming the sibling store.
+    const logFile = join(logDir, `${sid}.ndjson`);
+    expect(existsSync(logFile)).toBe(true);
+    const logged = readFileSync(logFile, "utf8");
+    expect(logged).toContain("split_brain_shadows_existing_store");
+    expect(logged).toContain(otherEncoded);
   });
 });
 

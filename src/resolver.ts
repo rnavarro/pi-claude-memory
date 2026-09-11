@@ -125,27 +125,23 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   // split-brain), the fresh exact dir we create will shadow it — resolution
   // prefers the exact dir from now on, making prior memories invisible to
   // reads. Mutations resolve exact-only (they must never land in another
-  // project's store), so this write cannot adopt the existing store; say so
-  // loudly instead of silently orphaning it.
+  // project's store), so this write cannot adopt the existing store; note it
+  // in the debug log rather than in the TUI.
   const siblings = findProjectCandidates(absCwd.split(sep).pop() ?? absCwd);
   if (siblings.length > 0) {
     // Suffix matching is heuristic: "/home/x/my-<basename>" also ends with
-    // "-<basename>", so candidates can be unrelated stores. Worded as
-    // "possible" and hedged accordingly — but still surfaced: the cost of
-    // a false positive is one console line, the cost of a missed real
-    // split-brain is silently shadowed memories.
-    console.error(
-      `[pi-claude-memory] creating a NEW project store for ${absCwd}. ` +
-        `Possible rename split-brain: ${siblings.length} store(s) whose encoded ` +
-        `names end in "-${absCwd.split(sep).pop()}" already exist ` +
-        `(${siblings.join(", ")}) — possibly unrelated projects. If one IS a ` +
-        `renamed cwd of this project, rename it to ${encoded} to adopt its ` +
-        `memories; otherwise ignore this notice.`,
-    );
+    // "-<basename>", so candidates can be unrelated stores. This is advisory
+    // only, and it fires once per candidate while the write loop runs — it
+    // belongs in the debug log, not in the middle of the rendered
+    // conversation. Set debugLog:true in settings.json to see it.
+    //
+    // The information is not lost: the resolved store is still created, and
+    // the debug entry records every candidate for later inspection.
     debugLog("resolver.split_brain_shadows_existing_store", {
       cwd: absCwd,
       encoded,
       siblings,
+      note: `new project store created for ${absCwd}; ${siblings.length} same-basename store(s) exist (${siblings.join(", ")}) — if one is a renamed cwd of this project, rename it to ${encoded} to adopt its memories`,
     });
   }
 

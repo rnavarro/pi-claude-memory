@@ -357,3 +357,40 @@ describe("injector containment: symlinked ancestors and roots", () => {
     for (const d of [proj, glob, outside]) rmSync(d, { recursive: true, force: true });
   });
 });
+
+describe("routing anchor tells the truth about the reviewer", () => {
+  it("promises a reviewer with the configured interval when autoLearn is on", async () => {
+    const { reviewerClause } = await import("../src/injector.js");
+    const c = reviewerClause(true, 25);
+    expect(c).toContain("every 25 turns");
+    expect(c).not.toContain("every 10 turns");
+  });
+
+  it("drops the reviewer promise when autoLearn is off", async () => {
+    const { reviewerClause } = await import("../src/injector.js");
+    const c = reviewerClause(false, 10);
+    // Telling the model to withhold memories in favour of a reviewer that
+    // never runs is a silent memory-loss mode.
+    expect(c).not.toContain("reviewer sweeps");
+    expect(c).toContain("only way a fact survives");
+  });
+
+  it("renders the anchor without a leftover template placeholder", async () => {
+    const { buildMemoryInjection, MEMORY_ROUTING_ANCHOR } = await import("../src/injector.js");
+    expect(MEMORY_ROUTING_ANCHOR).toContain("{{REVIEWER}}");
+    const root = mkdtempSync(join(tmpdir(), "pcm-anchor-"));
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "MEMORY.md"), "# M\n- [X](x.md) \u2014 s\n");
+    writeFileSync(join(root, "x.md"), "---\ndescription: d\ntype: project\n---\nbody\n");
+    const proj: MemoryDirType = {
+      tier: "project",
+      dir: root,
+      indexPath: join(root, "MEMORY.md"),
+      label: "project",
+    };
+    const { text } = buildMemoryInjection(proj, null, 5000, true, false, 10);
+    expect(text).not.toContain("{{REVIEWER}}");
+    expect(text).toContain("only way a fact survives");
+    rmSync(root, { recursive: true, force: true });
+  });
+});

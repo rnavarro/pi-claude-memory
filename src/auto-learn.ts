@@ -121,7 +121,6 @@ export async function runAutoLearn(
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     debugLog("auto_learn.no_api_key", { provider: cfg.model.provider });
-    console.error(`[pi-claude-memory] auto-learn: no API key for ${cfg.model.provider}`);
     return -1;
   }
 
@@ -206,7 +205,6 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       .trim();
   } catch (err) {
     debugLog("auto_learn.llm_error", { error: String(err) });
-    console.error(`[pi-claude-memory] auto-learn: LLM call failed: ${String(err)}`);
     return -1;
   }
 
@@ -301,7 +299,6 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       if (result.ok) written++;
     } catch (err) {
       debugLog("auto_learn.write_error", { name: c.name, tier: c.tier, error: String(err) });
-      console.error(`[pi-claude-memory] auto-learn write failed for ${c.name}: ${String(err)}`);
     }
   }
 
