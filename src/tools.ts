@@ -11,7 +11,7 @@ import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache } from "./index.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
 import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
-import type { ResolveResult } from "./types.js";
+import type { MemoryDir, ResolveResult } from "./types.js";
 
 /** Pick a tier dir from a resolve result. */
 function pickTier(resolved: ResolveResult, tier: "project" | "global") {
@@ -46,64 +46,54 @@ const recallTool = defineTool({
     const tier = params.tier ?? "project";
     const otherTier = tier === "project" ? "global" : "project";
 
-    // No memory dir at all.
-    if (!pickTier(resolved, tier) && !pickTier(resolved, otherTier)) {
+    // Candidate order: the requested tier first, then the other tier ONLY
+    // when the caller did not name one. An explicitly named tier is honored
+    // strictly, so a same-slug entry in the other store is never substituted.
+    //
+    // The other tier must be a candidate even when the requested tier has NO
+    // directory at all: with no project store for this cwd, a global entry
+    // must still be reachable. Resolving the dir first and only falling back
+    // after a failed READ dropped that case entirely, so recall_memory
+    // answered "No memory directory available (tier=project)" while a global
+    // store full of memories sat one call away.
+    const ordered: Array<"project" | "global"> = defaultTier ? [tier, otherTier] : [tier];
+    const candidates: MemoryDir[] = [];
+    for (const t of ordered) {
+      const d = pickTier(resolved, t);
+      if (d && !candidates.includes(d)) candidates.push(d);
+    }
+
+    if (candidates.length === 0) {
       return {
         content: [{ type: "text", text: `No memory directory available (tier=${tier}).` }],
         details: undefined as unknown,
       };
     }
 
-    const dir = pickTier(resolved, tier);
-    if (!dir) {
-      return {
-        content: [{ type: "text", text: `No memory directory available (tier=${tier}).` }],
-        details: undefined as unknown,
-      };
-    }
-    const result = readMemory(dir, params.name);
-
-    // Entry-level fallback: an omitted tier promises "falls back to global if
-    // not found" — the ENTRY may live in the other tier, not just the dir.
-    // An explicitly named tier is honored strictly so same-slug entries
-    // cannot be confused across tiers.
-    if (!result.ok && defaultTier) {
-      const otherDir = pickTier(resolved, otherTier);
-      if (otherDir && otherDir !== dir) {
-        const fallback = readMemory(otherDir, params.name);
-        if (fallback.ok) {
-          debugLog("tool.recall_memory.fallback", {
-            name: params.name,
-            tier: otherDir.tier,
-          });
-          const fallbackHeader = `**${otherDir.label} tier** — \`${fallback.filePath}\`\n\n`;
-          return {
-            content: [{ type: "text", text: fallbackHeader + fallback.content }],
-            details: {
-              tier: otherDir.tier,
-              filePath: fallback.filePath,
-              name: fallback.frontmatter.name,
-            } as unknown,
-          };
-        }
+    let miss: string | null = null;
+    for (const dir of candidates) {
+      const result = readMemory(dir, params.name);
+      if (!result.ok) {
+        miss ??= result.message;
+        continue;
       }
-    }
-
-    if (!result.ok) {
+      if (dir !== candidates[0]) {
+        debugLog("tool.recall_memory.fallback", { name: params.name, tier: dir.tier });
+      }
+      const header = `**${dir.label} tier** \u2014 \u0060${result.filePath}\u0060\n\n`;
       return {
-        content: [{ type: "text", text: result.message }],
-        details: undefined as unknown,
+        content: [{ type: "text", text: header + result.content }],
+        details: {
+          tier: dir.tier,
+          filePath: result.filePath,
+          name: result.frontmatter.name,
+        } as unknown,
       };
     }
 
-    const header = `**${dir.label} tier** — \`${result.filePath}\`\n\n`;
     return {
-      content: [{ type: "text", text: header + result.content }],
-      details: {
-        tier: dir.tier,
-        filePath: result.filePath,
-        name: result.frontmatter.name,
-      } as unknown,
+      content: [{ type: "text", text: miss ?? `Memory not found: ${params.name}` }],
+      details: undefined as unknown,
     };
   },
 });

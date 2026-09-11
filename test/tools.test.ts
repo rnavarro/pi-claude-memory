@@ -111,3 +111,51 @@ describe("write_memory global store creation", () => {
     expect(idx).toContain("fresh-global-entry.md");
   });
 });
+
+describe("recall_memory with an absent project store", () => {
+  // Regression: resolving the requested directory first and only falling
+  // back after a failed READ meant that when NO project store existed for
+  // the cwd, recall_memory answered "No memory directory available
+  // (tier=project)" while a global store full of memories sat unread.
+  it("falls back to the global store when there is no project directory", async () => {
+    const cwd = join(tmpHome, "work", "never-created");
+    const globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(
+      join(globalDir, "global-only.md"),
+      "---\ndescription: g\ntype: reference\n---\nglobal only body\n",
+    );
+
+    const res = await recallMemoryTool.execute(
+      "t-absent",
+      { name: "global-only" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    const text = (res.content[0] as { type: string; text: string }).text;
+    expect(text).toContain("global only body");
+    expect(text).not.toContain("No memory directory available");
+    expect((res.details as { tier: string }).tier).toBe("global");
+  });
+
+  it("still honors an explicitly named tier strictly", async () => {
+    const cwd = join(tmpHome, "work", "never-created-2");
+    const globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(
+      join(globalDir, "global-only-2.md"),
+      "---\ndescription: g\ntype: reference\n---\nglobal only body 2\n",
+    );
+
+    const res = await recallMemoryTool.execute(
+      "t-strict",
+      { name: "global-only-2", tier: "project" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    const text = (res.content[0] as { type: string; text: string }).text;
+    expect(text).toContain("No memory directory available");
+  });
+});

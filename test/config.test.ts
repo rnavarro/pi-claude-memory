@@ -33,3 +33,39 @@ describe("num — numeric config validation", () => {
     warn.mockRestore();
   });
 });
+
+describe("loadConfig guard behavior", () => {
+  it("warns (rather than silently defaulting) on a present-but-invalid numeric value", async () => {
+    // The call sites used to be gated by `typeof n.X === "number"`, so a
+    // string like "9000" never reached num() and defaulted silently —
+    // exactly the case a user needs feedback for.
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "pcm-cfg-"));
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(home, ".pi", "agent", "settings.json"),
+      JSON.stringify({
+        "pi-claude-memory": { shutdownTimeoutMs: "9000", reviewIntervalTurns: 2.5 },
+      }),
+    );
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { loadConfig, DEFAULT_CONFIG } = await import("../src/config.js");
+      const cfg = loadConfig();
+      // Both invalid values fall back, and the user is told.
+      expect(cfg.shutdownTimeoutMs).toBe(DEFAULT_CONFIG.shutdownTimeoutMs);
+      expect(cfg.reviewIntervalTurns).toBe(DEFAULT_CONFIG.reviewIntervalTurns);
+      const msgs = warn.mock.calls.map((c) => String(c[0]));
+      expect(msgs.some((m) => m.includes("shutdownTimeoutMs"))).toBe(true);
+      expect(msgs.some((m) => m.includes("reviewIntervalTurns"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+    }
+  });
+});

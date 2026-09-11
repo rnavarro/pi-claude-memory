@@ -94,7 +94,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
       ...DEFAULT_CONFIG,
       ...(typeof n.debugLog === "boolean" ? { debugLog: n.debugLog } : {}),
       ...(typeof n.autoLearn === "boolean" ? { autoLearn: n.autoLearn } : {}),
-      ...(typeof n.reviewIntervalTurns === "number"
+      ...(n.reviewIntervalTurns !== undefined
         ? {
             reviewIntervalTurns: num(
               n.reviewIntervalTurns,
@@ -105,7 +105,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
             ),
           }
         : {}),
-      ...(typeof n.injectTokenCap === "number"
+      ...(n.injectTokenCap !== undefined
         ? {
             injectTokenCap: num(
               n.injectTokenCap,
@@ -118,7 +118,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
         : {}),
       ...(isModelObj(n.reviewModel) ? { reviewModel: n.reviewModel } : {}),
       ...(isThinkingLevel(n.reviewThinking) ? { reviewThinking: n.reviewThinking } : {}),
-      ...(typeof n.reviewMaxOutputTokens === "number"
+      ...(n.reviewMaxOutputTokens !== undefined
         ? {
             reviewMaxOutputTokens: num(
               n.reviewMaxOutputTokens,
@@ -129,7 +129,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
             ),
           }
         : {}),
-      ...(typeof n.reviewMaxChunkChars === "number"
+      ...(n.reviewMaxChunkChars !== undefined
         ? {
             reviewMaxChunkChars: num(
               n.reviewMaxChunkChars,
@@ -141,7 +141,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
           }
         : {}),
       ...(typeof n.reviewOnShutdown === "boolean" ? { reviewOnShutdown: n.reviewOnShutdown } : {}),
-      ...(typeof n.shutdownMinChunkChars === "number"
+      ...(n.shutdownMinChunkChars !== undefined
         ? {
             shutdownMinChunkChars: num(
               n.shutdownMinChunkChars,
@@ -152,7 +152,7 @@ export function loadConfig(): PiClaudeMemoryConfig {
             ),
           }
         : {}),
-      ...(typeof n.shutdownTimeoutMs === "number"
+      ...(n.shutdownTimeoutMs !== undefined
         ? {
             shutdownTimeoutMs: num(
               n.shutdownTimeoutMs,
@@ -173,7 +173,15 @@ export function loadConfig(): PiClaudeMemoryConfig {
 function isModelObj(v: unknown): v is { provider: string; id: string } {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const o = v as Record<string, unknown>;
-  return typeof o.provider === "string" && typeof o.id === "string";
+  // Non-empty: {provider: "", id: ""} passes a bare typeof check and then
+  // fails much later as a confusing "model / not found". Reject it here so
+  // the default model is used instead.
+  return (
+    typeof o.provider === "string" &&
+    o.provider.length > 0 &&
+    typeof o.id === "string" &&
+    o.id.length > 0
+  );
 }
 
 function isThinkingLevel(v: unknown): v is "off" | "minimal" | "low" | "medium" | "high" {

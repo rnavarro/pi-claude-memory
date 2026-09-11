@@ -331,13 +331,41 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
     };
   }
 
-  // Patch MEMORY.md: append a link entry if not already present.
-  patchIndexAppend(dir, {
-    filename,
-    title: deriveTitle(req.name),
-    summary: req.description,
-    pinned: req.pinned,
-  });
+  // Patch MEMORY.md: append a link entry if not already present. Never let
+  // a failure here escape: the topic file is already on disk, and throwing
+  // would (a) in auto-learn be swallowed by the per-candidate catch, leaving
+  // a topic with NO index line — invisible to every injection, the exact
+  // state withIndexRetry exists to prevent — and (b) in the write_memory
+  // tool skip invalidateResolveCache, leaving a stale frozen injection.
+  let indexError: string | null = null;
+  try {
+    patchIndexAppend(dir, {
+      filename,
+      // Derive the display title from the SLUG, not the raw name: slugify
+      // strips characters that are not legal in a filename, and the index
+      // line interpolates the title inside [..]. A raw name containing ']'
+      // (e.g. "a]b" -> ab.md) produced `- [A]b](ab.md) — ...`, which no
+      // index regex can ever match, so every later write appended a
+      // duplicate and removal could not strip the line. Using the slug keeps
+      // title and filename in agreement by construction.
+      title: deriveTitle(slug),
+      summary: req.description,
+      pinned: req.pinned,
+    });
+  } catch (err) {
+    indexError = String(err);
+    debugLog("writer.index_patch_failed", {
+      slug,
+      filename,
+      tier: dir.tier,
+      label: dir.label,
+      error: indexError,
+    });
+    console.error(
+      `[pi-claude-memory] wrote ${filename} but failed to update ${dir.indexPath}: ${indexError}. ` +
+        `The topic file exists but has no index line, so it will not be injected until the next successful write to this store.`,
+    );
+  }
 
   debugLog("writer.write_ok", {
     slug,
@@ -355,7 +383,9 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
 
   return {
     ok: true,
-    message: `Wrote memory ${slug} to ${dir.label} tier`,
+    message: indexError
+      ? `Wrote memory ${slug} to ${dir.label} tier, but the index update failed (${indexError}); the entry is not linked yet`
+      : `Wrote memory ${slug} to ${dir.label} tier`,
     filePath,
   };
 }
@@ -415,8 +445,12 @@ function patchIndexAppend(
       return lines.join("\n");
     }
 
-    // Append at end. Preserve trailing newline state.
-    const ending = content.endsWith("\n") ? "" : "\n";
+    // Append at end. Preserve trailing newline state — and treat EMPTY
+    // content as needing no separator: `"".endsWith("\n")` is false, so an
+    // empty-but-existing MEMORY.md would otherwise gain a stray leading
+    // blank line, which parseIndexContent keeps as an IndexLine and
+    // renderIndexSection re-emits into the prompt on every turn.
+    const ending = content === "" || content.endsWith("\n") ? "" : "\n";
     return `${content}${ending}${newLine}\n`;
   });
 }

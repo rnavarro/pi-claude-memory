@@ -697,3 +697,72 @@ describe("name policy and index lines", () => {
     expect(readFileSync(dir.indexPath, "utf8")).not.toContain("foo.md");
   });
 });
+
+describe("index-line integrity", () => {
+  it("derives the title from the slug so bracket-bearing names stay matchable", () => {
+    // "a]b" slugifies to "ab"; using the RAW name as the title emitted
+    // "- [A]b](ab.md) — ...", which no index regex can match.
+    const res = writeMemory(dir, {
+      name: "a]b",
+      description: "bracketed",
+      type: "project",
+      tier: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: true,
+    });
+    expect(res.ok).toBe(true);
+    const index = readFileSync(join(dir.dir, "MEMORY.md"), "utf8");
+    expect(index).toContain("- [Ab](ab.md) — bracketed");
+    expect(index).not.toContain("A]b");
+
+    // And the line must be rewritable (not duplicated) on a second write.
+    writeMemory(dir, {
+      name: "a]b",
+      description: "updated",
+      type: "project",
+      tier: "project",
+      body: "body2",
+      pinned: false,
+      allowOverwrite: true,
+    });
+    const after = readFileSync(join(dir.dir, "MEMORY.md"), "utf8");
+    expect(after.match(/\(ab\.md\)/g)).toHaveLength(1);
+    expect(after).toContain("updated");
+  });
+
+  it("does not add a leading blank line to an empty index", () => {
+    writeFileSync(join(dir.dir, "MEMORY.md"), "");
+    writeMemory(dir, {
+      name: "first entry",
+      description: "first",
+      type: "project",
+      tier: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    const index = readFileSync(join(dir.dir, "MEMORY.md"), "utf8");
+    expect(index.startsWith("- [First Entry](first-entry.md)")).toBe(true);
+    expect(index.startsWith("\n")).toBe(false);
+  });
+
+  it("reports index-update failure without losing the topic file", () => {
+    // Force patchIndexAppend to throw by making MEMORY.md a directory.
+    mkdirSync(join(dir.dir, "MEMORY.md"));
+    const res = writeMemory(dir, {
+      name: "orphan",
+      description: "orphan",
+      type: "project",
+      tier: "project",
+      body: "orphan body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    // The write itself succeeded and the caller is told the index lagged.
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("index update failed");
+    // Topic file is on disk despite the failed index patch.
+    expect(existsSync(join(dir.dir, "orphan.md"))).toBe(true);
+  });
+});
