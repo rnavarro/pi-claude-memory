@@ -254,9 +254,7 @@ async function handleSessionShutdown(
   event: SessionShutdownEvent,
   ctx: ExtensionContext,
 ): Promise<void> {
-  console.error(
-    `[pi-claude-memory] session_shutdown fired: reason=${event.reason} turnCount=${turnCount}`,
-  );
+  debugLog("index.shutdown_fired", { reason: event.reason, turnCount });
   await withDebugLogContext(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     async () => {
@@ -431,12 +429,13 @@ function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
     resolved.global,
     config.injectTokenCap,
     hasCtxSearch,
+    config.autoLearn,
+    config.reviewIntervalTurns,
   );
 
   if (warnings.length > 0) {
     for (const w of warnings) {
       debugLog("injector.warning", { warning: w });
-      console.error(`[pi-claude-memory] ${w}`);
     }
   }
 
@@ -637,12 +636,12 @@ function launchAutoLearn(
   autoLearnAbort = controller;
   promise
     .then((written) => {
+      // Progress goes to the debug log, NOT to the console: this fires
+      // mid-conversation and a raw console line lands inside the rendered
+      // TUI output, breaking up the response formatting. debugLog is
+      // already gated by config.debugLog, which is where background-work
+      // chatter belongs.
       debugLog("auto_learn.result", { written });
-      if (written > 0) {
-        console.error(
-          `[pi-claude-memory] auto-learn: wrote ${written} new memor${written === 1 ? "y" : "ies"}`,
-        );
-      }
       // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
       // take effect next session — the model already has this context from
       // the conversation. Invalidating here would bust the prompt cache for
