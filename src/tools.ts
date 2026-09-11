@@ -8,7 +8,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
-import { invalidateResolveCache } from "./index.js";
+import { invalidateResolveCache, withToolLogContext } from "./index.js";
 import type { MemoryOpResult } from "./memory-writer.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
 import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
@@ -365,9 +365,32 @@ export const recallMemoryTool = recallTool;
 export const writeMemoryTool = writeTool;
 export const removeMemoryTool = removeTool;
 
+/** Wrap a tool so its execute body runs inside the debug-log context for the
+ * call.
+ *
+ * Tool calls arrive outside the lifecycle handlers, so without this no
+ * AsyncLocalStorage context is active and every debugLog in the read/write/
+ * remove path is discarded. The diagnostics existed and could never be emitted
+ * in production; a test that established the context by hand (as the ambiguity
+ * test did) hid exactly that gap.
+ *
+ * Wrapped at registration rather than inside each body: the context needs the
+ * CALL's cwd, and the definitions stay untouched because they are exported and
+ * used directly by tests. The extension context is the last argument. */
+function withLogging<T extends object>(tool: T): T {
+  const inner = (tool as { execute: (...a: unknown[]) => Promise<unknown> }).execute;
+  return {
+    ...tool,
+    execute: (...args: unknown[]) => {
+      const ctx = args.at(-1) as { cwd?: string } | undefined;
+      return withToolLogContext(ctx?.cwd ?? process.cwd(), () => inner(...args));
+    },
+  } as T;
+}
+
 /** Register all memory tools. */
 export function registerMemoryTools(pi: ExtensionAPI): void {
-  pi.registerTool(recallTool);
-  pi.registerTool(writeTool);
-  pi.registerTool(removeTool);
+  pi.registerTool(withLogging(recallTool));
+  pi.registerTool(withLogging(writeTool));
+  pi.registerTool(withLogging(removeTool));
 }
