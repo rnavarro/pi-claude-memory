@@ -16,7 +16,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { parseIndexFile } from "./index-parser.js";
-import { slugify, writeMemory } from "./memory-writer.js";
+import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
 import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
@@ -258,26 +258,34 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     // The snapshot is keyed by `${tier}:${slug}` so a same-slug entry in the
     // other tier can never stand in for this target's mtime.
     if (c.overwrite === true) {
-      const slug = slugify(c.name);
-      const snapKey = `${dir.tier}:${slug}`;
+      // Resolve the same target writeMemory is about to write: the EXISTING
+      // file for this name, whatever its stem. Keying on slugify(c.name) alone
+      // left a non-slug-normal stem ("Foo Bar.md") unresolvable — the snapshot
+      // lookup hit through the raw-stem alias, then the stat of the slug path
+      // threw ENOENT and the candidate was skipped as "deleted", so
+      // supersession silently no-opped and the log blamed a deletion that
+      // never happened.
+      const target = resolveWriteTarget(dir, c.name);
+      const targetStem = target.replace(/\.md$/, "");
+      const snapKey = `${dir.tier}:${targetStem}`;
       const snapMtime = mtimes.get(snapKey);
       if (snapMtime === undefined) {
         // Not present when the review started: created mid-review (or the
         // model guessed a slug that only materialized meanwhile). Never
         // overwrite what we did not see.
-        debugLog("auto_learn.skip_unsnapshotted_overwrite", { slug, tier: dir.tier });
+        debugLog("auto_learn.skip_unsnapshotted_overwrite", { target, tier: dir.tier });
         continue;
       }
       try {
-        const curMtime = statSync(join(dir.dir, `${slug}.md`)).mtimeMs;
+        const curMtime = statSync(join(dir.dir, target)).mtimeMs;
         if (curMtime !== snapMtime) {
-          debugLog("auto_learn.skip_stale_overwrite", { slug, snapMtime, curMtime });
+          debugLog("auto_learn.skip_stale_overwrite", { target, snapMtime, curMtime });
           continue;
         }
       } catch {
         // Vanished during the call — a user/Claude deliberate deletion.
         // Writing would resurrect it.
-        debugLog("auto_learn.skip_deleted_overwrite", { slug, tier: dir.tier });
+        debugLog("auto_learn.skip_deleted_overwrite", { target, tier: dir.tier });
         continue;
       }
     }

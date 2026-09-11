@@ -23,6 +23,7 @@ import {
   readMemory,
   removeMemory,
   resolveWikilinks,
+  resolveWriteTarget,
   verifyIndexPublish,
   withIndexRetry,
   writeMemory,
@@ -1056,5 +1057,79 @@ describe("dash-less index lines are parsed, not discarded as prose", () => {
   it("still treats non-link prose as prose", () => {
     const parsed = parseIndexContent("## Header\n- [A](a.md) trailing text\n", tmpDir);
     expect(parsed.entries).toHaveLength(0);
+  });
+});
+
+describe("non-slug-normal stems are addressable and supersedable", () => {
+  // A topic whose stem is not slug-normal ("Foo Bar.md", or uppercase) has a
+  // slug that differs from its stem, so the slug-derived path does not exist.
+  // Supersession of such a topic silently no-opped: the snapshot lookup hit
+  // via the raw-stem alias, then the stat of the slug path threw ENOENT and
+  // the candidate was skipped as "deleted". writeMemory also wrote the slug
+  // path, which would have created a duplicate rather than superseding.
+  const seed = (stem: string) =>
+    writeFileSync(join(tmpDir, stem), "---\ntype: project\ndescription: original\n---\nold body\n");
+
+  it("resolveWriteTarget targets the existing file, not the slug path", () => {
+    seed("Foo Bar.md");
+    expect(resolveWriteTarget(dir, "Foo Bar")).toBe("Foo Bar.md");
+    // The slug resolves too, so a model returning either form works.
+    expect(resolveWriteTarget(dir, "foo-bar")).toBe("Foo Bar.md");
+  });
+
+  it("falls back to the slug path when nothing exists", () => {
+    expect(resolveWriteTarget(dir, "Brand New")).toBe("brand-new.md");
+  });
+
+  it("overwrite supersedes the existing stem in place, with no duplicate file", () => {
+    seed("Foo Bar.md");
+    const res = writeMemory(dir, {
+      name: "Foo Bar",
+      description: "updated",
+      type: "project",
+      body: "new body",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(readFileSync(join(tmpDir, "Foo Bar.md"), "utf8")).toContain("new body");
+    // The whole point: one file, not a slug-named twin beside it.
+    expect(existsSync(join(tmpDir, "foo-bar.md"))).toBe(false);
+  });
+
+  it("a plain write refuses rather than duplicating an existing stem", () => {
+    seed("Foo Bar.md");
+    const res = writeMemory(dir, {
+      name: "Foo Bar",
+      description: "x",
+      type: "project",
+      body: "b",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: false,
+    });
+    expect(res.ok).toBe(false);
+    expect(existsSync(join(tmpDir, "foo-bar.md"))).toBe(false);
+  });
+
+  it("read and remove address a non-slug-normal stem by its slug", () => {
+    seed("Foo Bar.md");
+    const read = readMemory(dir, "foo-bar");
+    expect(read.ok).toBe(true);
+    if (read.ok) expect(read.content).toContain("old body");
+
+    const rem = removeMemory(dir, { name: "foo-bar", tier: "project" });
+    expect(rem.ok).toBe(true);
+    expect(existsSync(join(tmpDir, "Foo Bar.md"))).toBe(false);
+  });
+
+  it("ambiguous slug matches resolve to nothing rather than an arbitrary file", () => {
+    seed("Foo Bar.md");
+    writeFileSync(join(tmpDir, "foo bar.md"), "---\ntype: project\n---\nx\n");
+    // Both slugify to "foo-bar"; picking either would be a guess.
+    expect(resolveWriteTarget(dir, "foo-bar")).toBe("foo-bar.md");
+    const read = readMemory(dir, "foo-bar");
+    expect(read.ok).toBe(false);
   });
 });
