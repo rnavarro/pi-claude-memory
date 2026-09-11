@@ -520,14 +520,15 @@ describe("reviewer index summary is complete", () => {
     expect(summary).toContain("## project tier");
   });
 
-  it("spends the summary budget on project before global", () => {
-    // Both tiers' IDENTITIES are always listed (supersession keys on them), so
-    // the only thing the shared SUMMARY_BUDGET_CHARS can starve is summaries.
-    // With global iterated first, a large global index consumed the whole
-    // budget and left project summaries dropped to bare identity lines — the
-    // reverse of the injector's order, which puts the project tier (the
-    // likeliest home of the conversation under review) first for the same
-    // reason.
+  it("lists the project tier's section before the global tier's", () => {
+    // Corrects an overclaim in the previous commit's test: the summary budget
+    // is PER TIER (summaryChars resets at the top of the dir loop), so no
+    // ordering can starve either tier's summaries — my first test asserted
+    // summary presence, which holds under BOTH orderings, and passed against
+    // the reverted source. What the iteration order actually decides is the
+    // order sections appear in the reviewer prompt. Pin THAT, and also assert
+    // a global index large enough to saturate its own per-tier budget still
+    // keeps both tiers' summaries intact (so the test covers truncation too).
     const glob = join(tmpDir, ".claude", "memory");
     const proj = join(tmpDir, "work", "proj");
     mkdirSync(glob, { recursive: true });
@@ -549,10 +550,17 @@ describe("reviewer index summary is complete", () => {
       warnings: [],
     } as never);
     const pLine = summary.split("\n").find((l) => l.startsWith("- p:"));
-    // The project entry's summary must survive with its text intact; under the
-    // old ordering it was reduced to a bare identity line "- p [owner: ...]".
     expect(pLine).toBeDefined();
     expect(pLine).toContain("project-local detail that matters");
+
+    // The teeth this test previously lacked: the project section itself must
+    // come first in the reviewer prompt. Under global-first iteration the
+    // global header sits ahead of the project header and this fails.
+    const projHeader = summary.indexOf("## project tier");
+    const globHeader = summary.indexOf("## global tier");
+    expect(projHeader).toBeGreaterThan(-1);
+    expect(globHeader).toBeGreaterThan(-1);
+    expect(projHeader).toBeLessThan(globHeader);
   });
 });
 

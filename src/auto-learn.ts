@@ -521,11 +521,11 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
     return fallback;
   };
 
-  // Project first, mirroring the injector's budget order. The project tier is
-  // the likeliest home for the conversation under review, and its summaries are
-  // what makes supersession catch exact duplicates; global summaries must not
-  // consume the shared budget ahead of it. Identity lines are emitted either
-  // way, so this ordering only decides whose SUMMARIES survive the budget.
+  // Project first, mirroring the injector's presentation order. The summary
+  // budget is PER TIER (summaryChars is reset at the top of this loop), so no
+  // ordering choice can starve either tier's summaries; what this decides is
+  // the order sections appear in the reviewer prompt, and the conversation
+  // under review is likelier to be about the project tier.
   for (const dir of [resolved.project, resolved.global]) {
     if (!dir) continue;
     const headerIndex = lines.length;
