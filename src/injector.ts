@@ -14,6 +14,7 @@ import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
 import type { IndexEntry, IndexLine, MemoryDir, MemoryFile, MemoryType } from "./types.js";
+import { TOPIC_FILE_MAX_BYTES } from "./types.js";
 
 const DEFAULT_TOKEN_CAP = 5000;
 const CHARS_PER_TOKEN = 4; // rough estimate
@@ -239,7 +240,6 @@ function buildTierInjection(
 /** Topic files larger than this are skipped outright (not just filtered by
  * the token budget): the size check runs BEFORE reading so a huge non-memory
  * file linked from a hand-edited index cannot flood the read. */
-const TOPIC_FILE_MAX_BYTES = 1_000_000;
 
 /** Load topic files from disk, keyed by filePath.
  *

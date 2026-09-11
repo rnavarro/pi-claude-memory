@@ -12,6 +12,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -20,6 +21,7 @@ import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
+import { TOPIC_FILE_MAX_BYTES } from "./types.js";
 
 /** A write-memory request. */
 export interface WriteMemoryRequest {
@@ -541,6 +543,29 @@ export function readMemory(
   if (!filePath) {
     debugLog("writer.read_not_found", { name, tier: dir.tier, label: dir.label });
     return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
+  }
+
+  // Size cap shared with the injector. Without it recall_memory is an
+  // uncapped read of any file in the store, and the routing anchor actively
+  // tells the model to call it for ⟨index-only⟩ entries — exactly the entries
+  // the injector declined to read in full.
+  try {
+    const st = statSync(filePath);
+    if (st.size > TOPIC_FILE_MAX_BYTES) {
+      debugLog("writer.read_oversize", {
+        name,
+        tier: dir.tier,
+        size: st.size,
+        cap: TOPIC_FILE_MAX_BYTES,
+      });
+      return {
+        ok: false,
+        message: `Memory ${name} is too large to read (${st.size} bytes, cap ${TOPIC_FILE_MAX_BYTES})`,
+      };
+    }
+  } catch (err) {
+    debugLog("writer.read_stat_error", { name, tier: dir.tier, error: String(err) });
+    return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
   }
 
   const content = readFileSync(filePath, "utf8");

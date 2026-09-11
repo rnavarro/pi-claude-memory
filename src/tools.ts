@@ -9,6 +9,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache } from "./index.js";
+import type { MemoryOpResult } from "./memory-writer.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
 import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
@@ -185,20 +186,32 @@ const writeTool = defineTool({
       };
     }
 
-    const result = writeMemory(dir, {
-      name: params.name,
-      description: params.description,
-      type: params.type,
-      body: params.body,
-      pinned: params.pinned ?? false,
-      tier,
-      priority: params.priority ?? null,
-      allowOverwrite: true, // tool is user-initiated, overwrite is expected
-    });
-    // Invalidate the resolver cache so the next before_agent_start picks up
-    // any newly created project dir or index changes. This causes a one-time
-    // cache miss on the next turn (user explicitly wrote, one miss is fine).
-    invalidateResolveCache();
+    // The writer touches the filesystem in several places (mkdir, temp write
+    // + rename, index patch). A failure there must surface as ok:false rather
+    // than reject the tool call, and invalidation must still run: the topic
+    // file may well have landed before the failure, so the frozen injection
+    // is stale either way.
+    let result: MemoryOpResult;
+    try {
+      result = writeMemory(dir, {
+        name: params.name,
+        description: params.description,
+        type: params.type,
+        body: params.body,
+        pinned: params.pinned ?? false,
+        tier,
+        priority: params.priority ?? null,
+        allowOverwrite: true, // tool is user-initiated, overwrite is expected
+      });
+    } catch (err) {
+      debugLog("tool.write_memory_error", { name: params.name, tier, error: String(err) });
+      result = { ok: false, message: `Failed to write memory ${params.name}: ${String(err)}` };
+    } finally {
+      // Invalidate the resolver cache so the next before_agent_start picks up
+      // any newly created project dir or index changes. This causes a one-time
+      // cache miss on the next turn (user explicitly wrote, one miss is fine).
+      invalidateResolveCache();
+    }
     return {
       content: [
         { type: "text", text: result.message + (result.filePath ? ` (${result.filePath})` : "") },
@@ -245,10 +258,19 @@ const removeTool = defineTool({
       };
     }
 
-    const result = removeMemory(dir, { name: params.name, tier });
-    // Invalidate the resolver cache so the next before_agent_start reflects
-    // the removed entry in the index.
-    invalidateResolveCache();
+    // Same reasoning as write_memory: the file move and index rewrite can
+    // throw, and invalidation must run even then.
+    let result: MemoryOpResult;
+    try {
+      result = removeMemory(dir, { name: params.name, tier });
+    } catch (err) {
+      debugLog("tool.remove_memory_error", { name: params.name, tier, error: String(err) });
+      result = { ok: false, message: `Failed to remove memory ${params.name}: ${String(err)}` };
+    } finally {
+      // Invalidate the resolver cache so the next before_agent_start reflects
+      // the removed entry in the index.
+      invalidateResolveCache();
+    }
     return {
       content: [{ type: "text", text: result.message }],
       details: { ok: result.ok, tier: dir.tier, trashPath: result.filePath } as unknown,
