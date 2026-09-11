@@ -615,3 +615,85 @@ describe("index concurrency primitives", () => {
     expect(readFileSync(existing, "utf8")).toBe("unchanged\n");
   });
 });
+
+describe("name policy and index lines", () => {
+  it("never slugifies a traversal name into a different topic (extensionless)", () => {
+    writeFileSync(join(dir.dir, "outer.md"), "---\ndescription: d\ntype: reference\n---\nbody\n");
+    // slugify("../outer") === "outer" — the old candidate order would remove
+    // outer.md through a name the caller never legitimately addressed.
+    const r = removeMemory(dir, { name: "../outer", tier: "project" });
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(dir.dir, "outer.md"))).toBe(true);
+  });
+
+  it("rejects separator-bearing names instead of aliasing a slugged topic", () => {
+    writeFileSync(
+      join(dir.dir, "subnested.md"),
+      "---\ndescription: d\ntype: reference\n---\nbody\n",
+    );
+    // slugify("sub/nested") === "subnested" — must not reach it.
+    const r = removeMemory(dir, { name: "sub/nested", tier: "project" });
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(dir.dir, "subnested.md"))).toBe(true);
+  });
+
+  it("prefers the explicit filename over the slug-appended candidate", () => {
+    writeFileSync(
+      join(dir.dir, "alpha.md"),
+      "---\ndescription: plain\ntype: reference\n---\nalpha plain\n",
+    );
+    writeFileSync(
+      join(dir.dir, "alpha.md.md"),
+      "---\ndescription: doubled\ntype: reference\n---\nalpha doubled\n",
+    );
+    const read = readMemory(dir, "alpha.md");
+    expect(read.ok).toBe(true);
+    if (read.ok) expect(read.content).toContain("alpha plain");
+  });
+
+  it("writeMemory rejects unsafe names and empty or multiline descriptions", () => {
+    const base = {
+      description: "valid",
+      type: "reference" as const,
+      body: "b",
+      pinned: false,
+      tier: "project" as const,
+      allowOverwrite: true,
+    };
+    expect(writeMemory(dir, { ...base, name: "../evil" }).ok).toBe(false);
+    expect(writeMemory(dir, { ...base, name: "ok-name", description: "" }).ok).toBe(false);
+    expect(writeMemory(dir, { ...base, name: "ok-name", description: "   " }).ok).toBe(false);
+    expect(writeMemory(dir, { ...base, name: "ok-name", description: "a\nb" }).ok).toBe(false);
+    // Sanity: the valid form still writes
+    expect(writeMemory(dir, { ...base, name: "ok-name" }).ok).toBe(true);
+  });
+
+  it("replaces and removes dash-less hand-authored index lines", () => {
+    // A pre-existing topic whose index line lacks the — summary tail.
+    writeFileSync(
+      join(dir.dir, "foo.md"),
+      "---\ndescription: old\ntype: reference\n---\nold body\n",
+    );
+    writeFileSync(dir.indexPath, "- [Foo](foo.md)\n");
+
+    // Overwrite via writeMemory: the dash-less line is REPLACED, not duplicated
+    const w = writeMemory(dir, {
+      name: "foo",
+      description: "new summary",
+      type: "reference",
+      body: "new body",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(w.ok).toBe(true);
+    const idx = readFileSync(dir.indexPath, "utf8");
+    expect((idx.match(/\(foo\.md\)/g) ?? []).length).toBe(1);
+    expect(idx).toContain("new summary");
+
+    // Removal strips the line entirely — no orphan link to a trashed file
+    const r = removeMemory(dir, { name: "foo", tier: "project" });
+    expect(r.ok).toBe(true);
+    expect(readFileSync(dir.indexPath, "utf8")).not.toContain("foo.md");
+  });
+});

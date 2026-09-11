@@ -72,11 +72,36 @@ const TRASH_DIRNAME = ".trash";
  *    fallback honored them and could escape the memory dir.
  * 2. Reserved: never resolve to MEMORY.md (the index itself), so a stray
  *    `remove_memory MEMORY.md` cannot trash the index. */
+/** Names a read/remove/write may never address: path separators and
+ * traversal fragments would either escape the store or (after slugification)
+ * silently alias a DIFFERENT topic than the caller named — e.g. "sub/nested"
+ * slugified to "subnested.md", or "../outer" to "outer.md". Reject the
+ * unsafe input BEFORE any slugification so no neutralized form is tried. */
+export function isUnsafeMemoryName(name: string): boolean {
+  return (
+    name.includes("/") ||
+    name.includes("\\") ||
+    name.includes("..") ||
+    name.includes("\n") ||
+    name.includes("\r")
+  );
+}
+
 function resolveTopicFile(dir: MemoryDir, name: string): string | null {
+  // Unsafe names are rejected outright — never slugified. Slugify would
+  // neutralize the separator and silently resolve a different topic than
+  // the caller named.
+  if (isUnsafeMemoryName(name)) return null;
   const slug = slugify(name);
   const rawCandidate = name.endsWith(".md") ? name : `${name}.md`;
   const base = resolve(dir.dir);
-  for (const c of [`${slug}.md`, rawCandidate]) {
+  // Explicit filename first: when the caller names "alpha.md" and BOTH
+  // alpha.md and alpha.md.md exist (slug "alpha.md" + .md append), the
+  // caller meant alpha.md. The slug candidate stays as a fallback for
+  // hand-authored titles ("Alpha Beta" → alpha-beta.md).
+  for (const c of name.endsWith(".md")
+    ? [rawCandidate, `${slug}.md`]
+    : [`${slug}.md`, rawCandidate]) {
     // Direct children only: a separator-bearing candidate is a nested path —
     // lexically contained here, but this store never writes nested topics,
     // and restricting it flattens a whole class of containment tricks.
@@ -214,9 +239,29 @@ function roundTripValidate(
  *   latest write time, not the original).
  */
 export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpResult {
+  // Name policy is shared with read/remove: separator/traversal/newline
+  // bearing names are invalid AT ENTRY — slugifying them would silently
+  // target a different topic than the caller named ("../outer" → outer.md).
+  if (isUnsafeMemoryName(req.name)) {
+    return {
+      ok: false,
+      message: `Invalid memory name: ${JSON.stringify(req.name)} — path separators, traversal fragments, and newlines are not allowed`,
+    };
+  }
   const slug = slugify(req.name);
   if (!slug) {
     return { ok: false, message: `Invalid memory name: ${req.name}` };
+  }
+  // Description policy: it becomes the index-line summary after the dash.
+  // Empty descriptions emit unmatchable index lines ("- [T](x.md) — " fails
+  // every link regex, so rewrites append duplicates and removal can't strip
+  // the line), and multiline descriptions could smuggle a second entry into
+  // the index.
+  if (!req.description.trim() || req.description.includes("\n") || req.description.includes("\r")) {
+    return {
+      ok: false,
+      message: `Invalid description for ${slug}: must be a non-empty single line`,
+    };
   }
   // Reserved-name guard (write side): the read/remove path reserves
   // memory.md for the index, so writing a topic with that slug would create
@@ -345,7 +390,12 @@ function patchIndexAppend(
   const pin = entry.pinned ? "⛔ " : "";
   const newLine = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}`;
   const linkRegex = new RegExp(
-    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(entry.filename)}\\)\\s*[—-]\\s*.+$`,
+    // Summary optional: hand-authored lines like "- [Foo](foo.md)" (no dash
+    // + summary) must still be replaceable — a mandatory-summary regex would
+    // append a duplicate line instead. The write path now rejects empty
+    // descriptions, so WE never emit dash-less lines; this covers existing
+    // ones from Claude Code or hand edits.
+    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(entry.filename)}\\)(?:\\s*[—-]\\s*.+)?$`,
   );
 
   // If MEMORY.md doesn't exist, create it with the entry — no-clobber so
@@ -404,8 +454,11 @@ function removeFromIndex(dir: MemoryDir, filename: string): void {
   const indexPath = dir.indexPath;
   if (!existsSync(indexPath)) return;
 
+  // Summary optional: dash-less hand-authored lines must still be removable
+  // (a mandatory-summary regex would leave an orphan link pointing at a
+  // trashed file).
   const linkRegex = new RegExp(
-    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(filename)}\\)\\s*[—-]\\s*.+$`,
+    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(filename)}\\)(?:\\s*[—-]\\s*.+)?$`,
   );
   withIndexRetry(indexPath, (content) => {
     const lines = content.split("\n");
