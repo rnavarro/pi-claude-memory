@@ -5,6 +5,13 @@
   "type": "module",
   "license": "MIT",
   "author": "rnavarro",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rnavarro/pi-claude-memory.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "keywords": [
     "pi",
     "pi-extension",
