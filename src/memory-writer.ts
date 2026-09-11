@@ -6,7 +6,7 @@
 // link entries are appended (never rewritten) so hand-authored sections survive.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
@@ -53,8 +53,33 @@ export interface MemoryOpResult {
 
 const TRASH_DIRNAME = ".trash";
 
+/** Resolve a topic name to a safe file path within the memory dir, or null if
+ * not found or if the name would escape the dir / target the reserved index.
+ *
+ * Centralizes the slug-then-raw candidate lookup with two guards the previous
+ * inline code lacked:
+ * 1. Containment: the resolved path must stay inside dir. Rejects `..` and
+ *    separator-bearing raw names — slugify would mangle them, but the raw
+ *    fallback honored them and could escape the memory dir.
+ * 2. Reserved: never resolve to MEMORY.md (the index itself), so a stray
+ *    `remove_memory MEMORY.md` cannot trash the index. */
+function resolveTopicFile(dir: MemoryDir, name: string): string | null {
+  const slug = slugify(name);
+  const rawCandidate = name.endsWith(".md") ? name : `${name}.md`;
+  const base = resolve(dir.dir);
+  for (const c of [`${slug}.md`, rawCandidate]) {
+    const p = resolve(dir.dir, c);
+    // Containment: must be within the base dir (reject traversal/escape).
+    if (p !== base && !p.startsWith(`${base}${sep}`)) continue;
+    // Reserved: never touch the index file.
+    if (basename(p).toLowerCase() === "memory.md") continue;
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
 /** Sanitize a name into a safe filename slug. */
-function slugify(name: string): string {
+export function slugify(name: string): string {
   return (
     name
       .toLowerCase()
@@ -219,7 +244,7 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // Patch MEMORY.md: append a link entry if not already present.
   patchIndexAppend(dir, {
     filename,
-    title: deriveTitle(req.name, req.description),
+    title: deriveTitle(req.name),
     summary: req.description,
     pinned: req.pinned,
   });
@@ -242,10 +267,15 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   };
 }
 
-/** Derive a human-readable title from the name + description. */
-function deriveTitle(name: string, description: string): string {
-  // If description is short, use it as title; else prettify the name.
-  if (description && description.length <= 60) return description;
+/** Derive a human-readable title from the entry slug.
+ *
+ * The title is the bracket display text in MEMORY.md; the summary after the
+ * dash carries the description. Always prettify the slug so the two halves
+ * are not identical — duplicated text both wastes injected tokens every turn
+ * and breaks supersession identity (the auto-learn prompt tells the LLM to
+ * match the existing entry's identifier, which must be the slug, not the
+ * description). */
+function deriveTitle(name: string): string {
   return name
     .split("-")
     .filter(Boolean)
@@ -297,20 +327,9 @@ function patchIndexAppend(
 
 /** Remove a memory: move file to .trash/ and remove its MEMORY.md entry. */
 export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOpResult {
-  const slug = slugify(req.name);
-  // Allow direct filename match if slug doesn't match a real file
-  const candidates = [`${slug}.md`, req.name.endsWith(".md") ? req.name : `${req.name}.md`];
-  let filePath = "";
-  for (const c of candidates) {
-    const p = join(dir.dir, c);
-    if (existsSync(p)) {
-      filePath = p;
-      break;
-    }
-  }
-
-  if (!filePath || !existsSync(filePath)) {
-    debugLog("writer.remove_not_found", { slug, name: req.name, tier: dir.tier, label: dir.label });
+  const filePath = resolveTopicFile(dir, req.name);
+  if (!filePath) {
+    debugLog("writer.remove_not_found", { name: req.name, tier: dir.tier, label: dir.label });
     return { ok: false, message: `Memory not found: ${req.name} in ${dir.label} tier` };
   }
 
@@ -381,18 +400,9 @@ export function readMemory(
 ):
   | { ok: true; content: string; filePath: string; frontmatter: ParsedFrontmatter }
   | { ok: false; message: string } {
-  const slug = slugify(name);
-  const candidates = [`${slug}.md`, name.endsWith(".md") ? name : `${name}.md`];
-  let filePath = "";
-  for (const c of candidates) {
-    const p = join(dir.dir, c);
-    if (existsSync(p)) {
-      filePath = p;
-      break;
-    }
-  }
-  if (!filePath || !existsSync(filePath)) {
-    debugLog("writer.read_not_found", { slug, name, tier: dir.tier, label: dir.label });
+  const filePath = resolveTopicFile(dir, name);
+  if (!filePath) {
+    debugLog("writer.read_not_found", { name, tier: dir.tier, label: dir.label });
     return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
   }
 
@@ -402,7 +412,6 @@ export function readMemory(
   const { text, resolved, unresolved } = resolveWikilinks(frontmatter.body, dir);
 
   debugLog("writer.read_ok", {
-    slug,
     filename,
     tier: dir.tier,
     label: dir.label,

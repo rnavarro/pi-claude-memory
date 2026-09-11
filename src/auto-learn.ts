@@ -9,13 +9,14 @@
 // Fire-and-forget: never blocks the user's turn. All errors are caught and
 // logged to stderr.
 
-import { existsSync, readdirSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { parseIndexFile } from "./index-parser.js";
-import { writeMemory } from "./memory-writer.js";
+import { slugify, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
@@ -65,9 +66,11 @@ What NOT to extract:
 SUPERSESSION:
 If a candidate contradicts or supersedes an existing entry (e.g. a bug fix that
 resolves an earlier "unproven" note, or a corrected fact), return it with the
-SAME name as the existing entry so it replaces the old content. Do NOT create a
+SAME slug as the existing entry so it replaces the old content. Do NOT create a
 new entry under a different slug — that creates duplicates. Match the existing
-entry's name exactly (use the title before the colon in the existing index).
+entry's slug exactly: use the identifier before the colon in the existing index
+(that is the existing file's filename stem, e.g. "prefer-jq" — NOT the
+description).
 
 If there is nothing worth extracting, return an empty array: []
 
@@ -143,6 +146,12 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     ],
   };
 
+  // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
+  // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
+  // silently clobbering a newer edit with a stale review decision.
+  const resolved = resolveMemoryDirs(cwd);
+  const mtimes = snapshotMtimes([resolved.global, resolved.project]);
+
   // Follow pi-observational-memory's pattern: only pass reasoning if the
   // model supports it AND thinking is not "off". When thinking is "off",
   // omit the field entirely rather than passing a sentinel.
@@ -204,9 +213,6 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     return 0;
   }
 
-  // Resolve memory dirs for the cwd
-  const resolved = resolveMemoryDirs(cwd);
-
   // Write each candidate. Count successes.
   let written = 0;
   for (const c of candidates) {
@@ -218,6 +224,24 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       // Requested tier unavailable — skip silently. The model will learn from
       // the absence in the next cycle's index.
       continue;
+    }
+    // Stale-overwrite guard: if this candidate supersedes an existing entry,
+    // skip when the target file changed during the LLM call. A user/Claude
+    // edit in that window must not be silently clobbered.
+    if (c.overwrite === true) {
+      const slug = slugify(c.name);
+      const snapMtime = mtimes.get(slug);
+      if (snapMtime !== undefined) {
+        try {
+          const curMtime = statSync(join(dir.dir, `${slug}.md`)).mtimeMs;
+          if (curMtime !== snapMtime) {
+            debugLog("auto_learn.skip_stale_overwrite", { slug, snapMtime, curMtime });
+            continue;
+          }
+        } catch {
+          // file vanished during the call — let writeMemory handle normally
+        }
+      }
     }
     const result = writeMemory(dir, {
       name: c.name,
@@ -294,6 +318,31 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
   );
 }
 
+/** Snapshot mtimes of existing topic files, keyed by filename stem (slug),
+ * so overwrite candidates can be skipped if the target changed during the
+ * LLM call. Captured BEFORE the call; compared AFTER. */
+function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const dir of dirs) {
+    if (!dir || !existsSync(dir.dir)) continue;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".md") || entry.name === "MEMORY.md") continue;
+      try {
+        map.set(entry.name.replace(/\.md$/, ""), statSync(join(dir.dir, entry.name)).mtimeMs);
+      } catch {
+        // skip unreadable
+      }
+    }
+  }
+  return map;
+}
+
 /** Build a compact summary of the existing memory index for the LLM.
  *
  * Parses MEMORY.md (not a raw readdir) so the LLM sees entry descriptions,
@@ -311,13 +360,18 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
       const parsed = parseIndexFile(dir);
       if (parsed && parsed.entries.length > 0) {
         for (const entry of parsed.entries.slice(0, 50)) {
-          lines.push(`- ${entry.title}: ${entry.summary}`);
+          // Emit the filename stem (slug) as the stable identifier before the
+          // colon — the writer keys overwrite targets on slugify(candidate.name),
+          // so the LLM must return THAT slug to supersede, not the display title
+          // (which may differ from the filename and would create a duplicate).
+          const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
+          lines.push(`- ${stem}: ${entry.summary}`);
         }
         if (parsed.entries.length > 50) {
           lines.push(`... and ${parsed.entries.length - 50} more`);
         }
       } else {
-        // Fallback: no parseable index, list filenames if any files exist
+        // Fallback: no parseable index, list filename stems if any files exist
         const files = existsSync(dir.dir)
           ? readdirSync(dir.dir).filter((f: string) => f.endsWith(".md") && f !== "MEMORY.md")
           : [];
@@ -325,7 +379,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
           lines.push("(no entries)");
         } else {
           for (const f of files.slice(0, 50)) {
-            lines.push(`- ${f}`);
+            lines.push(`- ${f.replace(/\.md$/, "")}`);
           }
         }
       }
