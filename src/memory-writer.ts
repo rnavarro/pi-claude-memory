@@ -24,7 +24,7 @@ import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import { lineTargetsFile } from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
-import { TOPIC_FILE_MAX_BYTES } from "./types.js";
+import { INDEX_MAX_BYTES, TOPIC_FILE_MAX_BYTES } from "./types.js";
 
 /** A write-memory request. */
 export interface WriteMemoryRequest {
@@ -348,7 +348,20 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // This is critical for the shared store: Claude Code's provenance metadata
   // must survive a Pi-initiated overwrite.
   let preservedMetadata: Record<string, unknown> = {};
-  if (existsSync(filePath)) {
+  // lstat before reading: the read/remove paths reject a symlinked topic
+  // (resolveTopicFile), but this preserve-read would follow one and lift the
+  // TARGET's metadata into the new memory — which is then injected every turn.
+  // A symlink here means the name is not a topic we own, so skip preservation
+  // and write fresh; the publish below replaces the link rather than following
+  // it either way.
+  let existingIsPlainFile = false;
+  try {
+    const st = lstatSync(filePath);
+    existingIsPlainFile = st.isFile() && !st.isSymbolicLink();
+  } catch {
+    existingIsPlainFile = false;
+  }
+  if (existingIsPlainFile) {
     try {
       const existing = readFileSync(filePath, "utf8");
       const parsed = parseMemoryContent(existing, filename, Date.now());
@@ -566,7 +579,24 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   // removed: the topic is already in .trash/, so saying "and removed its
   // MEMORY.md link" while the link survives leaves a dangling index entry the
   // user believes is gone.
-  const linkRemoved = removeFromIndex(dir, filename);
+  // The file is already in .trash/ by this point, so a refusal to touch the
+  // index must not throw past this frame: the caller would otherwise report a
+  // generic failure and lose the fact that the move succeeded. Report both
+  // facts instead — the topic is gone, and its link could not be updated.
+  let linkRemoved = false;
+  let indexError: string | null = null;
+  try {
+    linkRemoved = removeFromIndex(dir, filename);
+  } catch (err) {
+    indexError = String(err);
+    debugLog("writer.remove_index_failed", {
+      filename,
+      tier: dir.tier,
+      label: dir.label,
+      trashPath,
+      error: indexError,
+    });
+  }
 
   debugLog("writer.remove_ok", {
     filename,
@@ -574,7 +604,18 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     label: dir.label,
     trashPath,
     linkRemoved,
+    indexError,
   });
+
+  if (indexError) {
+    return {
+      ok: true,
+      message:
+        `Moved memory ${filename} to .trash/ in ${dir.label} tier, but could not update ` +
+        `${dir.indexPath}: ${indexError}. Its index line, if any, still points at the trashed file.`,
+      filePath: trashPath,
+    };
+  }
 
   return {
     ok: true,
@@ -791,12 +832,41 @@ const INDEX_MERGE_ATTEMPTS = 3;
  *
  * fn maps current index content to updated content, or null for "nothing
  * to do". Internal — exported for tests. */
+/** Refuse to read an index we may not publish back over.
+ *
+ * A symlinked or otherwise non-regular MEMORY.md is not an index. Reading it
+ * pulls an unrelated file's bytes into the store — the subsequent rename
+ * replaces the LINK with a regular file containing them, laundering outside
+ * content past the read-side guards and into every future prompt. A FIFO would
+ * block this synchronous read forever. An oversize index is refused for the
+ * same reason the parser refuses it: appending to one that no longer parses
+ * poisons every entry in the tier.
+ *
+ * Throws rather than returning, so callers surface a degraded result instead
+ * of reporting success for a write that never reached the index. An ABSENT
+ * index is not an error — callers create one. */
+function assertIndexReadable(indexPath: string): void {
+  let st: import("node:fs").Stats;
+  try {
+    st = lstatSync(indexPath);
+  } catch {
+    return; // absent — the caller creates it
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`MEMORY.md is not a regular file: ${indexPath}`);
+  }
+  if (st.size > INDEX_MAX_BYTES) {
+    throw new Error(`MEMORY.md exceeds the ${INDEX_MAX_BYTES}-byte cap: ${indexPath}`);
+  }
+}
+
 export function withIndexRetry(
   indexPath: string,
   fn: (content: string) => string | null,
   verifyGuard?: () => boolean,
 ): void {
   for (let attempt = 1; ; attempt++) {
+    assertIndexReadable(indexPath);
     if (!existsSync(indexPath)) return;
     const before = readFileSync(indexPath, "utf8");
     const next = fn(before);

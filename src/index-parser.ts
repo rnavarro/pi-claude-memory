@@ -13,6 +13,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
+import { INDEX_MAX_BYTES } from "./types.js";
 
 // Match: - [title](href) — summary
 // The summary is OPTIONAL. Hand-authored and emoji-marked index lines
@@ -69,12 +70,6 @@ export function lineTargetsFile(line: string, baseDir: string, targetPath: strin
   if (!parsed) return false;
   return sameTarget(resolveHref(parsed.href, baseDir), targetPath);
 }
-
-/** Cap on the index file we will read into the prompt. MEMORY.md is
- * injected every turn, so an unbounded index is an unbounded per-turn cost.
- * Generous relative to any plausible index (Claude Code's own index lines
- * run ~100 bytes, so this is ~10k entries). */
-const INDEX_MAX_BYTES = 1_000_000;
 
 /** Parse a MEMORY.md file from disk.
  *

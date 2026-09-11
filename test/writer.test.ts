@@ -3,6 +3,7 @@
 
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -1131,5 +1132,108 @@ describe("non-slug-normal stems are addressable and supersedable", () => {
     expect(resolveWriteTarget(dir, "foo-bar")).toBe("foo-bar.md");
     const read = readMemory(dir, "foo-bar");
     expect(read.ok).toBe(false);
+  });
+});
+
+describe("writer index reads are guarded like the parser's", () => {
+  // withIndexRetry read MEMORY.md with a bare readFileSync. A symlinked index
+  // pulled an unrelated file's bytes into the store, and the publish then
+  // replaced the LINK with a regular file containing them — laundering outside
+  // content past the read-side guards and into every future prompt. A dangling
+  // symlink made existsSync false, so every write silently reported success
+  // while indexing nothing.
+  const write = (name: string) =>
+    writeMemory(dir, {
+      name,
+      description: `desc ${name}`,
+      type: "project",
+      body: `body ${name}`,
+      pinned: false,
+      tier: "project",
+      allowOverwrite: false,
+    });
+
+  it("does not launder an outside file's bytes through a symlinked index", () => {
+    const outside = join(tmpDir, "..", `outside-${process.pid}-${Date.now()}.txt`);
+    writeFileSync(outside, "SECRET_SENTINEL\n");
+    symlinkSync(outside, join(tmpDir, "MEMORY.md"));
+
+    const res = write("alpha");
+
+    // The write is reported as unindexed rather than as success.
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("index update failed");
+    // The outside file was neither read into the store nor overwritten.
+    expect(existsSync(outside)).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe("SECRET_SENTINEL\n");
+    // MEMORY.md is still the symlink — we refused rather than replaced it.
+    expect(lstatSync(join(tmpDir, "MEMORY.md")).isSymbolicLink()).toBe(true);
+    rmSync(outside, { force: true });
+  });
+
+  it("reports failure for a dangling symlinked index instead of silent success", () => {
+    symlinkSync(join(tmpDir, "nonexistent-target.md"), join(tmpDir, "MEMORY.md"));
+    const res = write("beta");
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("index update failed");
+    // The link was not silently replaced by a regular index file.
+    expect(lstatSync(join(tmpDir, "MEMORY.md")).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses an oversize index rather than appending past the parse cap", () => {
+    writeFileSync(join(tmpDir, "MEMORY.md"), `# big\n${"x".repeat(1_000_001)}\n`);
+    const res = write("gamma");
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("index update failed");
+    expect(res.message).toContain("cap");
+  });
+
+  it("does not lift a symlinked topic's metadata into the new memory", () => {
+    const outside = join(tmpDir, "..", `meta-${process.pid}-${Date.now()}.md`);
+    writeFileSync(
+      outside,
+      "---\nname: outside\ndescription: outside desc\ntype: reference\nmetadata:\n  originSessionId: LEAKED_SENTINEL\n---\noutside body\n",
+    );
+    symlinkSync(outside, join(tmpDir, "leak.md"));
+    writeFileSync(join(tmpDir, "MEMORY.md"), "# M\n");
+
+    const res = writeMemory(dir, {
+      name: "leak",
+      description: "ours",
+      type: "project",
+      body: "our body",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(res.ok).toBe(true);
+    const written = readFileSync(join(tmpDir, "leak.md"), "utf8");
+    expect(written).toContain("our body");
+    expect(written).not.toContain("LEAKED_SENTINEL");
+    rmSync(outside, { force: true });
+  });
+
+  it("still updates a normal index and preserves provenance metadata", () => {
+    // The guard must not break the ordinary path it protects.
+    writeFileSync(
+      join(tmpDir, "delta.md"),
+      "---\nname: delta\ndescription: d\ntype: project\nmetadata:\n  originSessionId: KEEP_ME\n---\nold\n",
+    );
+    writeFileSync(join(tmpDir, "MEMORY.md"), "# M\n");
+    const res = writeMemory(dir, {
+      name: "delta",
+      description: "updated",
+      type: "project",
+      body: "new body",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.message).not.toContain("index update failed");
+    const written = readFileSync(join(tmpDir, "delta.md"), "utf8");
+    expect(written).toContain("new body");
+    expect(written).toContain("KEEP_ME"); // provenance survives
+    expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).toContain("(delta.md)");
   });
 });

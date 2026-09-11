@@ -10,6 +10,15 @@
  */
 export const TOPIC_FILE_MAX_BYTES = 1_000_000;
 
+/** Maximum bytes read from a MEMORY.md index.
+ *
+ * Shared by the parser (which refuses to parse an oversize index) and the
+ * writer (which refuses to read-then-publish over one). An index that grows
+ * past this cap poisons every entry in that tier, so it must fail loudly on
+ * both sides rather than being appended to until it silently stops parsing.
+ */
+export const INDEX_MAX_BYTES = 1_000_000;
+
 /** Memory tier: project-specific or global (cross-project). */
 export type MemoryTier = "project" | "global";
 
