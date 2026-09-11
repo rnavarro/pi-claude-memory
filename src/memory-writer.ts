@@ -5,7 +5,16 @@
 // All writes are add-only for v1: existing frontmatter is preserved, MEMORY.md
 // link entries are appended (never rewritten) so hand-authored sections survive.
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
@@ -263,8 +272,19 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // Ensure the directory exists
   mkdirSync(dir.dir, { recursive: true });
 
-  // Write the topic file (atomic: write to temp, then rename)
-  atomicWriteFile(filePath, fullContent);
+  // Write the topic file. Auto-learn (allowOverwrite=false) publishes
+  // no-clobber: another writer creating the same slug between the collision
+  // check above and now would be silently destroyed by temp+rename; link()
+  // fails EEXIST atomically instead.
+  if (req.allowOverwrite) {
+    atomicWriteFile(filePath, fullContent);
+  } else if (!atomicWriteFileNoClobber(filePath, fullContent)) {
+    debugLog("writer.write_lost_create_race", { slug, filename, tier: dir.tier, label: dir.label });
+    return {
+      ok: false,
+      message: `Memory ${filename} appeared in ${dir.label} tier concurrently (auto-learn skipped to avoid clobbering)`,
+    };
+  }
 
   // Patch MEMORY.md: append a link entry if not already present.
   patchIndexAppend(dir, {
@@ -313,44 +333,42 @@ function deriveTitle(name: string): string {
 
 /** Append a link entry to MEMORY.md without destroying hand-authored content.
  *
- * Uses atomic write (temp-file + rename) so a concurrent Claude Code reader
- * never observes a truncated MEMORY.md. */
+ * Publishes via withIndexRetry (atomic writes + lost-update merge retry) so
+ * a concurrent Claude Code index edit is rebased onto and merged with, not
+ * overwritten. */
 function patchIndexAppend(
   dir: MemoryDir,
   entry: { filename: string; title: string; summary: string; pinned: boolean },
 ): void {
   const indexPath = dir.indexPath;
 
-  // If MEMORY.md doesn't exist, create it with the entry
-  if (!existsSync(indexPath)) {
-    const pin = entry.pinned ? "⛔ " : "";
-    const line = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}\n`;
-    atomicWriteFile(indexPath, line);
-    return;
-  }
-
-  const content = readFileSync(indexPath, "utf8");
-
-  // Check if an entry for this filename already exists — if so, replace its line.
-  const lines = content.split("\n");
+  const pin = entry.pinned ? "⛔ " : "";
+  const newLine = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}`;
   const linkRegex = new RegExp(
     `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(entry.filename)}\\)\\s*[—-]\\s*.+$`,
   );
-  const existingIdx = lines.findIndex((l) => linkRegex.test(l));
 
-  const pin = entry.pinned ? "⛔ " : "";
-  const newLine = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}`;
-
-  if (existingIdx >= 0) {
-    // Replace the existing line in place
-    lines[existingIdx] = newLine;
-    atomicWriteFile(indexPath, lines.join("\n"));
-    return;
+  // If MEMORY.md doesn't exist, create it with the entry — no-clobber so
+  // losing a creation race falls through to merge into the winner's index.
+  if (!existsSync(indexPath)) {
+    if (atomicWriteFileNoClobber(indexPath, `${newLine}\n`)) return;
   }
 
-  // Append at end. Preserve trailing newline state.
-  const ending = content.endsWith("\n") ? "" : "\n";
-  atomicWriteFile(indexPath, `${content}${ending}${newLine}\n`);
+  withIndexRetry(indexPath, (content) => {
+    // Check if an entry for this filename already exists — if so, replace its line.
+    const lines = content.split("\n");
+    const existingIdx = lines.findIndex((l) => linkRegex.test(l));
+
+    if (existingIdx >= 0) {
+      // Replace the existing line in place
+      lines[existingIdx] = newLine;
+      return lines.join("\n");
+    }
+
+    // Append at end. Preserve trailing newline state.
+    const ending = content.endsWith("\n") ? "" : "\n";
+    return `${content}${ending}${newLine}\n`;
+  });
 }
 
 /** Remove a memory: move file to .trash/ and remove its MEMORY.md entry. */
@@ -380,21 +398,21 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   };
 }
 
-/** Remove a link entry from MEMORY.md by filename.
- * Uses atomic write (temp-file + rename). */
+/** Remove a link entry from MEMORY.md by filename. Publishes via
+ * withIndexRetry (atomic writes + lost-update merge retry). */
 function removeFromIndex(dir: MemoryDir, filename: string): void {
   const indexPath = dir.indexPath;
   if (!existsSync(indexPath)) return;
 
-  const content = readFileSync(indexPath, "utf8");
-  const lines = content.split("\n");
   const linkRegex = new RegExp(
     `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(filename)}\\)\\s*[—-]\\s*.+$`,
   );
-  const filtered = lines.filter((l) => !linkRegex.test(l));
-  if (filtered.length !== lines.length) {
-    atomicWriteFile(indexPath, filtered.join("\n"));
-  }
+  withIndexRetry(indexPath, (content) => {
+    const lines = content.split("\n");
+    const filtered = lines.filter((l) => !linkRegex.test(l));
+    if (filtered.length === lines.length) return null; // nothing to remove
+    return filtered.join("\n");
+  });
 }
 
 /** Resolve [[wikilinks]] inside a markdown body to paths relative to the memory dir. */
@@ -467,6 +485,70 @@ function atomicWriteFile(filePath: string, content: string): void {
   const tmpPath = join(dir, tmpName);
   writeFileSync(tmpPath, content, "utf8");
   renameSync(tmpPath, filePath);
+}
+
+/** Publish a new file WITHOUT clobbering an existing one. link() is atomic
+ * and fails with EEXIST when the target exists, closing the
+ * check-then-create gap that write-then-rename leaves open (another writer
+ * could create the target between our check and our rename, and rename
+ * would silently destroy their bytes). Returns false when the target came
+ * into existence concurrently. Internal — exported for tests. */
+export function atomicWriteFileNoClobber(filePath: string, content: string): boolean {
+  const dir = dirname(filePath);
+  const tmpName = `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`;
+  const tmpPath = join(dir, tmpName);
+  writeFileSync(tmpPath, content, "utf8");
+  try {
+    linkSync(tmpPath, filePath);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // nothing to clean up
+    }
+  }
+}
+
+/** Number of read-check-merge attempts before withIndexRetry publishes
+ * rebased-on-freshest-read anyway. */
+const INDEX_MERGE_ATTEMPTS = 3;
+
+/** Read-modify-write MEMORY.md with lost-update mitigation: after computing
+ * the mutated content, re-read the index; if it changed since our read,
+ * another writer landed first — recompute from THEIR content and retry.
+ * Each attempt still publishes via atomic temp+rename.
+ *
+ * This narrows but does not close the lost-update window: no cross-process
+ * lock exists (Claude Code is an independent writer), so a write can still
+ * land in the gap between the final re-read and the rename. On retries
+ * exhausted, publish the mutation rebased on the freshest read rather than
+ * dropping it — a topic file with no index line is invisible to every
+ * injector.
+ *
+ * fn maps current index content to updated content, or null for "nothing
+ * to do". Internal — exported for tests. */
+export function withIndexRetry(indexPath: string, fn: (content: string) => string | null): void {
+  for (let attempt = 1; ; attempt++) {
+    if (!existsSync(indexPath)) return;
+    const before = readFileSync(indexPath, "utf8");
+    const next = fn(before);
+    if (next === null || next === before) return;
+    if (attempt < INDEX_MERGE_ATTEMPTS) {
+      const after = readFileSync(indexPath, "utf8");
+      if (after !== before) {
+        debugLog("writer.index_retry", { attempt, indexPath });
+        continue;
+      }
+    } else {
+      debugLog("writer.index_retry_exhausted", { attempt, indexPath });
+    }
+    atomicWriteFile(indexPath, next);
+    return;
+  }
 }
 
 /** Escape a string for safe embedding in a RegExp. */
