@@ -58,9 +58,9 @@ describe("buildExistingIndexSummary", () => {
 
     const summary = buildExistingIndexSummary(resolved);
     expect(summary).toContain("Global tier");
-    expect(summary).toContain("global_entry.md");
+    expect(summary).toContain("global_entry");
     expect(summary).toContain("test tier");
-    expect(summary).toContain("project_entry.md");
+    expect(summary).toContain("project_entry");
   });
 
   it("handles empty dirs gracefully", () => {
@@ -83,7 +83,7 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).toContain("(no entries)");
   });
 
-  it("emits title: description from parsed MEMORY.md entries (not filenames)", () => {
+  it("emits slug: description from parsed MEMORY.md entries (not titles)", () => {
     const claudeDir = join(tmpDir, ".claude", "memory");
     const { mkdirSync } = require("node:fs");
     mkdirSync(claudeDir, { recursive: true });
@@ -105,9 +105,11 @@ describe("buildExistingIndexSummary", () => {
     };
 
     const summary = buildExistingIndexSummary(resolved);
-    // Should contain the title and description, not just the filename
-    expect(summary).toContain("Prefer jq");
+    // Should contain the slug (stable identifier for supersession) and the
+    // description, NOT the display title.
+    expect(summary).toContain("prefer-jq:");
     expect(summary).toContain("Use jq for JSON processing");
+    expect(summary).not.toContain("Prefer jq");
   });
 });
 

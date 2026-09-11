@@ -1,7 +1,7 @@
 // Tests for memory-writer: write, remove, read, wikilink resolution.
 // Uses a temp dir to avoid touching the real Claude Code memory store.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -341,6 +341,34 @@ describe("removeMemory", () => {
     const result = removeMemory(dir, { name: "nonexistent", tier: "project" });
     expect(result.ok).toBe(false);
   });
+
+  it("refuses to remove the index file (MEMORY.md)", () => {
+    writeFileSync(dir.indexPath, "# Index\n\n- [x](x.md) — s\n", "utf8");
+    const result = removeMemory(dir, { name: "MEMORY.md", tier: "project" });
+    expect(result.ok).toBe(false);
+    expect(existsSync(dir.indexPath)).toBe(true);
+  });
+
+  it("refuses traversal names that would escape the memory dir", () => {
+    // Nested layout: mem dir is nested-root/mem, victim is nested-root/victim.md
+    // (a real escape would reach it via ../victim).
+    const nestedRoot = join(tmpDir, "nested-root");
+    const memDir = join(nestedRoot, "mem");
+    mkdirSync(memDir, { recursive: true });
+    const nestedDir: MemoryDir = {
+      tier: "project",
+      dir: memDir,
+      indexPath: join(memDir, "MEMORY.md"),
+      label: "test",
+    };
+    const victim = join(nestedRoot, "victim.md");
+    writeFileSync(victim, "secret", "utf8");
+
+    const result = removeMemory(nestedDir, { name: "../victim", tier: "project" });
+    expect(result.ok).toBe(false);
+    expect(existsSync(victim)).toBe(true); // untouched
+    expect(readFileSync(victim, "utf8")).toBe("secret");
+  });
 });
 
 describe("readMemory", () => {
@@ -362,6 +390,23 @@ describe("readMemory", () => {
 
   it("fails for unknown names", () => {
     const result = readMemory(dir, "nonexistent");
+    expect(result.ok).toBe(false);
+  });
+
+  it("refuses traversal names that would read outside the memory dir", () => {
+    const nestedRoot = join(tmpDir, "nested-root");
+    const memDir = join(nestedRoot, "mem");
+    mkdirSync(memDir, { recursive: true });
+    const nestedDir: MemoryDir = {
+      tier: "project",
+      dir: memDir,
+      indexPath: join(memDir, "MEMORY.md"),
+      label: "test",
+    };
+    const victim = join(nestedRoot, "secret.md");
+    writeFileSync(victim, "secret content", "utf8");
+
+    const result = readMemory(nestedDir, "../secret");
     expect(result.ok).toBe(false);
   });
 });
