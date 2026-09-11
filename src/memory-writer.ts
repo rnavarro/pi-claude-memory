@@ -21,6 +21,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
+import { lineTargetsFile } from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import { TOPIC_FILE_MAX_BYTES } from "./types.js";
 
@@ -422,6 +423,14 @@ function patchIndexAppend(
 
   const pin = entry.pinned ? "⛔ " : "";
   const newLine = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}`;
+  // Match by RESOLVED TARGET, not by the literal `(filename.md)` spelling.
+  // An index line reached through an absolute href (a shape the parser
+  // supports and Claude Code writes) is the same file, but a spelling-based
+  // regex misses it: the append branch then adds a SECOND line for a topic
+  // that is already listed, and every future write keeps missing it too, so
+  // the duplicate is permanent. The target path is the same one the parser
+  // and the containment guard use.
+  const targetPath = join(dir.dir, entry.filename);
   const linkRegex = new RegExp(
     // Summary optional: hand-authored lines like "- [Foo](foo.md)" (no dash
     // + summary) must still be replaceable — a mandatory-summary regex would
@@ -440,9 +449,13 @@ function patchIndexAppend(
   withIndexRetry(
     indexPath,
     (content) => {
-      // Check if an entry for this filename already exists — if so, replace its line.
+      // Check if an entry for this target already exists — if so, replace its
+      // line. `linkRegex` is the cheap literal fast path; the target check
+      // catches differently-spelled hrefs for the same file.
       const lines = content.split("\n");
-      const existingIdx = lines.findIndex((l) => linkRegex.test(l));
+      const existingIdx = lines.findIndex(
+        (l) => linkRegex.test(l) || lineTargetsFile(l, dir.dir, targetPath),
+      );
 
       if (existingIdx >= 0) {
         // Replace the existing line in place
@@ -497,36 +510,59 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   const trashPath = join(destDir, filename);
   renameSync(filePath, trashPath);
 
-  // Remove the link entry from MEMORY.md
-  removeFromIndex(dir, filename);
+  // Remove the link entry from MEMORY.md. Report honestly when no line was
+  // removed: the topic is already in .trash/, so saying "and removed its
+  // MEMORY.md link" while the link survives leaves a dangling index entry the
+  // user believes is gone.
+  const linkRemoved = removeFromIndex(dir, filename);
 
-  debugLog("writer.remove_ok", { filename, tier: dir.tier, label: dir.label, trashPath });
+  debugLog("writer.remove_ok", {
+    filename,
+    tier: dir.tier,
+    label: dir.label,
+    trashPath,
+    linkRemoved,
+  });
 
   return {
     ok: true,
-    message: `Moved memory ${filename} to .trash/ in ${dir.label} tier`,
+    message: linkRemoved
+      ? `Moved memory ${filename} to .trash/ in ${dir.label} tier`
+      : `Moved memory ${filename} to .trash/ in ${dir.label} tier, but no matching MEMORY.md line was found to remove`,
     filePath: trashPath,
   };
 }
 
 /** Remove a link entry from MEMORY.md by filename. Publishes via
- * withIndexRetry (atomic writes + lost-update merge retry). */
-function removeFromIndex(dir: MemoryDir, filename: string): void {
+ * withIndexRetry (atomic writes + lost-update merge retry).
+ *
+ * Returns whether any line was actually removed. Callers report success to
+ * the user, and a removal that silently no-ops leaves an index line pointing
+ * at a file already moved to .trash/ — the caller needs to know so it does
+ * not claim the link was removed. */
+function removeFromIndex(dir: MemoryDir, filename: string): boolean {
   const indexPath = dir.indexPath;
-  if (!existsSync(indexPath)) return;
+  if (!existsSync(indexPath)) return false;
 
-  // Summary optional: dash-less hand-authored lines must still be removable
-  // (a mandatory-summary regex would leave an orphan link pointing at a
-  // trashed file).
+  // Match by resolved target (see patchIndexAppend). A spelling-based regex
+  // misses an absolute-href line for the same file, so the file was trashed
+  // while its link survived — the tool still reported "removed its MEMORY.md
+  // link". The target path is the one the parser and containment guard use.
+  const targetPath = join(dir.dir, filename);
   const linkRegex = new RegExp(
     `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(filename)}\\)(?:\\s*[—-]\\s*.+)?$`,
   );
+  let removed = false;
   withIndexRetry(indexPath, (content) => {
     const lines = content.split("\n");
-    const filtered = lines.filter((l) => !linkRegex.test(l));
+    const filtered = lines.filter(
+      (l) => !(linkRegex.test(l) || lineTargetsFile(l, dir.dir, targetPath)),
+    );
     if (filtered.length === lines.length) return null; // nothing to remove
+    removed = true;
     return filtered.join("\n");
   });
+  return removed;
 }
 
 /** Resolve [[wikilinks]] inside a markdown body to paths relative to the memory dir. */

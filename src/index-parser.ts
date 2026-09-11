@@ -14,9 +14,61 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "
 import { isAbsolute, resolve } from "node:path";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
 
-// Match: - [title](href) — summary  (with optional emoji markers like ⛔ before [)
-// Also allows the dash to be a regular hyphen with spaces.
-const LINK_PATTERN = /^-\s+(?:[^[]+\s+)?\[([^\]]+)\]\(([^)]+)\)\s*[—-]\s*(.+)$/;
+// Match: - [title](href) — summary
+// The summary is OPTIONAL. Hand-authored and emoji-marked index lines
+// ("- ⛔ [Critical rule](rule.md)") carry no summary, and requiring one made
+// them invisible to injection: they fell through as raw prose, so their body
+// was never loaded and their pin was ignored — while the writer's replace and
+// remove regexes (which make the summary optional) happily treated them as
+// index lines. One grammar for both sides.
+const LINK_PATTERN = /^-\s+(?:[^[]+\s+)?\[([^\]]+)\]\(([^)]+)\)\s*(?:[—-]\s*(.*))?$/;
+
+/** A parsed index link line. `summary` is "" when the line omits it. */
+export interface ParsedLinkLine {
+  title: string;
+  href: string;
+  summary: string;
+}
+
+/** Parse a single index link line, ignoring pin markers. Returns null for
+ * prose lines. Shared by the parser and by the writer's replace/remove
+ * matching so the two can never disagree about what is a link line. */
+export function parseLinkLine(line: string): ParsedLinkLine | null {
+  const match = line.match(LINK_PATTERN);
+  if (!match) return null;
+  const [, title, href, summary] = match;
+  return { title: title.trim(), href, summary: (summary ?? "").trim() };
+}
+
+/** True when `path` and `target` name the same file.
+ *
+ * Compares canonical paths when both exist: an index href may reach a topic
+ * through a symlinked store component, and `resolveHref` already canonicalizes
+ * the read side, so lexical comparison alone would report a false negative and
+ * reintroduce the duplicate-line bug this guards against. */
+function sameTarget(path: string, target: string): boolean {
+  if (path === target) return true;
+  try {
+    return realpathSync(path) === realpathSync(target);
+  } catch {
+    return false;
+  }
+}
+
+/** True when the index line links to `targetPath`, regardless of how the href
+ * is SPELLED.
+ *
+ * Replace/remove used to match the literal `(filename.md)` spelling, so a line
+ * using an absolute href — a shape the parser explicitly supports and Claude
+ * Code writes — was neither replaced (a duplicate line was appended instead)
+ * nor removed (the link kept pointing at a file already moved to .trash/,
+ * while the tool reported success). Matching on the resolved target collapses
+ * absolute, `./`-prefixed, and `dir/../` spellings onto the same file. */
+export function lineTargetsFile(line: string, baseDir: string, targetPath: string): boolean {
+  const parsed = parseLinkLine(line);
+  if (!parsed) return false;
+  return sameTarget(resolveHref(parsed.href, baseDir), targetPath);
+}
 
 /** Cap on the index file we will read into the prompt. MEMORY.md is
  * injected every turn, so an unbounded index is an unbounded per-turn cost.
@@ -58,17 +110,16 @@ export function parseIndexContent(content: string, baseDir: string): ParsedIndex
   const rawLines = content.split("\n");
   for (let i = 0; i < rawLines.length; i++) {
     const line = rawLines[i];
-    const match = line.match(LINK_PATTERN);
+    const link = parseLinkLine(line);
 
-    if (match) {
-      const [, title, href, summary] = match;
-      const filePath = resolveHref(href, baseDir);
-      const pinned = isPinnedLine(line, summary);
+    if (link) {
+      const filePath = resolveHref(link.href, baseDir);
+      const pinned = isPinnedLine(line, link.summary);
       const entry: IndexEntry = {
-        title: title.trim(),
-        href,
+        title: link.title,
+        href: link.href,
         filePath,
-        summary: summary.trim(),
+        summary: link.summary,
         pinned,
         lineNumber: i + 1,
       };
