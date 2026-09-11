@@ -8,7 +8,7 @@
 // 5. Large files get index-only with ⟨index-only⟩ marker (model can fetch via recall_memory)
 // 6. Project tier injected first so it wins the shared budget (see buildMemoryInjection)
 
-import { closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { basename, resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
@@ -139,7 +139,9 @@ export function buildMemoryInjection(
     prepared.push(prepareTier(global, "Global", budget, warnings, project?.dir, alreadyLoaded));
   }
 
-  const knownDirs = [project, global].filter((d): d is MemoryDir => !!d);
+  const knownDirs: MemoryDir[] = [];
+  if (project) knownDirs.push(project);
+  if (global) knownDirs.push(global);
   for (const tier of prepared) {
     const text = renderTier(tier, alreadyLoaded, knownDirs, sep);
     if (text) blocks.push(text);
@@ -404,7 +406,14 @@ function loadTopicFiles(
       // Open once, then validate and read the same inode.
       let fd: number;
       try {
-        fd = openSync(realPath, "r");
+        // O_NONBLOCK matters here. Opening a FIFO for read BLOCKS until some
+        // writer opens the other end, so a FIFO named *.md and linked from the
+        // index hung prompt construction forever — the regular-file check
+        // below was never reached because the open never returned. With
+        // O_NONBLOCK the open returns immediately and fstatSync rejects the
+        // descriptor as non-regular. The descriptor-based check is kept
+        // deliberately: it validates the very inode we then read.
+        fd = openSync(realPath, constants.O_RDONLY | constants.O_NONBLOCK);
       } catch {
         continue;
       }

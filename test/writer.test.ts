@@ -1,11 +1,15 @@
 // Tests for memory-writer: write, remove, read, wikilink resolution.
 // Uses a temp dir to avoid touching the real Claude Code memory store.
 
+import { execFileSync } from "node:child_process";
 import {
+  closeSync,
+  constants,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -17,10 +21,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
+import { buildMemoryInjection } from "../src/injector.js";
 import {
   atomicWriteFile,
   atomicWriteFileNoClobber,
   buildFrontmatterYaml,
+  createTempFile,
   readMemory,
   removeMemory,
   resolveWikilinks,
@@ -30,6 +36,7 @@ import {
   writeMemory,
 } from "../src/memory-writer.js";
 import type { MemoryDir } from "../src/types.js";
+import { INDEX_MAX_BYTES } from "../src/types.js";
 
 let tmpDir: string;
 let dir: MemoryDir;
@@ -1402,6 +1409,135 @@ describe("entry identity for underscore-named entries", () => {
       expect(logged).toContain("until this entry is written again");
     } finally {
       spy.mockRestore();
+    }
+  });
+});
+
+describe("temporary files cannot be hijacked", () => {
+  it("does not follow a planted symlink at the predictable temp path", () => {
+    // The temp name is predictable (PID + timestamp), and writeFileSync(tmpPath)
+    // FOLLOWS a symlink at that path. The old code truncated whatever it pointed
+    // at, then renamed the symlink itself into place as the topic — modifying a
+    // file outside the store, reporting success, and leaving an entry that
+    // recall and containment both reject. Exclusive creation ("wx") refuses the
+    // existing path outright and picks a fresh name.
+    const outside = join(tmpDir, "outside-sentinel.md");
+    writeFileSync(outside, "IMPORTANT ORIGINAL\n");
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_700_000_000_000));
+    try {
+      const planted = join(tmpDir, `.topic.md.${process.pid}.1700000000000.0.tmp`);
+      symlinkSync(outside, planted);
+
+      atomicWriteFile(join(tmpDir, "topic.md"), "NEW CONTENT\n");
+
+      // The outside file is untouched...
+      expect(readFileSync(outside, "utf8")).toBe("IMPORTANT ORIGINAL\n");
+      // ...and the published topic is a real file carrying our bytes, not a
+      // symlink to somewhere else.
+      expect(lstatSync(join(tmpDir, "topic.md")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(tmpDir, "topic.md"), "utf8")).toBe("NEW CONTENT\n");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("createTempFile never returns a path it did not create", () => {
+    const outside = join(tmpDir, "outside2.md");
+    writeFileSync(outside, "KEEP\n");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_700_000_000_001));
+    try {
+      const planted = join(tmpDir, `.t.md.${process.pid}.1700000000001.0.tmp`);
+      symlinkSync(outside, planted);
+      const created = createTempFile(tmpDir, join(tmpDir, "t.md"), "body\n");
+      expect(created).not.toBe(planted);
+      // It created a regular file, and the planted link still points elsewhere.
+      expect(lstatSync(created).isSymbolicLink()).toBe(false);
+      expect(readFileSync(outside, "utf8")).toBe("KEEP\n");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("the index correction path is guarded like the main path", () => {
+  it("refuses to re-apply a merge that would cross the index size cap", () => {
+    // Two individually-valid versions can merge past the cap here. Above the
+    // cap parseIndexFile returns null, which hides EVERY entry in the tier.
+    // Sized in BYTES and close to the cap (the em-dash is 3 bytes), so the
+    // append below genuinely crosses it.
+    const line = "- [F](f.md) — s\n";
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    const filler = `# M\n${line.repeat(Math.floor(980_000 / lineBytes))}`;
+    writeFileSync(dir.indexPath, filler);
+    const before = readFileSync(dir.indexPath, "utf8");
+    expect(Buffer.byteLength(before)).toBeLessThan(INDEX_MAX_BYTES);
+    expect(Buffer.byteLength(before)).toBeGreaterThan(900_000);
+
+    // Simulate a concurrent writer's content that is NOT ours (so the
+    // correction path runs) and an append that pushes past the cap.
+    writeFileSync(dir.indexPath, `${before}- [Other](o.md) — o\n`);
+    const landed = readFileSync(dir.indexPath, "utf8");
+    verifyIndexPublish(
+      dir.indexPath,
+      "SOMETHING ELSE",
+      (content) => `${content}${"x".repeat(40_000)}\n`,
+    );
+
+    const after = readFileSync(dir.indexPath, "utf8");
+    expect(landed.length).toBeGreaterThan(0);
+    expect(after).toBe(landed); // nothing re-published
+    expect(Buffer.byteLength(after)).toBeLessThanOrEqual(INDEX_MAX_BYTES);
+  });
+
+  it("does not read through a symlinked index on the correction path", () => {
+    const outside = join(tmpDir, "outside-index.md");
+    writeFileSync(outside, `# OUTSIDE\n${"- [X](x.md) — x\n".repeat(5)}`);
+    symlinkSync(outside, dir.indexPath);
+    const before = readFileSync(outside, "utf8");
+
+    verifyIndexPublish(dir.indexPath, "DIFFERENT", (content) => `${content}INJECTED\n`);
+
+    // The symlink is still a symlink and its target was never rewritten.
+    expect(lstatSync(dir.indexPath).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, "utf8")).toBe(before);
+  });
+});
+
+describe("a FIFO in the store never blocks prompt construction", () => {
+  it("is rejected as a non-regular file rather than read", () => {
+    // A FIFO named *.md and linked from the index used to hang prompt
+    // construction: openSync(path, "r") on a FIFO BLOCKS until a writer appears,
+    // so the regular-file check was never reached. The loader now opens with
+    // O_NONBLOCK so the check runs.
+    //
+    // This test keeps a writer open, which means it exercises the non-regular
+    // rejection safely. The no-writer blocking case cannot be asserted in-process
+    // (a regression would hang the runner instead of failing it); it was
+    // verified out-of-band by reverting O_NONBLOCK and watching the probe die on
+    // a 30s timeout (exit 124) versus passing in ~0.3s with the fix.
+    const d = join(tmpDir, "fifo-store");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, "MEMORY.md"), "# F\n- [Blocked](blocked.md) — b\n");
+    execFileSync("mkfifo", [join(d, "blocked.md")]);
+    // Hold the FIFO open O_RDWR|O_NONBLOCK: O_RDWR counts as BOTH a reader and
+    // a writer, so it never blocks (O_WRONLY|O_NONBLOCK would fail ENXIO with no
+    // reader) and it means a plain blocking read-open would also return. That
+    // keeps this test non-hanging either way.
+    const wfd = openSync(join(d, "blocked.md"), constants.O_RDWR | constants.O_NONBLOCK);
+    try {
+      const res = buildMemoryInjection(
+        { tier: "project", dir: d, indexPath: join(d, "MEMORY.md"), label: "fifo" },
+        null,
+        5000,
+      );
+      // Completing at all is the assertion; the FIFO is rejected as a
+      // non-regular file, so its entry renders index-only (no body loaded).
+      expect(res.text).toContain("Blocked");
+    } finally {
+      closeSync(wfd);
     }
   });
 });
