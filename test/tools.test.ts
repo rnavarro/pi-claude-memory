@@ -255,3 +255,31 @@ describe("remove_memory cross-tier", () => {
     expect(readFileSync(projIndex, "utf8")).toContain("shared.md");
   });
 });
+
+describe("recall_memory reports the most informative failure", () => {
+  it("does not say 'not found' for an entry that exists but is unreadable", () => {
+    // The entry is absent from project but present-and-oversize in global. The
+    // old code kept the FIRST miss, so the caller was told the memory does not
+    // exist — and a model told that may simply write it again, duplicating a
+    // file that is sitting right there.
+    const cwd = join(tmpHome, "work", "proj2");
+    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    const globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(projDir, { recursive: true });
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(projDir, "MEMORY.md"), "# P\n");
+    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Huge](huge.md) — h\n");
+    writeFileSync(
+      join(globalDir, "huge.md"),
+      `---\ndescription: h\ntype: reference\n---\n${"x".repeat(1_100_000)}`,
+    );
+
+    return recallMemoryTool
+      .execute("t1", { name: "huge" }, undefined as never, undefined as never, makeCtx(cwd))
+      .then((res) => {
+        const text = (res.content[0] as { type: string; text: string }).text;
+        expect(text).toContain("too large");
+        expect(text).not.toMatch(/not found/i);
+      });
+  });
+});

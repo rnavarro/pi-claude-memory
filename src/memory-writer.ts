@@ -154,18 +154,29 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   // than to an arbitrary one.
   if (!slug) return null;
   let found: string | null = null;
-  let matches = 0;
+  const matchingNames: string[] = [];
   try {
     for (const e of readdirSync(base, { withFileTypes: true })) {
       if (!e.isFile() || !e.name.endsWith(".md") || e.name === "MEMORY.md") continue;
       if (slugify(e.name.replace(/\.md$/, "")) !== slug) continue;
-      matches++;
+      matchingNames.push(e.name);
       found = containedChild(base, e.name);
     }
   } catch {
     return null;
   }
-  return matches === 1 ? found : null;
+  if (matchingNames.length === 0) return null;
+  if (matchingNames.length === 1) return found;
+  // Refusing to guess between two files is right (picking arbitrarily could
+  // read or trash the wrong one), but the caller reports plain "not found",
+  // which is both wrong and impossible to diagnose from the message. Record the
+  // candidates so the ambiguity is at least visible in the debug log.
+  debugLog("writer.topic_ambiguous", {
+    name,
+    dir: dir.dir,
+    matches: matchingNames.slice(0, 5),
+  });
+  return null;
 }
 
 /** The filename a write of `name` should target: the EXISTING on-disk topic
