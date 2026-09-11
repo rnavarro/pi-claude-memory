@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildExistingIndexSummary, parseCandidates } from "../src/auto-learn.js";
+import { buildExistingIndexSummary, parseCandidates, snapshotMtimes } from "../src/auto-learn.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
 import type { ResolveResult } from "../src/types.js";
 
@@ -328,5 +328,24 @@ describe("createProjectMemoryDir split-brain warning", () => {
     } finally {
       vi.mocked(console.error).mockRestore();
     }
+  });
+});
+
+describe("snapshotMtimes keys", () => {
+  it("keys a non-slug-normal stem by BOTH the raw stem and its slug", () => {
+    const root = mkdtempSync(join(tmpdir(), "pcm-snap-"));
+    writeFileSync(join(root, "Foo Bar.md"), "---\ndescription: d\ntype: project\n---\nbody\n");
+    const dir = {
+      tier: "project" as const,
+      dir: root,
+      indexPath: join(root, "MEMORY.md"),
+      label: "Project",
+    };
+    const mtimes = snapshotMtimes([dir]);
+    // The summary advertises the raw stem; the overwrite guard looks up the
+    // slug. Both must resolve, or supersession of such an entry no-ops.
+    expect(mtimes.has("project:Foo Bar")).toBe(true);
+    expect(mtimes.has("project:foo-bar")).toBe(true);
+    rmSync(root, { recursive: true, force: true });
   });
 });
