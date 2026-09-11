@@ -114,7 +114,7 @@ const writeTool = defineTool({
     "Write a Claude Code-format memory entry (YAML frontmatter + markdown body) and append a link to MEMORY.md. " +
     "Round-trip validates YAML before writing. " +
     "Writes to the SAME files Claude Code uses — the shared store stays in sync. " +
-    "Add-only for v1: existing entries with the same name are overwritten at the file level, but hand-authored MEMORY.md sections are preserved.",
+    "An entry with the same name is overwritten at the file level; hand-authored MEMORY.md sections are preserved.",
   parameters: Type.Object({
     name: Type.String({
       description:

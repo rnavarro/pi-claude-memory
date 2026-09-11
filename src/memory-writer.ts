@@ -2,8 +2,9 @@
 //
 // Writes Claude Code-format memory files: per-topic .md with YAML frontmatter
 // + a link entry in MEMORY.md. Round-trip validates YAML before writing.
-// All writes are add-only for v1: existing frontmatter is preserved, MEMORY.md
-// link entries are appended (never rewritten) so hand-authored sections survive.
+// Existing frontmatter is preserved across an overwrite, and hand-authored
+// MEMORY.md content survives: only the link entry for the topic being written is
+// touched (replaced in place, or removed on request), never the rest of the file.
 
 import {
   existsSync,
@@ -23,7 +24,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
-import { lineTargetsAnyIdentity, lineTargetsFile } from "./index-parser.js";
+import { lineTargetsAnyIdentity, lineTargetsFile, parseLinkLine } from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import { INDEX_MAX_BYTES, TOPIC_FILE_MAX_BYTES } from "./types.js";
 
@@ -385,10 +386,28 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // and write fresh; the publish below replaces the link rather than following
   // it either way.
   let existingIsPlainFile = false;
+  let existingBytes = 0;
   try {
     const st = lstatSync(filePath);
     existingIsPlainFile = st.isFile() && !st.isSymbolicLink();
+    existingBytes = st.size;
   } catch {
+    existingIsPlainFile = false;
+  }
+  // Bound the preserve-read. The new-content cap further down runs AFTER this
+  // read, so it cannot protect it: a very large existing topic — Claude Code's
+  // file, or a hand edit — would be loaded and parsed synchronously in full
+  // before the replacement is written, stalling the turn. Recall and injection
+  // already refuse a topic this size, so it is one the model can never see
+  // anyway. Skip preservation and replace it; the publish below is atomic, so
+  // the oversize file is repaired as a side effect.
+  if (existingIsPlainFile && existingBytes > TOPIC_FILE_MAX_BYTES) {
+    debugLog("writer.preserve_read_oversize", {
+      filename,
+      tier: dir.tier,
+      bytes: existingBytes,
+      cap: TOPIC_FILE_MAX_BYTES,
+    });
     existingIsPlainFile = false;
   }
   if (existingIsPlainFile) {
@@ -463,22 +482,24 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   try {
     patchIndexAppend(dir, {
       filename,
-      // Derive the display title from the RESOLVED FILENAME STEM, not from the
-      // slug. Two reasons:
+      // Derive the display title from the RESOLVED FILENAME STEM.
       //
-      // 1. The index line interpolates the title inside [..]. A raw name
-      //    containing ']' (e.g. "a]b" -> ab.md) produced `- [A]b](ab.md) — ...`,
-      //    which no index regex can ever match, so every later write appended a
-      //    duplicate and removal could not strip the line. A filename stem has
-      //    already been through slugify OR was already a legal name on disk, so
-      //    it is safe here either way.
-      // 2. Deriving from the SLUG mangled titles for the many real entries whose
-      //    stems contain an underscore: slugify strips '_', so a supersession of
-      //    the real `feedback_prefer_jq.md` rewrote its line to
-      //    `- [Feedbackpreferjq](feedback_prefer_jq.md)`. Title and filename
-      //    disagreed — the opposite of what the previous comment here claimed.
-      //    The stem also keeps the title in agreement with the href by
-      //    construction, which is what the comment was reaching for.
+      // The stem keeps the title in agreement with the href; deriving it from
+      // the SLUG did not. slugify collapses whitespace runs to a single hyphen
+      // but PRESERVES underscores and dots, so the slug of a spaced stem
+      // ("Foo Bar" -> "foo-bar") is a different string from the stem on disk,
+      // and the old hyphen-only title split left an underscore stem as one
+      // unsplit word — the real `feedback_prefer_jq.md` rendered as
+      // "Feedback_prefer_jq".
+      //
+      // (An earlier version of this comment claimed slugify STRIPS underscores
+      // and that the title became "Feedbackpreferjq". That is not what slugify
+      // does — its character class is [^a-z0-9._-], which keeps '_'. Corrected
+      // here so a later reader does not re-derive a wrong model of it.)
+      //
+      // A stem is not automatically safe to interpolate, though: a legal
+      // on-disk name may contain ']'. deriveTitle strips bracket characters and
+      // patchIndexAppend refuses to publish a line that does not parse.
       title: deriveTitle(filename.replace(/\.md$/, "")),
       summary: req.description,
       pinned: req.pinned,
@@ -538,11 +559,21 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
  * stems use underscores (`feedback_prefer_jq`, `user_location`), and splitting
  * only on hyphens left those as a single unsplit word. */
 function deriveTitle(name: string): string {
-  return name
-    .split(/[-_]+/)
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
+  return (
+    name
+      .split(/[-_]+/)
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ")
+      // Strip bracket characters. The title is interpolated inside `[..]` in the
+      // index line, and the filename is a real, legal on-disk name that may
+      // contain ']' — a stem like `a]b` emitted raw produced
+      // `- [A]b](a]b.md) — ...`, which no index regex can match. The line then
+      // becomes prose: its body is never injected, it can never be replaced (the
+      // next write appends another malformed duplicate) and never removed. The
+      // href must stay literal, so the TITLE is what gets made safe.
+      .replace(/[[\]]/g, "")
+  );
 }
 
 /** Append a link entry to MEMORY.md without destroying hand-authored content.
@@ -558,6 +589,16 @@ function patchIndexAppend(
 
   const pin = entry.pinned ? "⛔ " : "";
   const newLine = `- ${pin}[${entry.title}](${entry.filename}) — ${entry.summary}`;
+  // The line we emit MUST parse back. Everything that reads, replaces, or
+  // removes an index entry works on PARSED links, so an unparseable line is
+  // invisible to injection forever and can never be replaced or removed — each
+  // later write just appends another malformed duplicate. deriveTitle strips
+  // the characters that would break the [title](href) shape; this assertion
+  // turns any FUTURE regression into a reported failure instead of a
+  // permanently orphaned entry.
+  if (!parseLinkLine(newLine)) {
+    throw new Error(`Refusing to publish an unparseable MEMORY.md line: ${newLine}`);
+  }
   // Match by RESOLVED TARGET, not by the literal `(filename.md)` spelling.
   // An index line reached through an absolute href (a shape the parser
   // supports and Claude Code writes) is the same file, but a spelling-based
@@ -1115,18 +1156,23 @@ export function verifyIndexPublish(
   fn: (content: string) => string | null,
   verifyGuard?: () => boolean,
 ): void {
+  // Guard the CORRECTIVE read too. This path ran unguarded, so a symlink
+  // swapped in during the rename-to-verify window was read through here even
+  // though the main path refuses one, and that content was then re-published
+  // as the index.
+  //
+  // Deliberately OUTSIDE the catch below. assertIndexReadable throwing means a
+  // RECOGNISED unsafe index (symlinked, non-regular, or over the cap) replaced
+  // the one we just published — a detected problem, not a race to shrug at, so
+  // it must reach the caller and the write must be reported as degraded. An
+  // ABSENT index is not an error (assertIndexReadable returns for that), so the
+  // concurrent-removal race still falls through to the read below.
+  assertIndexReadable(indexPath);
   let landed: string;
   try {
-    // Guard the CORRECTIVE read too. This path ran unguarded, so a symlink
-    // swapped in during the rename-to-verify window was read through here even
-    // though the main path refuses one, and that content was then re-published
-    // as the index.
-    assertIndexReadable(indexPath);
     landed = readFileSync(indexPath, "utf8");
   } catch {
     // Index vanished post-write (concurrent removal) — nothing sane to do.
-    // Narrowed to the read: failures of the corrective write below must
-    // surface rather than masquerade as a missing index.
     return;
   }
   if (landed === next) return; // our publish landed cleanly; nothing to do
@@ -1144,7 +1190,14 @@ export function verifyIndexPublish(
     const bytes = Buffer.byteLength(reapplied, "utf8");
     if (bytes > INDEX_MAX_BYTES) {
       debugLog("writer.index_reapply_oversize", { indexPath, bytes, cap: INDEX_MAX_BYTES });
-      return;
+      // Throw rather than return. This is a DETECTED divergence we could not
+      // repair, so the topic sits on disk with no index line — invisible to
+      // every injection. Returning normally reported a clean write for an entry
+      // that will never be injected; the callers already have a degraded-result
+      // path for a thrown index failure.
+      throw new Error(
+        `index re-apply would exceed the ${INDEX_MAX_BYTES}-byte cap (${bytes} bytes): ${indexPath}`,
+      );
     }
     atomicWriteFile(indexPath, reapplied);
     debugLog("writer.index_postwrite_reapply", { indexPath });
