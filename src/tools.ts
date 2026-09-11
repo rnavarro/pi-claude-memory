@@ -199,11 +199,18 @@ const removeTool = defineTool({
     "remove_memory - Move a memory entry to .trash/ and remove its MEMORY.md link. Recoverable, never hard-deletes.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     debugLog("tool.remove_memory", { name: params.name, tier: params.tier ?? "project" });
+    const explicitTier = params.tier !== undefined;
     const tier = params.tier ?? "project";
     // Removals are mutations: exact project match only (see write_memory).
     const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
-    const dir =
-      pickTier(resolved, tier) ?? pickTier(resolved, tier === "project" ? "global" : "project");
+    // An explicitly named tier must be honored — silently falling back to
+    // the other tier would delete from a different store than asked. The
+    // cross-tier fallback stays only for the default tier, where the caller
+    // said "remove X" without naming where it lives.
+    let dir = pickTier(resolved, tier);
+    if (!dir && !explicitTier) {
+      dir = pickTier(resolved, tier === "project" ? "global" : "project");
+    }
     if (!dir) {
       return {
         content: [{ type: "text", text: `No ${tier} memory directory available.` }],
