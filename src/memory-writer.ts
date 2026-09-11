@@ -434,25 +434,29 @@ function patchIndexAppend(
     if (atomicWriteFileNoClobber(indexPath, `${newLine}\n`)) return;
   }
 
-  withIndexRetry(indexPath, (content) => {
-    // Check if an entry for this filename already exists — if so, replace its line.
-    const lines = content.split("\n");
-    const existingIdx = lines.findIndex((l) => linkRegex.test(l));
+  withIndexRetry(
+    indexPath,
+    (content) => {
+      // Check if an entry for this filename already exists — if so, replace its line.
+      const lines = content.split("\n");
+      const existingIdx = lines.findIndex((l) => linkRegex.test(l));
 
-    if (existingIdx >= 0) {
-      // Replace the existing line in place
-      lines[existingIdx] = newLine;
-      return lines.join("\n");
-    }
+      if (existingIdx >= 0) {
+        // Replace the existing line in place
+        lines[existingIdx] = newLine;
+        return lines.join("\n");
+      }
 
-    // Append at end. Preserve trailing newline state — and treat EMPTY
-    // content as needing no separator: `"".endsWith("\n")` is false, so an
-    // empty-but-existing MEMORY.md would otherwise gain a stray leading
-    // blank line, which parseIndexContent keeps as an IndexLine and
-    // renderIndexSection re-emits into the prompt on every turn.
-    const ending = content === "" || content.endsWith("\n") ? "" : "\n";
-    return `${content}${ending}${newLine}\n`;
-  });
+      // Append at end. Preserve trailing newline state — and treat EMPTY
+      // content as needing no separator: `"".endsWith("\n")` is false, so an
+      // empty-but-existing MEMORY.md would otherwise gain a stray leading
+      // blank line, which parseIndexContent keeps as an IndexLine and
+      // renderIndexSection re-emits into the prompt on every turn.
+      const ending = content === "" || content.endsWith("\n") ? "" : "\n";
+      return `${content}${ending}${newLine}\n`;
+    },
+    () => existsSync(join(dir.dir, entry.filename)),
+  );
 }
 
 /** Remove a memory: move file to .trash/ and remove its MEMORY.md entry. */
@@ -639,7 +643,11 @@ const INDEX_MERGE_ATTEMPTS = 3;
  *
  * fn maps current index content to updated content, or null for "nothing
  * to do". Internal — exported for tests. */
-export function withIndexRetry(indexPath: string, fn: (content: string) => string | null): void {
+export function withIndexRetry(
+  indexPath: string,
+  fn: (content: string) => string | null,
+  verifyGuard?: () => boolean,
+): void {
   for (let attempt = 1; ; attempt++) {
     if (!existsSync(indexPath)) return;
     const before = readFileSync(indexPath, "utf8");
@@ -661,17 +669,46 @@ export function withIndexRetry(indexPath: string, fn: (content: string) => strin
     // strictly LARGER. Verify what landed; if another writer replaced the
     // index in that gap, re-apply the mutation once on their content so our
     // entry is merged rather than lost.
+    //
+    // The re-apply is NOT unconditional. Re-running an append closure on
+    // someone else's content re-adds a line they may have deliberately
+    // removed: if a concurrent remove_memory stripped our line AND trashed
+    // the topic in this window, blindly re-applying resurrects a link to a
+    // file that is already in .trash/. verifyGuard lets the caller veto the
+    // re-apply when the topic it would link to no longer exists.
+    let landed: string;
     try {
-      const landed = readFileSync(indexPath, "utf8");
-      if (landed !== next) {
-        const reapplied = fn(landed);
-        if (reapplied !== null && reapplied !== landed) {
-          atomicWriteFile(indexPath, reapplied);
-          debugLog("writer.index_postwrite_reapply", { indexPath });
-        }
-      }
+      landed = readFileSync(indexPath, "utf8");
     } catch {
-      // index vanished post-write (concurrent removal) — nothing sane to do
+      // Index vanished post-write (concurrent removal) — nothing sane to do.
+      // Narrowed to the read: failures of the corrective write below must
+      // surface rather than masquerade as a missing index.
+      return;
+    }
+    if (landed === next) return; // our publish landed cleanly; nothing to do
+    // A writer replaced the index in the rename->verify gap. Re-run the
+    // mutation on THEIR content so our entry merges instead of being lost.
+    //
+    // The re-apply is not unconditional: an append closure cannot tell
+    // "my line was removed" from "my line was never added", so blindly
+    // re-running it re-links a topic a concurrent remove just trashed.
+    // verifyGuard lets the caller veto exactly that case.
+    if (verifyGuard && !verifyGuard()) {
+      debugLog("writer.index_reapply_vetoed", { indexPath });
+      return;
+    }
+    // Re-read rather than reusing `landed`: the guard ran in between, and
+    // re-applying to a stale snapshot would clobber what landed since.
+    let fresh: string;
+    try {
+      fresh = readFileSync(indexPath, "utf8");
+    } catch {
+      return;
+    }
+    const reapplied = fn(fresh);
+    if (reapplied !== null && reapplied !== fresh) {
+      atomicWriteFile(indexPath, reapplied);
+      debugLog("writer.index_postwrite_reapply", { indexPath });
     }
     return;
   }
