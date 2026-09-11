@@ -205,11 +205,10 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         return;
       }
 
-      // Truncate to configured max
-      const truncated =
-        chunk.length > config.reviewMaxChunkChars
-          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
-          : chunk;
+      // Truncate to configured max, keeping the RECENT end (see
+      // truncateReviewChunk): a capped chunk must not drop the turns that just
+      // happened in favour of the oldest ones.
+      const truncated = truncateReviewChunk(chunk, config.reviewMaxChunkChars);
 
       debugLog("auto_learn.trigger_compact", {
         chunkChars: truncated.length,
@@ -502,11 +501,10 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
         return;
       }
 
-      // Truncate chunk to configured max
-      const truncated =
-        chunk.length > config.reviewMaxChunkChars
-          ? `${chunk.slice(0, config.reviewMaxChunkChars)}\n... [truncated]`
-          : chunk;
+      // Truncate to configured max, keeping the RECENT end. Compaction is the
+      // event meant to preserve recent raw material, so truncating from the
+      // head discarded exactly what it exists to keep.
+      const truncated = truncateReviewChunk(chunk, config.reviewMaxChunkChars);
 
       debugLog("auto_learn.trigger", {
         chunkChars: truncated.length,
@@ -700,6 +698,20 @@ function drainPendingCompact(): void {
  * held to at most half the budget and the live chunk takes the remainder
  * (and is itself capped to whatever is left). Both halves get a truncation
  * marker so the reviewer can tell it is seeing a prefix. */
+/** Bound a review chunk to `maxChars`, keeping the MOST RECENT material.
+ *
+ * The periodic and compaction chunks are chronological, so the head is the
+ * oldest conversation and the tail is what just happened. Truncating from the
+ * head kept the oldest turns and dropped the newest corrections — and for
+ * compaction it discarded the recent raw material at the very event meant to
+ * preserve it. The marker goes at the front, where the dropped bytes were, so
+ * the model can tell the prefix is missing. */
+export function truncateReviewChunk(chunk: string, maxChars: number): string {
+  if (chunk.length <= maxChars) return chunk;
+  if (maxChars <= 0) return "";
+  return `... [truncated]\n${chunk.slice(-maxChars)}`;
+}
+
 export function composeShutdownChunk(
   snapshot: string | null,
   live: string,
