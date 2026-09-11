@@ -1360,10 +1360,12 @@ describe("entry identity for underscore-named entries", () => {
 
   it("derives a readable title from the stem instead of mangling it", () => {
     // Real corpus stems look like this (feedback_prefer_jq.md, user_location.md).
-    // slugify() STRIPS underscores, so deriving the title from the slug
-    // rewrote the line to `- [Feedbackpreferjq](feedback_prefer_jq.md)`,
-    // putting the title and the filename in disagreement — which the old
-    // comment claimed was impossible "by construction".
+    // The old title split was on hyphens only, so an underscore stem stayed one
+    // unsplit word and the line read `[Feedback_prefer_jq]`. (An earlier version
+    // of this comment claimed slugify() STRIPS underscores and produced
+    // "Feedbackpreferjq". It does not: slugify's character class is
+    // [^a-z0-9._-], which keeps '_'. The assertion below used to test for the
+    // title that never existed, so it passed against the broken code too.)
     writeFileSync(
       join(tmpDir, "feedback_prefer_jq.md"),
       "---\ndescription: old\ntype: feedback\n---\nold\n",
@@ -1375,7 +1377,8 @@ describe("entry identity for underscore-named entries", () => {
     const res = writeJq();
     expect(res.ok).toBe(true);
     const idx = readFileSync(dir.indexPath, "utf8");
-    expect(idx).not.toContain("Feedbackpreferjq");
+    // What the hyphen-only split actually produced — this assertion has teeth.
+    expect(idx).not.toContain("Feedback_prefer_jq");
     expect(idx).toContain("[Feedback Prefer Jq](feedback_prefer_jq.md)");
   });
 
@@ -1481,11 +1484,15 @@ describe("the index correction path is guarded like the main path", () => {
     // correction path runs) and an append that pushes past the cap.
     writeFileSync(dir.indexPath, `${before}- [Other](o.md) — o\n`);
     const landed = readFileSync(dir.indexPath, "utf8");
-    verifyIndexPublish(
-      dir.indexPath,
-      "SOMETHING ELSE",
-      (content) => `${content}${"x".repeat(40_000)}\n`,
-    );
+    // The refusal must REACH THE CALLER. Returning quietly reported a clean
+    // write for a topic that has no index line and will never be injected.
+    expect(() =>
+      verifyIndexPublish(
+        dir.indexPath,
+        "SOMETHING ELSE",
+        (content) => `${content}${"x".repeat(40_000)}\n`,
+      ),
+    ).toThrow(/exceed/);
 
     const after = readFileSync(dir.indexPath, "utf8");
     expect(landed.length).toBeGreaterThan(0);
@@ -1499,7 +1506,12 @@ describe("the index correction path is guarded like the main path", () => {
     symlinkSync(outside, dir.indexPath);
     const before = readFileSync(outside, "utf8");
 
-    verifyIndexPublish(dir.indexPath, "DIFFERENT", (content) => `${content}INJECTED\n`);
+    // assertIndexReadable now sits OUTSIDE the read's catch, so a recognised
+    // unsafe index is reported to the caller instead of being swallowed as
+    // "index vanished".
+    expect(() =>
+      verifyIndexPublish(dir.indexPath, "DIFFERENT", (content) => `${content}INJECTED\n`),
+    ).toThrow(/not a regular file/);
 
     // The symlink is still a symlink and its target was never rewritten.
     expect(lstatSync(dir.indexPath).isSymbolicLink()).toBe(true);
@@ -1650,5 +1662,95 @@ describe("an exact name resolves to the exact file", () => {
     expect(res.ok).toBe(true);
     expect(existsSync(join(tmpDir, "Foo Bar.md"))).toBe(false);
     expect(existsSync(join(tmpDir, "foo-bar.md"))).toBe(true);
+  });
+});
+
+describe("write-path fidelity", () => {
+  it("does not read an oversize existing topic just to preserve provenance", () => {
+    // The new-content cap runs AFTER the preserve-read, so it cannot bound it.
+    // A very large existing topic was loaded and parsed synchronously in full
+    // before the replacement was written. Recall and injection already refuse a
+    // file this size, so the model can never see it anyway: skip preservation
+    // and replace it.
+    const huge =
+      "---\n" +
+      "name: huge-topic\n" +
+      "description: Written by Claude Code\n" +
+      "metadata:\n" +
+      "  node_type: memory\n" +
+      "  type: feedback\n" +
+      "  originSessionId: SHOULD-NOT-SURVIVE\n" +
+      "---\n\n" +
+      "x".repeat(1_200_000);
+    writeFileSync(join(tmpDir, "huge-topic.md"), huge, "utf8");
+
+    const res = writeMemory(dir, {
+      name: "huge-topic",
+      description: "replaced",
+      type: "feedback",
+      body: "small now",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+
+    expect(res.ok).toBe(true);
+    const content = readFileSync(join(tmpDir, "huge-topic.md"), "utf8");
+    expect(content).toContain("small now");
+    // Preservation was skipped, so the oversize file's provenance did not ride
+    // along — and the 1.2 MB was never read to find it.
+    expect(content).not.toContain("SHOULD-NOT-SURVIVE");
+  });
+
+  it("emits a parseable index line for a stem containing a bracket", () => {
+    // A legal on-disk name may contain ']'. The title is interpolated inside
+    // [..], so an unsanitised stem produced `- [A]b](a]b.md) — ...`, which no
+    // index regex matches. The line becomes prose: its body is never injected,
+    // it can never be replaced (each write appends another malformed duplicate)
+    // and never removed.
+    writeFileSync(join(tmpDir, "a]b.md"), "---\ndescription: b\ntype: reference\n---\nBODY\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), "# M\n");
+
+    const res = writeMemory(dir, {
+      name: "a]b",
+      description: "bracketed stem",
+      type: "reference",
+      body: "BODY2",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(res.ok).toBe(true);
+
+    const parsed = parseIndexContent(readFileSync(join(tmpDir, "MEMORY.md"), "utf8"), tmpDir);
+    const links = parsed.lines.filter((l) => "href" in l) as Array<{ href: string }>;
+    expect(links.length).toBe(1);
+    expect(links[0].href).toBe("a]b.md");
+  });
+
+  it("throws when the corrective index re-apply would exceed the cap", () => {
+    // A DETECTED divergence we could not repair. Returning normally reported a
+    // clean write for a topic that has no index line and will never be injected.
+    const root = mkdtempSync(join(tmpdir(), "pcm-vip-cap-"));
+    const idx = join(root, "MEMORY.md");
+    // Their content already sits at the cap, so merging our line must overflow.
+    writeFileSync(idx, "y".repeat(INDEX_MAX_BYTES - 10));
+    expect(() =>
+      verifyIndexPublish(idx, "OUR-PUBLISH\n", (content) => `${content}${"z".repeat(100)}\n`),
+    ).toThrow(/exceed/);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("throws when a symlink replaced the index after publication", () => {
+    // assertIndexReadable is now outside the read's catch: a RECOGNISED unsafe
+    // index is a detected problem, not the concurrent-removal race that is
+    // allowed to pass quietly.
+    const root = mkdtempSync(join(tmpdir(), "pcm-vip-sym-"));
+    const outside = join(root, "outside.md");
+    const idx = join(root, "MEMORY.md");
+    writeFileSync(outside, "# OUTSIDE\n");
+    symlinkSync(outside, idx);
+    expect(() => verifyIndexPublish(idx, "OUR-PUBLISH\n", (c) => c)).toThrow(/not a regular file/);
+    rmSync(root, { recursive: true, force: true });
   });
 });
