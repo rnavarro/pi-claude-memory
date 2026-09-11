@@ -169,6 +169,88 @@ describe("writeMemory", () => {
     expect(parsed.body).toContain("Some reference content.");
   });
 
+  it("persists priority to frontmatter and reads it back", () => {
+    writeMemory(dir, {
+      name: "prioritized-entry",
+      description: "Has explicit priority",
+      type: "project",
+      body: "Body.",
+      pinned: false,
+      tier: "project",
+      priority: 4,
+      allowOverwrite: true,
+    });
+    const content = readFileSync(join(tmpDir, "prioritized-entry.md"), "utf8");
+    expect(content).toContain("priority: 4");
+    const parsed = parseMemoryContent(content, "prioritized-entry.md", Date.now());
+    expect(parsed.priority).toBe(4);
+  });
+
+  it("clears pinned on overwrite from pinned:true to pinned:false", () => {
+    // First write: pinned
+    writeMemory(dir, {
+      name: "pin-toggle",
+      description: "Starts pinned",
+      type: "feedback",
+      body: "Body.",
+      pinned: true,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    let content = readFileSync(join(tmpDir, "pin-toggle.md"), "utf8");
+    expect(content).toContain("pinned: true");
+
+    // Overwrite: clear pinned
+    writeMemory(dir, {
+      name: "pin-toggle",
+      description: "Now unpinned",
+      type: "feedback",
+      body: "Body.",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    content = readFileSync(join(tmpDir, "pin-toggle.md"), "utf8");
+    const parsed = parseMemoryContent(content, "pin-toggle.md", Date.now());
+    expect(parsed.pinned).toBe(false);
+    // metadata block must not carry a pinned key
+    expect(content).not.toMatch(/^\s{2}pinned:/m);
+
+    // Index line should also lose the pin marker
+    const idx = readFileSync(dir.indexPath, "utf8");
+    expect(idx).not.toContain("⛔");
+  });
+
+  it("clears priority on overwrite when priority is omitted", () => {
+    writeMemory(dir, {
+      name: "prio-toggle",
+      description: "Has priority",
+      type: "project",
+      body: "Body.",
+      pinned: false,
+      tier: "project",
+      priority: 5,
+      allowOverwrite: true,
+    });
+    expect(readFileSync(join(tmpDir, "prio-toggle.md"), "utf8")).toContain("priority: 5");
+
+    // Overwrite without priority — should be cleared, not preserved
+    writeMemory(dir, {
+      name: "prio-toggle",
+      description: "No priority now",
+      type: "project",
+      body: "Body.",
+      pinned: false,
+      tier: "project",
+      priority: null,
+      allowOverwrite: true,
+    });
+    const content = readFileSync(join(tmpDir, "prio-toggle.md"), "utf8");
+    const parsed = parseMemoryContent(content, "prio-toggle.md", Date.now());
+    expect(parsed.priority).toBeNull();
+    expect(content).not.toMatch(/^\s{2}priority:/m);
+  });
+
   it("skips when allowOverwrite=false and file exists (auto-learn collision guard)", () => {
     // First write succeeds
     writeMemory(dir, {

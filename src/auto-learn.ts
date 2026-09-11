@@ -283,9 +283,14 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
     typeof c.pinned === "boolean" &&
     // overwrite is optional (defaults to false)
     (c.overwrite === undefined || typeof c.overwrite === "boolean") &&
-    // priority is optional (defaults to type-derived value)
+    // priority is optional (defaults to type-derived value); if present it
+    // must be an integer 1-5 to match extractPriority's read-side validation
+    // (a float would be written then silently ignored on read).
     (c.priority === undefined ||
-      (typeof c.priority === "number" && c.priority >= 1 && c.priority <= 5))
+      (typeof c.priority === "number" &&
+        Number.isInteger(c.priority) &&
+        c.priority >= 1 &&
+        c.priority <= 5))
   );
 }
 
