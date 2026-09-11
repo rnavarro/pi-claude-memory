@@ -217,6 +217,16 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     return 0;
   }
 
+  // A review aborted after its deadline (shutdown timeout, session
+  // replacement) must not write: its decisions were computed against a
+  // conversation snapshot that is no longer the live one, and writing would
+  // race whoever triggered the abort. The LLM call itself is already
+  // signal-bound; this closes the completion→write window.
+  if (signal?.aborted) {
+    debugLog("auto_learn.skip_writes_aborted", { candidates: candidates.length });
+    return 0;
+  }
+
   // Write each candidate. Count successes.
   let written = 0;
   for (const c of candidates) {
