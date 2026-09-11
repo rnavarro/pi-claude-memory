@@ -46,7 +46,10 @@ You return a JSON array of memory candidates. Each candidate has:
 - description: one-line summary
 - type: one of "feedback" (behavioral rule), "reference" (lookup material), "project" (project-specific fact), "user" (user preference)
 - body: markdown body, 1-10 lines
-- tier: "project" or "global"
+- tier: the store the entry should live in. An entry in the existing-index
+  summary tagged [owner: X] belongs in store X regardless of which section
+  listed it, so a candidate overwriting it must carry tier X — echoing the
+  section's tier silently duplicates the entry into the wrong store
 - pinned: boolean (true only for critical behavioral rules)
 - overwrite: boolean (true if this supersedes/replaces an existing entry — see SUPERSESSION below)
 - priority: optional integer 1-5 (5=highest). Omit to use type default (feedback=5, user=4, project=3, reference=2)
@@ -518,7 +521,12 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
     return fallback;
   };
 
-  for (const dir of [resolved.global, resolved.project]) {
+  // Project first, mirroring the injector's budget order. The project tier is
+  // the likeliest home for the conversation under review, and its summaries are
+  // what makes supersession catch exact duplicates; global summaries must not
+  // consume the shared budget ahead of it. Identity lines are emitted either
+  // way, so this ordering only decides whose SUMMARIES survive the budget.
+  for (const dir of [resolved.project, resolved.global]) {
     if (!dir) continue;
     const headerIndex = lines.length;
     // Name the TIER in the header, not just the label. A project store's label

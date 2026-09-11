@@ -656,8 +656,15 @@ function launchAutoLearn(
 ): Promise<number> {
   if (autoLearnInFlight) {
     debugLog("auto_learn.skip_inflight", {});
-    // Return a resolved promise so callers awaiting this (shutdown) proceed.
-    return Promise.resolve(0);
+    // Return the IN-FLIGHT promise, not a resolved dummy. Draining a queued
+    // compaction can launch a fresh review in the settling review's .finally;
+    // shutdown then calls launchAutoLearn, finds the busy flag still set, and
+    // awaits a placeholder it cannot distinguish from real work. That skipped
+    // the final review silently while the replacement ran unawaited past
+    // exit — exactly what session_shutdown exists to prevent. Awaiting the
+    // real review is correct here: it already holds the most recent material,
+    // so launching a competitor writer over it would be worse.
+    return autoLearnInFlight;
   }
 
   // Reviews launched without a caller-supplied controller (periodic,

@@ -519,6 +519,41 @@ describe("reviewer index summary is complete", () => {
     expect(summary).toContain("## global tier");
     expect(summary).toContain("## project tier");
   });
+
+  it("spends the summary budget on project before global", () => {
+    // Both tiers' IDENTITIES are always listed (supersession keys on them), so
+    // the only thing the shared SUMMARY_BUDGET_CHARS can starve is summaries.
+    // With global iterated first, a large global index consumed the whole
+    // budget and left project summaries dropped to bare identity lines — the
+    // reverse of the injector's order, which puts the project tier (the
+    // likeliest home of the conversation under review) first for the same
+    // reason.
+    const glob = join(tmpDir, ".claude", "memory");
+    const proj = join(tmpDir, "work", "proj");
+    mkdirSync(glob, { recursive: true });
+    mkdirSync(proj, { recursive: true });
+    // A global index whose summaries alone exceed the budget...
+    const gLines = ["# G"];
+    for (let i = 0; i < 40; i++) {
+      writeFileSync(join(glob, `g${i}.md`), "---\ndescription: g\ntype: reference\n---\nx\n");
+      gLines.push(`- [G${i}](g${i}.md) — ${"global boilerplate advice repeated here. ".repeat(6)}`);
+    }
+    writeFileSync(join(glob, "MEMORY.md"), `${gLines.join("\n")}\n`);
+    // ...and a project index whose summaries then get starved.
+    writeFileSync(join(proj, "p.md"), "---\ndescription: p\ntype: project\n---\nx\n");
+    writeFileSync(join(proj, "MEMORY.md"), "- [P](p.md) — project-local detail that matters\n");
+
+    const summary = buildExistingIndexSummary({
+      project: { tier: "project", dir: proj, indexPath: join(proj, "MEMORY.md"), label: "proj" },
+      global: { tier: "global", dir: glob, indexPath: join(glob, "MEMORY.md"), label: "global" },
+      warnings: [],
+    } as never);
+    const pLine = summary.split("\n").find((l) => l.startsWith("- p:"));
+    // The project entry's summary must survive with its text intact; under the
+    // old ordering it was reduced to a bare identity line "- p [owner: ...]".
+    expect(pLine).toBeDefined();
+    expect(pLine).toContain("project-local detail that matters");
+  });
 });
 
 describe("snapshotMtimes alias keys never shadow a real stem", () => {
