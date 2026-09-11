@@ -702,9 +702,15 @@ export function composeShutdownChunk(
   maxChars: number,
 ): string {
   const cap = Math.max(0, maxChars);
+  // The live branch keeps its TAIL: at shutdown the review wants the most
+  // recent material, and keeping the head would retain the oldest turns of
+  // the session while discarding the conversation that just ended. (The
+  // pre-compaction snapshot keeps its head — it is a chronological prefix
+  // of the same session, so its oldest turns are the ones the later branch
+  // does not repeat.)
   let liveOut = live;
   if (live.length > cap) {
-    liveOut = `${live.slice(0, cap)}\n... [truncated]`;
+    liveOut = `... [truncated]\n${live.slice(-cap)}`;
   }
 
   if (!snapshot) return liveOut;
@@ -718,7 +724,8 @@ export function composeShutdownChunk(
   }
   const liveBudget = Math.max(0, cap - snapshotOut.length);
   if (liveOut.length > liveBudget) {
-    liveOut = `${liveOut.slice(0, liveBudget)}\n... [truncated]`;
+    // Tail again: the newest turns are the ones worth reviewing.
+    liveOut = `... [truncated]\n${liveOut.slice(-liveBudget)}`;
   }
 
   return `### Pre-compaction snapshot\n${snapshotOut}\n\n${liveOut}`;
