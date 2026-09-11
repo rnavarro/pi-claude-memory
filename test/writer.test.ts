@@ -959,3 +959,102 @@ describe("atomicWriteFile temp cleanup", () => {
     expect(leftovers).toEqual([]);
   });
 });
+
+describe("index lines matched by resolved target, not href spelling", () => {
+  // An index line may reach a topic through an absolute href — a shape the
+  // parser supports and Claude Code writes (two exist in a real project index
+  // on this machine). Replace/remove used to match only the literal
+  // `(filename.md)` spelling, so those lines were neither replaced (a duplicate
+  // was appended) nor removed (the link survived while the tool reported
+  // success). Both are deterministic single-process bugs — no race needed.
+  const absoluteHref = (name: string) =>
+    `- [${name}](${join(tmpDir, `${name}.md`)}) — from Claude Code`;
+  const write = (name: string) =>
+    writeMemory(dir, {
+      name,
+      description: `desc ${name}`,
+      type: "project",
+      body: `body ${name}`,
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+
+  it("replaces a line written with an absolute href instead of duplicating it", () => {
+    writeFileSync(join(tmpDir, "alpha.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), `${absoluteHref("alpha")}\n- [Other](other.md) — o\n`);
+    write("alpha");
+    const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
+    const alphaLines = index.split("\n").filter((l) => l.includes("alpha.md"));
+    expect(alphaLines).toHaveLength(1); // not two
+    expect(index).toContain("(other.md)"); // unrelated prose preserved
+  });
+
+  it("removes a line written with an absolute href and reports it as removed", () => {
+    writeFileSync(join(tmpDir, "beta.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), `${absoluteHref("beta")}\n- [Other](other.md) — o\n`);
+    const result = removeMemory(dir, { name: "beta", tier: "project" });
+    expect(result.ok).toBe(true);
+    const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
+    // The link does NOT survive pointing at a file that is now in .trash/
+    expect(index).not.toContain("beta.md");
+    expect(index).toContain("(other.md)");
+    expect(result.message).not.toContain("no matching");
+  });
+
+  it("matches ./ and dir/../ spellings of the same target", () => {
+    writeFileSync(join(tmpDir, "gamma.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), `- [G](./gamma.md) — dot slash\n`);
+    write("gamma");
+    const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
+    expect(index.split("\n").filter((l) => l.includes("gamma.md"))).toHaveLength(1);
+
+    writeFileSync(join(tmpDir, "MEMORY.md"), `- [G](sub/../gamma.md) — traversal\n`);
+    const res = removeMemory(dir, { name: "gamma", tier: "project" });
+    expect(res.ok).toBe(true);
+    expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).not.toContain("gamma.md");
+  });
+
+  it("still removes only the addressed topic", () => {
+    writeFileSync(join(tmpDir, "delta.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "epsilon.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), `- [D](delta.md) — d\n- [E](epsilon.md) — e\n`);
+    removeMemory(dir, { name: "delta", tier: "project" });
+    const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
+    expect(index).not.toContain("delta.md");
+    expect(index).toContain("(epsilon.md)");
+  });
+
+  it("reports honestly when no line matched", () => {
+    writeFileSync(join(tmpDir, "orphan.md"), "---\ntype: project\n---\nold\n");
+    writeFileSync(join(tmpDir, "MEMORY.md"), `- [Other](other.md) — o\n`);
+    const res = removeMemory(dir, { name: "orphan", tier: "project" });
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("no matching MEMORY.md line");
+  });
+});
+
+describe("dash-less index lines are parsed, not discarded as prose", () => {
+  // The parser required `— summary`, so "- [Critical rule](rule.md)" fell
+  // through as raw prose: its body was never loaded, its pin was ignored, and
+  // it got no ⟨index-only⟩ marker — while the writer's regexes treated the same
+  // line as an index line. One grammar now covers both.
+  it("parses a link line with no summary as an entry", () => {
+    const parsed = parseIndexContent("- ⛔ [Critical rule](rule.md)\n", tmpDir);
+    expect(parsed.entries).toHaveLength(1);
+    expect(parsed.entries[0].title).toBe("Critical rule");
+    expect(parsed.entries[0].summary).toBe("");
+    expect(parsed.entries[0].pinned).toBe(true); // pin marker honored
+  });
+
+  it("parses an absolute href with no summary", () => {
+    const parsed = parseIndexContent(`- [Abs](${join(tmpDir, "abs.md")})\n`, tmpDir);
+    expect(parsed.entries).toHaveLength(1);
+    expect(parsed.entries[0].filePath).toBe(join(tmpDir, "abs.md"));
+  });
+
+  it("still treats non-link prose as prose", () => {
+    const parsed = parseIndexContent("## Header\n- [A](a.md) trailing text\n", tmpDir);
+    expect(parsed.entries).toHaveLength(0);
+  });
+});
