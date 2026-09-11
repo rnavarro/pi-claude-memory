@@ -283,3 +283,74 @@ describe("recall_memory reports the most informative failure", () => {
       });
   });
 });
+
+describe("remove_memory cleans every index that references the topic", () => {
+  it("strips the other tier's dangling reference even when a tier is named", async () => {
+    // The my-app layout: the PROJECT index links a GLOBAL topic by
+    // absolute href. Naming tier:"global" (which the injected anchor teaches
+    // the model to do for an entry it tagged "[in global tier]") used to make
+    // alsoUnlink empty, because it was derived from the candidate list — and
+    // that list holds exactly one element when a tier is named. The global file
+    // was trashed while the project index kept advertising it.
+    const cwd = join(tmpHome, "work", "myapp");
+    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    const globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(projDir, { recursive: true });
+    mkdirSync(globalDir, { recursive: true });
+
+    const globalTopic = join(globalDir, "shared_rule.md");
+    writeFileSync(globalTopic, "---\ndescription: s\ntype: feedback\n---\nrule\n");
+    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Shared](shared_rule.md) — rule\n");
+    writeFileSync(join(projDir, "MEMORY.md"), `# P\n- [Shared](${globalTopic}) — rule\n`);
+
+    const res = await removeMemoryTool.execute(
+      "t1",
+      { name: "shared_rule", tier: "global" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+
+    expect((res.details as { ok: boolean }).ok).toBe(true);
+    expect(readFileSync(join(globalDir, "MEMORY.md"), "utf8")).not.toContain("shared_rule.md");
+    // The dangling absolute reference is gone too, despite the named tier.
+    expect(readFileSync(join(projDir, "MEMORY.md"), "utf8")).not.toContain(globalTopic);
+  });
+
+  it("does not fall through to the other tier when the first tier refuses", async () => {
+    // A refusal is an ANSWER about the tier that refused, not an invitation to
+    // try the other store. Falling through deleted an entry the caller never
+    // named: with `.trash` present as a plain file in the project tier, the
+    // project removal was refused and the GLOBAL copy was trashed instead,
+    // reported as success.
+    const cwd = join(tmpHome, "work", "proj");
+    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    const globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(projDir, { recursive: true });
+    mkdirSync(globalDir, { recursive: true });
+
+    writeFileSync(join(projDir, "foo.md"), "---\ndescription: p\ntype: project\n---\nP\n");
+    writeFileSync(join(projDir, "MEMORY.md"), "# P\n- [Foo](foo.md) — project\n");
+    writeFileSync(join(projDir, ".trash"), "not a directory\n");
+
+    writeFileSync(join(globalDir, "foo.md"), "---\ndescription: g\ntype: reference\n---\nG\n");
+    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Foo](foo.md) — global\n");
+
+    const res = await removeMemoryTool.execute(
+      "t1",
+      { name: "foo" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    const text = (res.content[0] as { type: string; text: string }).text;
+
+    // The refusal is reported...
+    expect(text).toContain("not a plain directory");
+    // ...and BOTH stores are intact: the project entry survives its own
+    // refused removal, and the global entry was never a candidate for it.
+    expect(existsSync(join(projDir, "foo.md"))).toBe(true);
+    expect(existsSync(join(globalDir, "foo.md"))).toBe(true);
+    expect(readFileSync(join(globalDir, "MEMORY.md"), "utf8")).toContain("(foo.md)");
+  });
+});

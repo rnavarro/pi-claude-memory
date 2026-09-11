@@ -23,7 +23,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
-import { lineTargetsFile } from "./index-parser.js";
+import { lineTargetsAnyIdentity, lineTargetsFile } from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import { INDEX_MAX_BYTES, TOPIC_FILE_MAX_BYTES } from "./types.js";
 
@@ -72,6 +72,11 @@ export interface MemoryOpResult {
   message: string;
   /** Path to the written/moved file, if any. */
   filePath?: string;
+  /** Machine-readable failure class, so a caller can tell "this tier does not
+   * hold the entry" (safe to try the other tier) from "this tier refused" (an
+   * answer about THIS tier, which must not be retried against another store).
+   * Absent on success. */
+  reason?: "not_found" | "refused" | "error";
 }
 
 const TRASH_DIRNAME = ".trash";
@@ -605,7 +610,11 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   const filePath = resolveTopicFile(dir, req.name);
   if (!filePath) {
     debugLog("writer.remove_not_found", { name: req.name, tier: dir.tier, label: dir.label });
-    return { ok: false, message: `Memory not found: ${req.name} in ${dir.label} tier` };
+    return {
+      ok: false,
+      reason: "not_found",
+      message: `Memory not found: ${req.name} in ${dir.label} tier`,
+    };
   }
 
   // Move to .trash/ (never delete — user can recover)
@@ -625,7 +634,11 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     const st = lstatSync(trashDir);
     if (st.isSymbolicLink() || !st.isDirectory()) {
       debugLog("writer.trash_not_directory", { trashDir, tier: dir.tier });
-      return { ok: false, message: `.trash in ${dir.label} tier is not a plain directory` };
+      return {
+        ok: false,
+        reason: "refused",
+        message: `.trash in ${dir.label} tier is not a plain directory`,
+      };
     }
   } catch {
     // Absent — create it below.
@@ -633,10 +646,12 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   }
   const destDir = mkdtempSync(join(trashDir, `${filename}.`));
   const trashPath = join(destDir, filename);
-  // Pin the canonical identity BEFORE the move. Index lines pointing at this
-  // topic — in this store or the other tier — are matched against it, and after
-  // renameSync the leaf is gone so realpath can no longer resolve it.
-  const targetPath = canonicalTopicTarget(filePath);
+  // Pin every spelling of this topic's identity BEFORE the move. Index lines
+  // pointing at it — in this store or the other tier — are matched against this
+  // set: after renameSync the leaf is gone, so a matcher that canonicalizes both
+  // sides can no longer resolve the topic and would miss a cross-tier absolute
+  // href entirely.
+  const identities = topicIdentities(filePath);
   renameSync(filePath, trashPath);
 
   // Remove the link entry from MEMORY.md. Report honestly when no line was
@@ -650,7 +665,7 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   let linkRemoved = false;
   let indexError: string | null = null;
   try {
-    linkRemoved = removeFromIndex(dir, targetPath);
+    linkRemoved = removeFromIndex(dir, identities);
   } catch (err) {
     indexError = String(err);
     debugLog("writer.remove_index_failed", {
@@ -669,14 +684,15 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   // topics. Removing the owning copy alone left that store advertising advice
   // that no longer exists, so the caller (which already resolves both tiers)
   // passes the other store in and the dangling line goes too. Matching uses the
-  // canonical target captured above, so an alias spelling or a symlinked store
-  // root still matches.
+  // identity set captured above (lexical and canonical), so a bare or absolute
+  // href, an alias spelling, and a symlinked store root all still match — while
+  // a same-basename entry OWNED by the other tier correctly does not.
   const crossUnlinked: string[] = [];
   const crossFailed: string[] = [];
   for (const other of req.alsoUnlink ?? []) {
     if (other.indexPath === dir.indexPath || other.dir === dir.dir) continue;
     try {
-      if (removeFromIndex(other, targetPath)) crossUnlinked.push(other.label);
+      if (removeFromIndex(other, identities)) crossUnlinked.push(other.label);
     } catch (err) {
       crossFailed.push(other.label);
       debugLog("writer.remove_cross_unlink_failed", {
@@ -745,33 +761,44 @@ export function canonicalTopicTarget(p: string): string {
   }
 }
 
-/** Remove a link entry from MEMORY.md by resolved target path. Publishes via
+/** Every spelling that identifies a topic file: its lexical path and its
+ * canonical (realpath) path.
+ *
+ * Both are captured BEFORE any move, because after renameSync the leaf is gone
+ * and realpath can no longer resolve it. A matcher that canonicalizes both
+ * sides therefore silently stops recognising the topic, which is how a
+ * cross-tier absolute href survived removal. Recording both spellings keeps
+ * matching working with the leaf missing, and covers an index href written
+ * either through the store's lexical path or through a resolved one. */
+export function topicIdentities(p: string): Set<string> {
+  return new Set<string>([resolve(p), canonicalTopicTarget(p)]);
+}
+
+/** Remove a link entry from MEMORY.md by resolved identity. Publishes via
  * withIndexRetry (atomic writes + lost-update merge retry).
  *
  * Returns whether any line was actually removed. Callers report success to
  * the user, and a removal that silently no-ops leaves an index line pointing
  * at a file already moved to .trash/ — the caller needs to know so it does
  * not claim the link was removed. */
-function removeFromIndex(dir: MemoryDir, targetPath: string): boolean {
+function removeFromIndex(dir: MemoryDir, identities: ReadonlySet<string>): boolean {
   const indexPath = dir.indexPath;
   if (!existsSync(indexPath)) return false;
 
-  // Match by resolved target (see patchIndexAppend). A spelling-based regex
-  // misses an absolute-href line for the same file, so the file was trashed
-  // while its link survived — the tool still reported "removed its MEMORY.md
-  // link". The target is passed in rather than rebuilt from the filename so a
-  // cross-tier line matching the same file (by absolute href, or through a
-  // symlinked store root) is found even after the topic has been moved and
-  // realpath no longer resolves it.
-  const linkRegex = new RegExp(
-    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(basename(targetPath))}\\)(?:\\s*[—-]\\s*.+)?$`,
-  );
+  // Match by RESOLVED IDENTITY, never by the literal `(basename)` spelling.
+  //
+  // The basename fast path this used to carry is sound only for the topic's OWN
+  // store (same dir + same basename ⇒ same file). This function is also called
+  // against the OTHER tier's index, where a bare `(notes.md)` href links that
+  // tier's own file — so the shortcut stripped a live, unrelated entry's line
+  // and reported it as a cross-tier cleanup. Both stores really do hold a
+  // `user_location.md` on this machine, each linked by a bare basename in its
+  // own index. Resolving the href is the only rule that is both
+  // spelling-independent and tier-correct.
   let removed = false;
   withIndexRetry(indexPath, (content) => {
     const lines = content.split("\n");
-    const filtered = lines.filter(
-      (l) => !(linkRegex.test(l) || lineTargetsFile(l, dir.dir, targetPath)),
-    );
+    const filtered = lines.filter((l) => !lineTargetsAnyIdentity(l, dir.dir, identities));
     if (filtered.length === lines.length) return null; // nothing to remove
     removed = true;
     return filtered.join("\n");
