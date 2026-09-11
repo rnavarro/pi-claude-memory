@@ -235,7 +235,20 @@ function findProjectCandidates(cwdBasename: string): string[] {
   const encodedBasename = `-${cwdBasename}`;
   const candidates: { dir: string; mtime: number }[] = [];
 
-  for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
+  // A filesystem failure here must never break the turn. This runs inside
+  // before_agent_start (resolveMemoryDirs is called from computeInjection), so
+  // an unguarded readdirSync throw would abort turn start — the same hazard
+  // reconcileIndex guards against in index-parser.ts. The existsSync check above
+  // does not cover it: it reports existence, not readability, and EACCES, EIO,
+  // and ENOTDIR all come out of the readdir itself.
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(projectsDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     // Match by suffix: encoded dir ends with -<basename>
     if (entry.name.endsWith(encodedBasename)) {
