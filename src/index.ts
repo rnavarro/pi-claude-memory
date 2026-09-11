@@ -279,7 +279,12 @@ async function handleSessionShutdown(
           // review that errored and is done. A hung review is still running
           // — abort it below; either way do not start a second writer on
           // top of it.
-          inflightSettled = !(err instanceof Error && err.message.includes("timed out"));
+          //
+          // Matched on the sentinel CLASS, not the message: a provider or
+          // network error whose text happens to contain "timed out" would
+          // otherwise be misread as "still running", causing us to abort and
+          // skip the final review for a review that had already settled.
+          inflightSettled = !(err instanceof AutoLearnAwaitTimeout);
         }
         if (!inflightSettled) {
           // On timeout the in-flight review is STILL RUNNING (periodic and
@@ -734,11 +739,23 @@ export function composeShutdownChunk(
  * rejects with a timeout Error after ms. Used so an in-flight review cannot
  * block shutdown indefinitely. The timer is unref'd so it never keeps the
  * process alive on its own. */
+/** Thrown by raceTimeout when the awaited promise did not settle in time.
+ *
+ * A dedicated class rather than message matching: callers must be able to
+ * tell "our deadline fired" from "the awaited work rejected", and an
+ * arbitrary rejection may well mention timing out in its own text. */
+export class AutoLearnAwaitTimeout extends Error {
+  constructor() {
+    super("auto-learn in-flight await timed out");
+    this.name = "AutoLearnAwaitTimeout";
+  }
+}
+
 function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     p,
     new Promise<T>((_, reject) => {
-      const t = setTimeout(() => reject(new Error("auto-learn in-flight await timed out")), ms);
+      const t = setTimeout(() => reject(new AutoLearnAwaitTimeout()), ms);
       t.unref?.();
     }),
   ]);

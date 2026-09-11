@@ -394,3 +394,40 @@ describe("routing anchor tells the truth about the reviewer", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("pinned entry demotion is never silent", () => {
+  const mkdir2 = (root: string, tier: "project" | "global"): MemoryDirType => ({
+    tier,
+    dir: root,
+    indexPath: join(root, "MEMORY.md"),
+    label: tier,
+  });
+
+  it("warns when a pinned entry exceeds the remaining budget", () => {
+    const root = mkdtempSync(join(tmpdir(), "pcm-pin-"));
+    const body = "p".repeat(40000); // far beyond a tiny cap
+    writeFileSync(
+      join(root, "big-pinned.md"),
+      `---\ndescription: d\ntype: project\n---\n${body}\n`,
+    );
+    writeFileSync(join(root, "MEMORY.md"), "# M\n- ⛔ [Big pinned](big-pinned.md) — d\n");
+    const dir = mkdir2(root, "project");
+    // Tiny cap so the pinned body cannot fit.
+    const { warnings } = buildMemoryInjection(dir, null, 50);
+    expect(warnings.some((w) => w.includes("pinned entry") && w.includes("index-only"))).toBe(true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("does not warn for a pinned entry that fits", () => {
+    const root = mkdtempSync(join(tmpdir(), "pcm-pin-ok-"));
+    writeFileSync(
+      join(root, "small-pinned.md"),
+      "---\ndescription: d\ntype: project\n---\nsmall\n",
+    );
+    writeFileSync(join(root, "MEMORY.md"), "# M\n- ⛔ [Small pinned](small-pinned.md) — d\n");
+    const dir = mkdir2(root, "project");
+    const { warnings } = buildMemoryInjection(dir, null, 20000);
+    expect(warnings.some((w) => w.includes("pinned entry"))).toBe(false);
+    rmSync(root, { recursive: true, force: true });
+  });
+});

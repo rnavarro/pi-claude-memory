@@ -107,7 +107,7 @@ export function buildMemoryInjection(
 
   // Shared mutable budget across both tiers. Project tier goes first so it
   // wins when competing for the same budget.
-  const budget = { remaining: tokenCap };
+  const budget = { remaining: tokenCap, total: tokenCap };
   let hasAnyEntries = false;
 
   if (project) {
@@ -153,7 +153,7 @@ export function buildMemoryInjection(
 function buildTierInjection(
   dir: MemoryDir,
   label: string,
-  budget: { remaining: number },
+  budget: { remaining: number; total: number },
   warnings: string[],
   otherTierDir?: string | null,
 ): InjectionBlock {
@@ -199,7 +199,7 @@ function buildTierInjection(
     text: fullTextSection,
     loadedPaths,
     tokens,
-  } = buildFullTextSection(files, parsed.entries, budget);
+  } = buildFullTextSection(files, parsed.entries, budget, warnings);
 
   // Build the index section (always injected — it's cheap and information-dense)
   // Mark entries whose bodies are NOT loaded with ⟨index-only⟩ so the model
@@ -371,7 +371,8 @@ function renderIndexSection(
 function buildFullTextSection(
   files: Map<string, MemoryFile>,
   entries: IndexEntry[],
-  budget: { remaining: number },
+  budget: { remaining: number; total: number },
+  warnings: string[],
 ): { text: string; loadedPaths: Set<string>; filesLoaded: number; tokens: number } {
   // Build a priority-ordered list of candidate files
   const candidates = prioritizeFiles(files, entries);
@@ -394,6 +395,17 @@ function buildFullTextSection(
 
     const bodyTokens = estimateTokens(file.frontmatter.body);
     if (bodyTokens > budget.remaining) {
+      // A pinned entry is documented as "always injected in full regardless
+      // of size", but the shared budget still bounds it: a single pinned body
+      // larger than the cap, or several pinned bodies exhausting it, gets
+      // demoted to ⟨index-only⟩. That is the right outcome (overdrawing the
+      // budget would blow the context window), but it must not be silent —
+      // the user needs to know a pinned entry is not arriving in full.
+      if (effectivePinned) {
+        warnings.push(
+          `pinned entry ${file.filename} is index-only this turn: ${bodyTokens} tokens exceeds the ${budget.remaining} remaining of the ${budget.total}-token budget`,
+        );
+      }
       continue; // would exceed shared budget
     }
 
