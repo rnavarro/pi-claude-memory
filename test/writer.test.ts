@@ -1569,3 +1569,56 @@ describe("an ambiguous name is recorded, not reported as absent", () => {
     expect(logged).toContain("Foo Bar.md");
   });
 });
+
+describe("cross-tier unlink matches the topic, not a same-named file", () => {
+  it("leaves the other tier's own entry alone when both stores share a basename", () => {
+    // The real layout on this machine: ~/.claude/memory/user_location.md and
+    // the other-project project store both hold user_location.md, each
+    // linked by a bare basename in its OWN index. A cross-tier match built from
+    // the target's basename therefore hit the other tier's own file, stripped a
+    // live unrelated entry's line, and reported it as a cross-tier cleanup.
+    const proj = join(tmpDir, "proj");
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "user_location.md"), "---\ndescription: p\ntype: reference\n---\nP\n");
+    writeFileSync(
+      join(proj, "MEMORY.md"),
+      "# P\n- [User location](user_location.md) — project copy\n",
+    );
+
+    const glob = join(tmpDir, "glob");
+    mkdirSync(glob, { recursive: true });
+    writeFileSync(join(glob, "user_location.md"), "---\ndescription: g\ntype: reference\n---\nG\n");
+    writeFileSync(
+      join(glob, "MEMORY.md"),
+      "# G\n- [User location](user_location.md) — global copy\n",
+    );
+
+    const projDir = {
+      tier: "project" as const,
+      dir: proj,
+      indexPath: join(proj, "MEMORY.md"),
+      label: "proj",
+    };
+    const globDir = {
+      tier: "global" as const,
+      dir: glob,
+      indexPath: join(glob, "MEMORY.md"),
+      label: "global",
+    };
+
+    const res = removeMemory(projDir, {
+      name: "user_location",
+      tier: "project",
+      alsoUnlink: [globDir],
+    });
+
+    expect(res.ok).toBe(true);
+    // The project entry's own link goes...
+    expect(readFileSync(join(proj, "MEMORY.md"), "utf8")).not.toContain("user_location.md");
+    // ...and the global entry is untouched, file and line alike. The global
+    // line was never a reference to the project topic; it names global's own
+    // file, which is still on disk and still indexed.
+    expect(existsSync(join(glob, "user_location.md"))).toBe(true);
+    expect(readFileSync(join(glob, "MEMORY.md"), "utf8")).toContain("(user_location.md)");
+  });
+});

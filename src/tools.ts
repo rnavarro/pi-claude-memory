@@ -279,6 +279,20 @@ const removeTool = defineTool({
       if (d && !candidates.some((c) => c.dir === d.dir)) candidates.push(d);
     }
 
+    // Indexes that may hold a reference to the removed topic, INDEPENDENT of
+    // `explicitTier`. Naming a tier constrains which store the entry is removed
+    // FROM; it must not constrain which indexes get their dangling reference
+    // cleaned. Deriving this from `candidates` made it empty on the explicit
+    // path, so `remove_memory({name, tier: "global"})` trashed the global topic
+    // and left the project index advertising it — the exact dangling link this
+    // argument exists to prevent, on the invocation the injected anchor teaches
+    // the model to use when it tags an entry "[in global tier]".
+    const allDirs: MemoryDir[] = [];
+    for (const t of ["project", "global"] as const) {
+      const d = pickTier(resolved, t);
+      if (d && !allDirs.some((c) => c.dir === d.dir)) allDirs.push(d);
+    }
+
     if (candidates.length === 0) {
       return {
         content: [{ type: "text", text: `No ${tier} memory directory available.` }],
@@ -287,23 +301,41 @@ const removeTool = defineTool({
     }
 
     // Try each candidate until one actually holds the entry. A "not found" in
-    // the first tier is not an answer while another tier is untried; any other
-    // failure is reported as-is.
+    // the first tier is not an answer while another tier is untried. Any OTHER
+    // failure IS an answer about that tier, so it is reported instead of being
+    // retried against a store the caller did not name.
     let result: MemoryOpResult | null = null;
     let dir: MemoryDir = candidates[0];
     let firstMiss: string | null = null;
+    const isNotFound = (m: string) => /not found/i.test(m);
     try {
       for (const candidate of candidates) {
         const attempt = removeMemory(candidate, {
           name: params.name,
           tier: candidate.tier,
-          // Both stores are resolved here, so the other one's index can have
-          // its dangling cross-tier link stripped in the same operation.
-          alsoUnlink: candidates.filter((c) => c !== candidate),
+          // Every resolved store, so the other one's dangling cross-tier
+          // reference is stripped in the same operation.
+          alsoUnlink: allDirs.filter((c) => c.dir !== candidate.dir),
         });
         if (!attempt.ok) {
-          firstMiss ??= attempt.message;
-          continue;
+          if (attempt.reason === "not_found") {
+            // Keep the most specific absence, mirroring recall_memory: the first
+            // tier answering "not found" must not mask a second tier's "too
+            // large to read", which tells the caller the memory does exist.
+            if (firstMiss === null || (isNotFound(firstMiss) && !isNotFound(attempt.message))) {
+              firstMiss = attempt.message;
+            }
+            continue;
+          }
+          // A refusal — a safety check declining, or an I/O failure — is an
+          // ANSWER about this tier, not an invitation to try the other store.
+          // Falling through here trashed an entry the caller never named: with
+          // `.trash` in the project tier present as a plain file, remove_memory
+          // refused the project removal and then deleted the GLOBAL copy while
+          // reporting success.
+          result = attempt;
+          dir = candidate;
+          break;
         }
         result = attempt;
         dir = candidate;

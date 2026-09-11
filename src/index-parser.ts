@@ -71,6 +71,38 @@ export function lineTargetsFile(line: string, baseDir: string, targetPath: strin
   return sameTarget(resolveHref(parsed.href, baseDir), targetPath);
 }
 
+/** True when the index line's href resolves to ANY path in `identities`.
+ *
+ * Unlike `lineTargetsFile` this carries no basename fast path, because the
+ * caller may be an index belonging to a DIFFERENT store than the topic. A line
+ * whose href is literally `(notes.md)` in another tier's index links that
+ * tier's OWN `notes.md`, not the topic being removed. The real corpus holds
+ * `user_location.md` in both the global store and the other-project project
+ * store, each linked by a bare basename in its own index, so a basename-based
+ * cross-tier match stripped a live, unrelated entry's line and reported it as a
+ * cleanup. Resolving the href is the only rule that is both
+ * spelling-independent and tier-correct.
+ *
+ * `identities` holds every spelling the topic is known by (its lexical path and
+ * its canonical path, both captured BEFORE the move). Resolving the HREF stays
+ * lexical, so this keeps matching after the leaf is gone and realpath can no
+ * longer resolve it. */
+export function lineTargetsAnyIdentity(
+  line: string,
+  baseDir: string,
+  identities: ReadonlySet<string>,
+): boolean {
+  const parsed = parseLinkLine(line);
+  if (!parsed) return false;
+  const lexical = isAbsolute(parsed.href) ? resolve(parsed.href) : resolve(baseDir, parsed.href);
+  if (identities.has(lexical)) return true;
+  try {
+    return identities.has(realpathSync(lexical));
+  } catch {
+    return false;
+  }
+}
+
 /** Parse a MEMORY.md file from disk.
  *
  * The index is the one path that is NOT covered by the topic-file guards in
