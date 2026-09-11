@@ -5,9 +5,10 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildExistingIndexSummary, parseCandidates } from "../src/auto-learn.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
+import type { ResolveResult } from "../src/types.js";
 
 let tmpDir: string;
 let origHome: string | undefined;
@@ -20,7 +21,13 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
-  if (origHome !== undefined) process.env.HOME = origHome;
+  // Restore HOME exactly: when it was unset originally, it must end unset,
+  // not silently re-pointed at the wiped temp dir.
+  if (origHome === undefined) {
+    delete process.env.HOME;
+  } else {
+    process.env.HOME = origHome;
+  }
 });
 
 describe("buildExistingIndexSummary", () => {
@@ -42,7 +49,7 @@ describe("buildExistingIndexSummary", () => {
     writeFileSync(join(projectDir, "project_entry.md"), "# Project");
     writeFileSync(join(projectDir, "MEMORY.md"), "# Project Memory\n");
 
-    const resolved = {
+    const resolved: ResolveResult = {
       global: {
         tier: "global",
         dir: claudeDir,
@@ -70,7 +77,7 @@ describe("buildExistingIndexSummary", () => {
 
     mkdirSync(claudeDir, { recursive: true });
 
-    const resolved = {
+    const resolved: ResolveResult = {
       global: {
         tier: "global",
         dir: claudeDir,
@@ -95,7 +102,7 @@ describe("buildExistingIndexSummary", () => {
       "# Global Memory Index\n\n- [Prefer jq](prefer-jq.md) — Use jq for JSON processing\n",
     );
 
-    const resolved = {
+    const resolved: ResolveResult = {
       global: {
         tier: "global",
         dir: claudeDir,
@@ -290,5 +297,36 @@ describe("createProjectMemoryDir", () => {
     // uses createProjectMemoryDir directly, not the resolver.
     resolved = resolveMemoryDirs(cwd);
     expect(resolved.project).toBeNull(); // no MEMORY.md yet
+  });
+});
+
+describe("createProjectMemoryDir split-brain warning", () => {
+  it("warns loudly (and still creates) when a basename-matched store already exists", () => {
+    // An existing store for a *different* cwd sharing the basename "app":
+    // the exact store for cwdB does not exist, but a basename glob would
+    // match the customer-a store. Mutations resolve exact-only, so creating
+    // here shadows those memories — the operator must see that.
+    const otherEncoded = `-${encodePath(join(tmpDir, "work", "customer-a", "app")).slice(1)}`;
+    const projectsRoot = join(tmpDir, ".claude", "projects");
+    mkdirSync(join(projectsRoot, otherEncoded), { recursive: true });
+    writeFileSync(join(projectsRoot, otherEncoded, "MEMORY.md"), "# Customer A\n- [x](x.md) — x\n");
+
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cwdB = join(tmpDir, "work", "customer-b", "app");
+      const created = createProjectMemoryDir(cwdB);
+      if (!created) throw new Error("expected createProjectMemoryDir to return a dir");
+      // Warning fired: names the shadowed store and the adopt-by-rename hint
+      const errCalls = vi.mocked(console.error).mock.calls.map((c) => String(c[0]));
+      expect(
+        errCalls.some((m) => m.includes("NEW project store") && m.includes(otherEncoded)),
+      ).toBe(true);
+      expect(errCalls.some((m) => m.includes("shadow"))).toBe(true);
+      // The new exact store dir was created anyway (writes must succeed;
+      // MEMORY.md itself appears on first write).
+      expect(existsSync(created.dir)).toBe(true);
+    } finally {
+      vi.mocked(console.error).mockRestore();
+    }
   });
 });

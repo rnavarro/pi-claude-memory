@@ -121,6 +121,26 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   const projectDir = `${claudeProjectsDir()}/${encoded}`;
   const memorySubdir = `${projectDir}/memory`;
 
+  // Split-brain warning: if a basename-matched store already exists (rename
+  // split-brain), the fresh exact dir we create will shadow it — resolution
+  // prefers the exact dir from now on, making prior memories invisible to
+  // reads. Mutations resolve exact-only (they must never land in another
+  // project's store), so this write cannot adopt the existing store; say so
+  // loudly instead of silently orphaning it.
+  const siblings = findProjectCandidates(absCwd.split(sep).pop() ?? absCwd);
+  if (siblings.length > 0) {
+    console.error(
+      `[pi-claude-memory] creating a NEW project store for ${absCwd} while ${siblings.length} ` +
+        `basename-matched store(s) already exist (${siblings.join(", ")}). Those memories will be ` +
+        `shadowed by the new store — rename an existing dir to ${encoded} to adopt them.`,
+    );
+    debugLog("resolver.split_brain_shadows_existing_store", {
+      cwd: absCwd,
+      encoded,
+      siblings,
+    });
+  }
+
   try {
     mkdirSync(memorySubdir, { recursive: true });
     debugLog("resolver.create_project_dir", { cwd: absCwd, encoded, memorySubdir });

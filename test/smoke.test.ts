@@ -33,13 +33,13 @@ describe.skipIf(!REAL_CORPUS)("resolver", () => {
     expect(result.project).not.toBeNull();
     expect(result.project?.tier).toBe("project");
     expect(result.project?.dir).toContain("my-app");
-    expect(existsSync(result.project?.indexPath)).toBe(true);
+    expect(result.project && existsSync(result.project.indexPath)).toBe(true);
   });
 
   it("resolves other-project (root-level MEMORY.md anomaly)", () => {
     const result = resolveMemoryDirs(OTHER_CWD);
     expect(result.project).not.toBeNull();
-    expect(existsSync(result.project?.indexPath)).toBe(true);
+    expect(result.project && existsSync(result.project.indexPath)).toBe(true);
   });
 
   it("resolves global memory", () => {

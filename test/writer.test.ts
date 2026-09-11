@@ -1,7 +1,15 @@
 // Tests for memory-writer: write, remove, read, wikilink resolution.
 // Uses a temp dir to avoid touching the real Claude Code memory store.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -487,5 +495,76 @@ describe("end-to-end: write then read then parse index", () => {
     expect(parsed.entries).toHaveLength(2);
     const betaEntry = parsed.entries.find((e) => e.href === "beta.md");
     expect(betaEntry?.pinned).toBe(true);
+  });
+});
+
+describe("mutation guards", () => {
+  it("writeMemory rejects the reserved slug 'memory'", () => {
+    const result = writeMemory(dir, {
+      name: "memory",
+      description: "trying to shadow the index",
+      type: "reference",
+      body: "nope",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("Reserved memory name");
+    // Nothing was written at all
+    expect(existsSync(join(dir.dir, "memory.md"))).toBe(false);
+    // Case variant is also rejected via the case-insensitive slug check
+    const upper = writeMemory(dir, {
+      name: "Memory",
+      description: "case variant",
+      type: "reference",
+      body: "nope",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+    });
+    expect(upper.ok).toBe(false);
+  });
+
+  it("read/remove refuse nested-path names even when lexically inside the dir", () => {
+    writeFileSync(join(dir.dir, "outer.md"), "---\ndescription: d\ntype: reference\n---\nbody\n");
+    mkdirSync(join(dir.dir, "sub"), { recursive: true });
+    writeFileSync(
+      join(dir.dir, "sub", "nested.md"),
+      "---\ndescription: d\ntype: reference\n---\nbody\n",
+    );
+
+    const removed = removeMemory(dir, { name: "sub/nested.md", tier: "project" });
+    expect(removed.ok).toBe(false);
+    expect(existsSync(join(dir.dir, "sub", "nested.md"))).toBe(true);
+
+    // A nested binary lookalike ("..") is neutralized by slugify but must
+    // never resolve via the raw fallback either.
+    const traversal = removeMemory(dir, { name: "../outer.md", tier: "project" });
+    expect(traversal.ok).toBe(false);
+    expect(existsSync(join(dir.dir, "outer.md"))).toBe(true);
+  });
+
+  it("read/remove refuse a symlinked topic pointing outside the store", () => {
+    // Target OUTSIDE the memory dir
+    const outsideDir = mkdtempSync(join(tmpdir(), "pcm-outside-"));
+    const outside = join(outsideDir, "victim.md");
+    writeFileSync(outside, "---\ndescription: outside\ntype: reference\n---\nsecret\n");
+
+    // Symlink placed INSIDE the store pointing at it
+    const linkPath = join(dir.dir, "innocent.md");
+    symlinkSync(outside, linkPath);
+
+    const read = readMemory(dir, "innocent.md");
+    expect(read.ok).toBe(false);
+    if (!read.ok) expect(read.message).toContain("not found");
+
+    const removed = removeMemory(dir, { name: "innocent.md", tier: "project" });
+    expect(removed.ok).toBe(false);
+    // The outside victim was not touched, and the link still exists
+    expect(existsSync(outside)).toBe(true);
+    expect(existsSync(linkPath)).toBe(true);
+
+    rmSync(outsideDir, { recursive: true, force: true });
   });
 });

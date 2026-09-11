@@ -5,7 +5,7 @@
 // All writes are add-only for v1: existing frontmatter is preserved, MEMORY.md
 // link entries are appended (never rewritten) so hand-authored sections survive.
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
@@ -68,12 +68,26 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   const rawCandidate = name.endsWith(".md") ? name : `${name}.md`;
   const base = resolve(dir.dir);
   for (const c of [`${slug}.md`, rawCandidate]) {
+    // Direct children only: a separator-bearing candidate is a nested path —
+    // lexically contained here, but this store never writes nested topics,
+    // and restricting it flattens a whole class of containment tricks.
+    if (c.includes("/") || c.includes("\\") || c.includes("..")) continue;
     const p = resolve(dir.dir, c);
-    // Containment: must be within the base dir (reject traversal/escape).
+    // Containment: must be within the base dir (defense in depth on top of
+    // the direct-children rule).
     if (p !== base && !p.startsWith(`${base}${sep}`)) continue;
     // Reserved: never touch the index file.
     if (basename(p).toLowerCase() === "memory.md") continue;
-    if (existsSync(p)) return p;
+    let st: import("node:fs").Stats;
+    try {
+      st = lstatSync(p);
+    } catch {
+      continue;
+    }
+    // Only plain regular files: a symlinked "topic" could point outside the
+    // store (read would leak, removal semantics get murky).
+    if (st.isSymbolicLink() || !st.isFile()) continue;
+    return p;
   }
   return null;
 }
@@ -195,11 +209,22 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   if (!slug) {
     return { ok: false, message: `Invalid memory name: ${req.name}` };
   }
+  // Reserved-name guard (write side): the read/remove path reserves
+  // memory.md for the index, so writing a topic with that slug would create
+  // an orphan no tool can ever recall or remove — and on case-insensitive
+  // filesystems it could shadow MEMORY.md itself.
+  if (/^memory$/i.test(slug)) {
+    return {
+      ok: false,
+      message: `Reserved memory name: ${req.name} — the slug "memory" collides with the reserved index filename`,
+    };
+  }
   const filename = `${slug}.md`;
   const filePath = join(dir.dir, filename);
 
+  const wasExisting = existsSync(filePath);
   // Collision guard: if the file exists and caller didn't allow overwrite, skip.
-  if (existsSync(filePath) && !req.allowOverwrite) {
+  if (wasExisting && !req.allowOverwrite) {
     debugLog("writer.write_skip_collision", { slug, filename, tier: dir.tier, label: dir.label });
     return {
       ok: false,
@@ -256,7 +281,10 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
     tier: dir.tier,
     label: dir.label,
     pinned: req.pinned,
-    overwrote: preservedMetadata && Object.keys(preservedMetadata).length > 0,
+    // Overwrite defined by the write itself (target existed + allowOverwrite),
+    // not by whether metadata survived — a frontmatter-less Gen 3 target
+    // overwrites with nothing to preserve.
+    overwrote: wasExisting && req.allowOverwrite,
     filePath,
   });
 

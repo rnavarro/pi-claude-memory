@@ -239,22 +239,34 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       // the absence in the next cycle's index.
       continue;
     }
-    // Stale-overwrite guard: if this candidate supersedes an existing entry,
-    // skip when the target file changed during the LLM call. A user/Claude
-    // edit in that window must not be silently clobbered.
+    // Stale-overwrite guard: an overwrite candidate is only safe when the
+    // target file existed at snapshot time and is unchanged since. Anything
+    // else (created mid-review, edited mid-review, deleted mid-review) is a
+    // concurrent mutation the stale review must not clobber or resurrect.
+    // The snapshot is keyed by `${tier}:${slug}` so a same-slug entry in the
+    // other tier can never stand in for this target's mtime.
     if (c.overwrite === true) {
       const slug = slugify(c.name);
-      const snapMtime = mtimes.get(slug);
-      if (snapMtime !== undefined) {
-        try {
-          const curMtime = statSync(join(dir.dir, `${slug}.md`)).mtimeMs;
-          if (curMtime !== snapMtime) {
-            debugLog("auto_learn.skip_stale_overwrite", { slug, snapMtime, curMtime });
-            continue;
-          }
-        } catch {
-          // file vanished during the call — let writeMemory handle normally
+      const snapKey = `${dir.tier}:${slug}`;
+      const snapMtime = mtimes.get(snapKey);
+      if (snapMtime === undefined) {
+        // Not present when the review started: created mid-review (or the
+        // model guessed a slug that only materialized meanwhile). Never
+        // overwrite what we did not see.
+        debugLog("auto_learn.skip_unsnapshotted_overwrite", { slug, tier: dir.tier });
+        continue;
+      }
+      try {
+        const curMtime = statSync(join(dir.dir, `${slug}.md`)).mtimeMs;
+        if (curMtime !== snapMtime) {
+          debugLog("auto_learn.skip_stale_overwrite", { slug, snapMtime, curMtime });
+          continue;
         }
+      } catch {
+        // Vanished during the call — a user/Claude deliberate deletion.
+        // Writing would resurrect it.
+        debugLog("auto_learn.skip_deleted_overwrite", { slug, tier: dir.tier });
+        continue;
       }
     }
     const result = writeMemory(dir, {
@@ -332,9 +344,12 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
   );
 }
 
-/** Snapshot mtimes of existing topic files, keyed by filename stem (slug),
- * so overwrite candidates can be skipped if the target changed during the
- * LLM call. Captured BEFORE the call; compared AFTER. */
+/** Snapshot mtimes of existing topic files, keyed by `${tier}:${slug}`, so
+ * overwrite candidates can be skipped if the target changed during the LLM
+ * call. Captured BEFORE the call; compared AFTER. Tier-keyed because a
+ * same-slug file in the other tier must not stand in for the target's
+ * mtime (project iterated after global would otherwise overwrite the
+ * global key and phantom-mismatch every global overwrite). */
 function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
   const map = new Map<string, number>();
   for (const dir of dirs) {
@@ -348,7 +363,10 @@ function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".md") || entry.name === "MEMORY.md") continue;
       try {
-        map.set(entry.name.replace(/\.md$/, ""), statSync(join(dir.dir, entry.name)).mtimeMs);
+        map.set(
+          `${dir.tier}:${entry.name.replace(/\.md$/, "")}`,
+          statSync(join(dir.dir, entry.name)).mtimeMs,
+        );
       } catch {
         // skip unreadable
       }
