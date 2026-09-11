@@ -6,7 +6,7 @@
 // 3. Greedily inject full file bodies up to a token cap (default 5000)
 // 4. Priority: pinned entries → feedback/user type → most recently modified
 // 5. Large files get index-only with ⟨index-only⟩ marker (model can fetch via recall_memory)
-// 6. Global tier injected first, then project tier
+// 6. Project tier injected first so it wins the shared budget (see buildMemoryInjection)
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";

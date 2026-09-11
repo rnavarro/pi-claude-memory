@@ -502,7 +502,28 @@ export function atomicWriteFileNoClobber(filePath: string, content: string): boo
     linkSync(tmpPath, filePath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "EEXIST") return false;
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EEXIST") return false;
+    // Hardlinks are unavailable on exFAT/FAT, many FUSE mounts, and some
+    // network shares. Fall back to O_CREAT|O_EXCL ("wx") — also an atomic
+    // no-clobber create, no hardlink support needed. wx EEXIST means the
+    // target came into existence concurrently: same no-clobber contract.
+    if (
+      code === "EPERM" ||
+      code === "ENOSYS" ||
+      code === "ENOTSUP" ||
+      code === "EOPNOTSUPP" ||
+      code === "EMLINK" ||
+      code === "EXDEV"
+    ) {
+      try {
+        writeFileSync(filePath, content, { flag: "wx" });
+        return true;
+      } catch (fallbackErr) {
+        if ((fallbackErr as NodeJS.ErrnoException)?.code === "EEXIST") return false;
+        throw fallbackErr;
+      }
+    }
     throw err;
   } finally {
     try {

@@ -158,6 +158,28 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   }
 }
 
+/** Create the global memory dir on first global write (fresh installations
+ * have no ~/.claude/memory). Reads stay side-effect-free — this is called
+ * only from write paths when the global tier is null. */
+export function createGlobalMemoryDir(): MemoryDir | null {
+  const globalDir = claudeGlobalDir();
+  try {
+    mkdirSync(globalDir, { recursive: true });
+    debugLog("resolver.create_global_dir", { globalDir });
+    return {
+      tier: "global",
+      dir: globalDir,
+      indexPath: `${globalDir}/MEMORY.md`,
+      label: "global",
+    };
+  } catch (err) {
+    const errorMsg = String(err);
+    debugLog("resolver.create_global_dir_error", { globalDir, error: errorMsg });
+    console.error(`[pi-claude-memory] failed to create global memory dir: ${errorMsg}`);
+    return null;
+  }
+}
+
 /** Check both memory layouts for a project directory. */
 function resolveProjectMemory(
   projectDir: string,
