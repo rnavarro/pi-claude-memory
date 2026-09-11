@@ -139,13 +139,18 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   const slug = slugify(name);
   const rawCandidate = name.endsWith(".md") ? name : `${name}.md`;
   const base = resolve(dir.dir);
-  // Explicit filename first: when the caller names "alpha.md" and BOTH
-  // alpha.md and alpha.md.md exist (slug "alpha.md" + .md append), the
-  // caller meant alpha.md. The slug candidate stays as a fallback for
-  // hand-authored titles ("Alpha Beta" → alpha-beta.md).
-  for (const c of name.endsWith(".md")
-    ? [rawCandidate, `${slug}.md`]
-    : [`${slug}.md`, rawCandidate]) {
+  // Candidate order: the EXACT name the caller gave, then the slug.
+  //
+  // A bare name is tried as a filename first. `Foo Bar.md` and `foo-bar.md` can
+  // both exist — different topics whose stems differ only by what slugify folds
+  // — and slug-first made `readMemory(dir, "Foo Bar")` read `foo-bar.md`, so an
+  // exact, on-disk name resolved to a DIFFERENT topic and an overwrite or a
+  // removal landed on the wrong file. The reviewer advertises raw stems, so an
+  // exact stem must beat a normalization of it; the slug stays as the fallback
+  // for a hand-authored title ("Alpha Beta" → alpha-beta.md). For a name that
+  // already ends in `.md` this is unchanged: the raw candidate is the name and
+  // the slug candidate is the `.md.md` shape.
+  for (const c of [rawCandidate, `${slug}.md`]) {
     const p = containedChild(base, c);
     if (p) return p;
   }
