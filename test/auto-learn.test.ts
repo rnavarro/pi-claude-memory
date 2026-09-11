@@ -568,3 +568,24 @@ describe("snapshotMtimes alias keys never shadow a real stem", () => {
     expect(map.has("project:MEMORY")).toBe(false); // never the index itself
   });
 });
+
+describe("resolution survives an unreadable projects directory", () => {
+  it("does not abort the turn when the projects dir cannot be listed", () => {
+    // findProjectCandidates runs inside before_agent_start (resolveMemoryDirs is
+    // reached from computeInjection), so an unguarded readdirSync throw aborts
+    // turn start — the same hazard reconcileIndex guards against in
+    // index-parser.ts. existsSync only reports existence, not readability:
+    // EACCES, EIO, and ENOTDIR all come out of the readdir itself. A FILE where
+    // the projects directory belongs is the portable way to force ENOTDIR.
+    const cwd = join(tmpDir, "work", "proj");
+    const claude = join(tmpDir, ".claude");
+    mkdirSync(claude, { recursive: true });
+    writeFileSync(join(claude, "projects"), "not a directory\n");
+
+    let resolved: ResolveResult | undefined;
+    expect(() => {
+      resolved = resolveMemoryDirs(cwd);
+    }).not.toThrow();
+    expect(resolved?.project).toBeNull();
+  });
+});
