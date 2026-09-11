@@ -855,12 +855,38 @@ export function readMemory(
  * rename is atomic on POSIX when source and destination are on the same
  * filesystem (same directory). This prevents a concurrent reader (Claude
  * Code) from observing a truncated file. */
+/** Create an exclusively-owned temp file beside `filePath`, returning its path.
+ *
+ * The temp name is predictable (PID + timestamp), so a preexisting SYMLINK at
+ * that pathname used to be followed by `writeFileSync(tmpPath, ...)`, truncating
+ * whatever it pointed at — and the subsequent rename then published the symlink
+ * itself as the topic. A write could therefore modify a file outside the store,
+ * report success, and leave an entry that recall and containment both reject.
+ *
+ * `flag: "wx"` (O_CREAT|O_EXCL) refuses to open an existing path at all, so we
+ * only ever write a file this call created. A collision picks a fresh name, and
+ * the attempt counter keeps the name unique without depending on the clock.
+ *
+ * Internal — exported for tests. */
+export function createTempFile(dir: string, filePath: string, content: string): string {
+  const base = basename(filePath);
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const tmpPath = join(dir, `.${base}.${process.pid}.${Date.now()}.${attempt}.tmp`);
+    try {
+      writeFileSync(tmpPath, content, { encoding: "utf8", flag: "wx" });
+      return tmpPath;
+    } catch (err) {
+      // Name already taken (possibly by a planted symlink). Try another.
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    }
+  }
+  throw new Error(`could not create a unique temp file for ${filePath}`);
+}
+
 /** Write via temp file + rename. Internal — exported for tests. */
 export function atomicWriteFile(filePath: string, content: string): void {
   const dir = dirname(filePath);
-  const tmpName = `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`;
-  const tmpPath = join(dir, tmpName);
-  writeFileSync(tmpPath, content, "utf8");
+  const tmpPath = createTempFile(dir, filePath, content);
   try {
     renameSync(tmpPath, filePath);
   } catch (err) {
@@ -885,9 +911,7 @@ export function atomicWriteFile(filePath: string, content: string): void {
  * into existence concurrently. Internal — exported for tests. */
 export function atomicWriteFileNoClobber(filePath: string, content: string): boolean {
   const dir = dirname(filePath);
-  const tmpName = `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`;
-  const tmpPath = join(dir, tmpName);
-  writeFileSync(tmpPath, content, "utf8");
+  const tmpPath = createTempFile(dir, filePath, content);
   try {
     linkSync(tmpPath, filePath);
     return true;
@@ -1050,6 +1074,11 @@ export function verifyIndexPublish(
 ): void {
   let landed: string;
   try {
+    // Guard the CORRECTIVE read too. This path ran unguarded, so a symlink
+    // swapped in during the rename-to-verify window was read through here even
+    // though the main path refuses one, and that content was then re-published
+    // as the index.
+    assertIndexReadable(indexPath);
     landed = readFileSync(indexPath, "utf8");
   } catch {
     // Index vanished post-write (concurrent removal) — nothing sane to do.
@@ -1066,6 +1095,14 @@ export function verifyIndexPublish(
   }
   const reapplied = fn(landed);
   if (reapplied !== null && reapplied !== landed) {
+    // Same size cap the main path enforces. Two individually-valid versions can
+    // merge into an index past the cap here, and parseIndexFile returns null
+    // above it — which hides EVERY entry in that tier, not just the merged one.
+    const bytes = Buffer.byteLength(reapplied, "utf8");
+    if (bytes > INDEX_MAX_BYTES) {
+      debugLog("writer.index_reapply_oversize", { indexPath, bytes, cap: INDEX_MAX_BYTES });
+      return;
+    }
     atomicWriteFile(indexPath, reapplied);
     debugLog("writer.index_postwrite_reapply", { indexPath });
   }
