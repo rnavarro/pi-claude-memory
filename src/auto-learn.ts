@@ -149,7 +149,11 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
   // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
   // silently clobbering a newer edit with a stale review decision.
-  const resolved = resolveMemoryDirs(cwd);
+  // Auto-learn writes are mutations: exact project match only (no
+  // basename-glob fallback) so a review never writes into another project's
+  // store via a fuzzy match. For a new project this yields project=null and
+  // the project tier is created on first write below.
+  const resolved = resolveMemoryDirs(cwd, { exactOnly: true });
   const mtimes = snapshotMtimes([resolved.global, resolved.project]);
 
   // Follow pi-observational-memory's pattern: only pass reasoning if the

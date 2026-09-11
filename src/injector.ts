@@ -11,7 +11,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename } from "node:path";
 import { debugLog } from "./debug-log.js";
-import { parseMemoryFile } from "./frontmatter.js";
+import { parseMemoryContent } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
 import type { IndexEntry, IndexLine, MemoryDir, MemoryFile, MemoryType } from "./types.js";
 
@@ -209,31 +209,30 @@ function loadTopicFiles(_dir: MemoryDir, filePaths: string[]): Map<string, Memor
       const filename = basename(filePath);
       // Skip MEMORY.md itself
       if (filename === "MEMORY.md") continue;
-      const frontmatter = parseMemoryFile(filePath, filename);
+      // One read + one stat per file: read the bytes once, stat for mtime,
+      // and parse from the in-memory string (parseMemoryContent) instead of
+      // having parseMemoryFile read the file a second time.
       const content = readFileSync(filePath, "utf8");
-      const stats = { size: content.length, mtime: 0, lineCount: content.split("\n").length };
+      let mtime = 0;
+      try {
+        mtime = statSync(filePath).mtimeMs;
+      } catch {
+        // stat failure — inject with mtime 0 (sorts last)
+      }
+      const frontmatter = parseMemoryContent(content, filename, mtime);
       files.set(filePath, {
         filename,
         filePath,
         frontmatter,
-        size: stats.size,
-        mtime: getFileMtime(filePath),
-        lineCount: stats.lineCount,
+        size: content.length,
+        mtime,
+        lineCount: content.split("\n").length,
       });
     } catch {
       // skip unreadable files
     }
   }
   return files;
-}
-
-/** Get file mtime safely. */
-function getFileMtime(filePath: string): number {
-  try {
-    return statSync(filePath).mtimeMs;
-  } catch {
-    return 0;
-  }
 }
 
 /** Render the MEMORY.md index section (all lines, preserving structure).
@@ -272,13 +271,19 @@ function buildFullTextSection(
   // Build a priority-ordered list of candidate files
   const candidates = prioritizeFiles(files, entries);
 
+  // Index-pinned status (⛔ marker or [pin] in MEMORY.md) — an entry counted
+  // as pinned for sorting must also bypass the large-file filter, otherwise
+  // "always inject" silently fails for big pinned files.
+  const indexPinned = new Set(entries.filter((e) => e.pinned).map((e) => e.filePath));
+
   let tokensUsed = 0;
   const parts: string[] = [];
   const loadedPaths = new Set<string>();
   let filesLoaded = 0;
 
   for (const file of candidates) {
-    if (file.lineCount > SMALL_FILE_LINE_THRESHOLD && !file.frontmatter.pinned) {
+    const effectivePinned = Boolean(file.frontmatter.pinned) || indexPinned.has(file.filePath);
+    if (file.lineCount > SMALL_FILE_LINE_THRESHOLD && !effectivePinned) {
       continue; // large files get index-only unless pinned
     }
 
