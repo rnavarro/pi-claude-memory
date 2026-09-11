@@ -251,6 +251,45 @@ describe("injector (synthetic, index-pin bypass)", () => {
   });
 });
 
+describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
+  it("resolves the index at the root but the topic base to memory/", () => {
+    // This LOCKS the current behavior rather than "fixing" hrefs to be
+    // relative to the index file. A real store on this machine has exactly
+    // this shape: a root MEMORY.md whose lines are bare (`user_location.md`)
+    // with the topics in the sibling memory/. The read base is memory/, so
+    // those bare hrefs resolve correctly and the bodies load. Emitting
+    // index-relative links instead (memory/foo.md) would resolve to
+    // memory/memory/foo.md and MISS — the would-be fix breaks the real store.
+    const home = mkdtempSync(join(tmpdir(), "pcm-l2-"));
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      // Unique cwd: the resolver caches by cwd.
+      const cwd = `/home/user/workspace/pcm-l2-${process.pid}-${Date.now()}`;
+      const proj = join(home, ".claude", "projects", encodePath(cwd));
+      const mem = join(proj, "memory");
+      mkdirSync(mem, { recursive: true });
+      writeFileSync(join(proj, "MEMORY.md"), "- [User location](user_location.md) — Springfield\n");
+      writeFileSync(
+        join(mem, "user_location.md"),
+        "---\ndescription: loc\ntype: user\n---\nTOPIC_BODY_SENTINEL\n",
+      );
+
+      const resolved = resolveMemoryDirs(cwd);
+      expect(resolved.project?.indexPath).toBe(join(proj, "MEMORY.md"));
+      expect(resolved.project?.dir).toBe(mem);
+
+      const { text } = buildMemoryInjection(resolved.project, resolved.global, 20000);
+      // The bare href resolved against memory/, so the body is injected.
+      expect(text).toContain("TOPIC_BODY_SENTINEL");
+    } finally {
+      if (origHome === undefined) Reflect.deleteProperty(process.env, "HOME");
+      else process.env.HOME = origHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("cross-tier injection does not duplicate a shared topic", () => {
   // A project index may link an absolute href into the global store, and the
   // global index lists the same file relatively. Each tier built its OWN
