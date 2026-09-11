@@ -182,9 +182,9 @@ const writeTool = defineTool({
       bodyChars: params.body.length,
     });
     const tier = params.tier ?? "project";
-    // Writes are mutations: exact project match only (no basename-glob
-    // fallback) so a write never lands in another project's store.
-    const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
+    // Resolution is exact for every operation; a same-basename store is never
+    // adopted implicitly, so a write cannot land in another project's store.
+    const resolved = resolveMemoryDirs(ctx.cwd);
     let dir = pickTier(resolved, tier);
     // Create the dir if it doesn't exist yet (fresh installations have no
     // store — reads stay side-effect-free, writes create on demand).
@@ -258,8 +258,10 @@ const removeTool = defineTool({
     const explicitTier = params.tier !== undefined;
     const tier = params.tier ?? "project";
     const otherTier = tier === "project" ? "global" : "project";
-    // Removals are mutations: exact project match only (see write_memory).
-    const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
+    // Resolution is exact for every operation (see write_memory), so a
+    // removal can only name an entry in this project's own store — or the
+    // global tier, which is one fixed directory.
+    const resolved = resolveMemoryDirs(ctx.cwd);
 
     // Candidate order mirrors recall_memory: the requested tier first, then the
     // other tier ONLY when the caller did not name one. An explicitly named tier

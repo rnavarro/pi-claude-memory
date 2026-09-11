@@ -25,7 +25,7 @@ import { type AutoLearnConfig, runAutoLearn } from "./auto-learn.js";
 import { loadConfig, type PiClaudeMemoryConfig } from "./config.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { buildMemoryInjection } from "./injector.js";
-import { resolveMemoryDirs } from "./resolver.js";
+import { orphanSignpost, resolveMemoryDirs } from "./resolver.js";
 import { registerMemoryTools } from "./tools.js";
 import type { ResolveResult } from "./types.js";
 
@@ -450,7 +450,7 @@ async function handleBeforeAgentStart(
 function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
   const resolved = resolveMemoryDirs(cwd);
 
-  const { text, warnings } = buildMemoryInjection(
+  let { text, warnings } = buildMemoryInjection(
     resolved.project,
     resolved.global,
     config.injectTokenCap,
@@ -463,6 +463,16 @@ function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
     for (const w of warnings) {
       debugLog("injector.warning", { warning: w });
     }
+  }
+
+  // Adoption signpost: this cwd has no store, but same-basename stores exist.
+  // Resolution used to adopt one of those implicitly; now the rename is the
+  // user's decision, so the line names the candidates and the exact rename.
+  // Appending to the frozen block makes it once-per-session, not per-turn.
+  const orphans = resolved.orphanStores ?? [];
+  if (orphans.length > 0) {
+    text = `${text}\n${orphanSignpost(cwd, orphans)}`;
+    debugLog("resolver.orphan_signpost", { cwd, orphanStores: orphans });
   }
 
   return { cwd, text, resolved };

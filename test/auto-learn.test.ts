@@ -2,15 +2,7 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +12,6 @@ import {
   parseCandidates,
   snapshotMtimes,
 } from "../src/auto-learn.js";
-import { withDebugLogContext } from "../src/debug-log.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
 import type { MemoryDir as MemoryDirType, ResolveResult } from "../src/types.js";
 
@@ -138,39 +129,35 @@ describe("buildExistingIndexSummary", () => {
   });
 });
 
-describe("resolveMemoryDirs exactOnly", () => {
-  it("falls back to basename-glob match without exactOnly (read behavior)", () => {
+describe("resolveMemoryDirs is exact for reads and mutations alike", () => {
+  it("does not adopt a foreign same-basename store; it reports it as an orphan", () => {
     // Simulate cwd /work/customer-b/app whose exact project store does not
-    // exist, while another project /work/customer-a/app does. The fuzzy
-    // (read) path still glob-matches the other store by basename — that is
-    // pre-existing read behavior.
+    // exist, while another project /work/customer-a/app does. The read path
+    // used to glob-adopt the other store by basename suffix and inject a
+    // foreign project's memories into this cwd's prompt (encodePath is lossy,
+    // '/' → '-', so suffixes collide). Reads and mutations now share one
+    // rule: only the exact encoded store resolves; a same-basename store is
+    // reported for the user to adopt deliberately.
     const otherDir = join(tmpDir, ".claude", "projects", "-work-customer-a-app");
     mkdirSync(otherDir, { recursive: true });
     writeFileSync(join(otherDir, "MEMORY.md"), "# Customer A\n");
 
     const cwdB = join(tmpDir, "work", "customer-b", "app");
-    const fuzzy = resolveMemoryDirs(cwdB);
-    expect(fuzzy.project?.dir).toContain("customer-a");
+    const resolved = resolveMemoryDirs(cwdB);
+    expect(resolved.project).toBeNull();
+    expect(resolved.orphanStores?.length).toBe(1);
+    expect(resolved.orphanStores?.[0]).toContain("customer-a");
   });
 
-  it("returns null project with exactOnly:true instead of matching another project", () => {
-    const otherDir = join(tmpDir, ".claude", "projects", "-work-customer-a-app");
-    mkdirSync(otherDir, { recursive: true });
-    writeFileSync(join(otherDir, "MEMORY.md"), "# Customer A\n");
-
-    const cwdB = join(tmpDir, "work", "customer-b", "app");
-    const exact = resolveMemoryDirs(cwdB, { exactOnly: true });
-    expect(exact.project).toBeNull();
-  });
-
-  it("still resolves an exact match with exactOnly:true", () => {
+  it("still resolves an exact match, with nothing to report", () => {
     const cwdA = join(tmpDir, "work", "customer-a", "app");
     const exactDir = join(tmpDir, ".claude", "projects", encodePath(cwdA));
     const memorySub = join(exactDir, "memory");
     mkdirSync(memorySub, { recursive: true });
     writeFileSync(join(memorySub, "MEMORY.md"), "# Customer A\n");
-    const got = resolveMemoryDirs(cwdA, { exactOnly: true });
+    const got = resolveMemoryDirs(cwdA);
     expect(got.project?.dir).toContain("customer-a");
+    expect(got.orphanStores?.length ?? 0).toBe(0);
   });
 });
 
@@ -316,47 +303,29 @@ describe("createProjectMemoryDir", () => {
   });
 });
 
-describe("createProjectMemoryDir split-brain notice", () => {
-  it("records a candidate-store notice in the debug log (not the TUI) and still creates", () => {
-    // An existing store for a *different* cwd sharing the basename "app":
-    // the exact store for cwdB does not exist, but a basename glob would
-    // match the customer-a store. Mutations resolve exact-only, so creating
-    // here shadows those memories — record it for the operator.
-    //
-    // This is advisory and fires per candidate, so it goes to the debug log
-    // rather than the console: a console line would land inside the rendered
-    // conversation. See the no-console-ui-noise memory.
+describe("createProjectMemoryDir", () => {
+  it("creates the exact store when a same-basename sibling exists, without console noise", () => {
+    // The create path used to scan for sibling stores and debug-note that the
+    // fresh exact dir would shadow them on fuzzy reads. Reads are exact now,
+    // so there is nothing to shadow: resolution already reports the sibling
+    // via orphanStores (rendered once per session as the adoption signpost),
+    // and the orphan-signpost test above covers that path. Creating remains
+    // unconditional, and putting the store in place stays console-silent.
     const otherEncoded = `-${encodePath(join(tmpDir, "work", "customer-a", "app")).slice(1)}`;
     const projectsRoot = join(tmpDir, ".claude", "projects");
     mkdirSync(join(projectsRoot, otherEncoded), { recursive: true });
     writeFileSync(join(projectsRoot, otherEncoded, "MEMORY.md"), "# Customer A\n- [x](x.md) — x\n");
 
-    const logDir = join(tmpDir, ".pi", "agent", "pi-claude-memory", "debug");
-    const sid = `split-${Date.now()}`;
     const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
     let created: MemoryDirType | null = null;
     try {
-      created = withDebugLogContext({ enabled: true, cwd: tmpDir, sessionId: sid }, () => {
-        const cwdB = join(tmpDir, "work", "customer-b", "app");
-        return createProjectMemoryDir(cwdB);
-      });
+      created = createProjectMemoryDir(join(tmpDir, "work", "customer-b", "app"));
     } finally {
       consoleErr.mockRestore();
     }
     if (!created) throw new Error("expected createProjectMemoryDir to return a dir");
-
-    // The new exact store dir was created (MEMORY.md appears on first write).
     expect(existsSync(created.dir)).toBe(true);
-
-    // No console noise went to the TUI.
     expect(consoleErr).not.toHaveBeenCalled();
-
-    // The notice is recorded in the debug log, naming the sibling store.
-    const logFile = join(logDir, `${sid}.ndjson`);
-    expect(existsSync(logFile)).toBe(true);
-    const logged = readFileSync(logFile, "utf8");
-    expect(logged).toContain("split_brain_shadows_existing_store");
-    expect(logged).toContain(otherEncoded);
   });
 });
 

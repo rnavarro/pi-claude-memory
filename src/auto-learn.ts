@@ -138,7 +138,7 @@ export async function runAutoLearn(
   // basename-glob fallback) so a review never writes into another project's
   // store via a fuzzy match. For a new project this yields project=null and
   // the project tier is created on first write below.
-  const resolved = resolveMemoryDirs(cwd, { exactOnly: true });
+  const resolved = resolveMemoryDirs(cwd);
   const existingIndex = buildExistingIndexSummary(resolved);
   // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
   // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
