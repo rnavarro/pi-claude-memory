@@ -10,6 +10,7 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   renameSync,
   statSync,
@@ -471,9 +472,29 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
 
   // Move to .trash/ (never delete — user can recover)
   const trashDir = join(dir.dir, TRASH_DIRNAME);
-  mkdirSync(trashDir, { recursive: true });
   const filename = basename(filePath);
-  const trashPath = join(trashDir, `${filename}.${Date.now()}.bak`);
+  // Unique per-removal destination. `${filename}.${Date.now()}.bak` collided
+  // when the same topic was removed twice within one millisecond (or across
+  // processes sharing a timestamp), and renameSync overwrites silently — so
+  // the second removal would destroy the first backup, contradicting the
+  // recoverability promise. mkdtempSync reserves a fresh directory instead.
+  //
+  // The .trash dir is also checked for symlink-ness: moving files through an
+  // attacker-controlled symlink would relocate them outside the store. The
+  // check runs BEFORE creating anything, so an existing symlink is rejected
+  // rather than followed by mkdirSync.
+  try {
+    const st = lstatSync(trashDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      debugLog("writer.trash_not_directory", { trashDir, tier: dir.tier });
+      return { ok: false, message: `.trash in ${dir.label} tier is not a plain directory` };
+    }
+  } catch {
+    // Absent — create it below.
+    mkdirSync(trashDir, { recursive: true });
+  }
+  const destDir = mkdtempSync(join(trashDir, `${filename}.`));
+  const trashPath = join(destDir, filename);
   renameSync(filePath, trashPath);
 
   // Remove the link entry from MEMORY.md
@@ -595,12 +616,26 @@ export function readMemory(
  * rename is atomic on POSIX when source and destination are on the same
  * filesystem (same directory). This prevents a concurrent reader (Claude
  * Code) from observing a truncated file. */
-function atomicWriteFile(filePath: string, content: string): void {
+/** Write via temp file + rename. Internal — exported for tests. */
+export function atomicWriteFile(filePath: string, content: string): void {
   const dir = dirname(filePath);
   const tmpName = `.${basename(filePath)}.${process.pid}.${Date.now()}.tmp`;
   const tmpPath = join(dir, tmpName);
   writeFileSync(tmpPath, content, "utf8");
-  renameSync(tmpPath, filePath);
+  try {
+    renameSync(tmpPath, filePath);
+  } catch (err) {
+    // Don't leave the temp file behind on a failed publish. It is invisible
+    // to the .md scans (both require .endsWith(".md")), but it accumulates
+    // in a directory the user browses. Mirrors atomicWriteFileNoClobber's
+    // cleanup, which already did this.
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Already gone, or not ours to remove — nothing useful to do.
+    }
+    throw err;
+  }
 }
 
 /** Publish a new file WITHOUT clobbering an existing one. link() is atomic

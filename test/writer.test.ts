@@ -13,10 +13,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
 import {
+  atomicWriteFile,
   atomicWriteFileNoClobber,
   buildFrontmatterYaml,
   readMemory,
@@ -837,5 +838,83 @@ describe("readMemory size cap is shared with the injector", () => {
     // injector path was bounded.
     const { TOPIC_FILE_MAX_BYTES } = await import("../src/types.js");
     expect(TOPIC_FILE_MAX_BYTES).toBe(1_000_000);
+  });
+});
+
+describe("trash recoverability", () => {
+  it("keeps BOTH versions when the same topic is removed twice in one millisecond", () => {
+    // The old naming was `filename.${Date.now()}.bak`, which collides within a
+    // millisecond and is then silently overwritten by renameSync — destroying
+    // the first backup despite the recoverable-never-deletes promise.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    try {
+      writeMemory(dir, {
+        name: "versioned",
+        description: "v1",
+        type: "project",
+        tier: "project",
+        body: "first version",
+        pinned: false,
+        allowOverwrite: false,
+      });
+      removeMemory(dir, { name: "versioned", tier: "project" });
+
+      writeMemory(dir, {
+        name: "versioned",
+        description: "v2",
+        type: "project",
+        tier: "project",
+        body: "second version",
+        pinned: false,
+        allowOverwrite: false,
+      });
+      removeMemory(dir, { name: "versioned", tier: "project" });
+
+      // Two distinct backups, both intact.
+      const trashDir = join(dir.dir, ".trash");
+      const entries = readdirSync(trashDir, { withFileTypes: true }).filter((e) => e.isDirectory());
+      expect(entries.length).toBe(2);
+      const bodies = entries
+        .map((e) => readFileSync(join(trashDir, e.name, "versioned.md"), "utf8"))
+        .join("\n");
+      expect(bodies).toContain("first version");
+      expect(bodies).toContain("second version");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses to move a file through a symlinked .trash", () => {
+    writeMemory(dir, {
+      name: "through-link",
+      description: "d",
+      type: "project",
+      tier: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    const outside = mkdtempSync(join(tmpdir(), "pcm-trash-out-"));
+    // .trash as a symlink to an outside directory.
+    symlinkSync(outside, join(dir.dir, ".trash"));
+    const res = removeMemory(dir, { name: "through-link", tier: "project" });
+    expect(res.ok).toBe(false);
+    // The topic is untouched and nothing landed outside the store.
+    expect(existsSync(join(dir.dir, "through-link.md"))).toBe(true);
+    expect(readdirSync(outside).length).toBe(0);
+    rmSync(outside, { recursive: true, force: true });
+  });
+});
+
+describe("atomicWriteFile temp cleanup", () => {
+  it("leaves no .tmp behind when the publish fails", () => {
+    // Make the rename fail by making the target a non-empty directory.
+    const target = join(dir.dir, "noisy.md");
+    mkdirSync(target);
+    writeFileSync(join(target, "blocker"), "x");
+    expect(() => atomicWriteFile(target, "content")).toThrow();
+    const leftovers = readdirSync(dir.dir).filter((f) => f.endsWith(".tmp"));
+    expect(leftovers).toEqual([]);
   });
 });
