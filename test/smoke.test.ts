@@ -251,6 +251,47 @@ describe("injector (synthetic, index-pin bypass)", () => {
   });
 });
 
+describe("cross-tier injection does not duplicate a shared topic", () => {
+  // A project index may link an absolute href into the global store, and the
+  // global index lists the same file relatively. Each tier built its OWN
+  // loadedPaths set, so the body was emitted twice and charged twice against
+  // the shared budget — confirmed live: a real project index on this machine
+  // has two such absolute cross-tier hrefs.
+  const mkStore = (root: string, indexLines: string, files: Record<string, string>) => {
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, "MEMORY.md"), indexLines);
+    for (const [name, body] of Object.entries(files)) {
+      writeFileSync(join(root, name), `---\ndescription: ${name}\ntype: reference\n---\n${body}\n`);
+    }
+    return { tier: "global" as const, dir: root, indexPath: join(root, "MEMORY.md"), label: root };
+  };
+
+  it("emits a cross-tier-linked body exactly once", () => {
+    const base = mkdtempSync(join(tmpdir(), "pcm-xtier-"));
+    const globalRoot = join(base, "global");
+    const projectRoot = join(base, "project");
+    const globalDir = mkStore(globalRoot, "- [Shared](shared.md) — the shared topic\n", {
+      "shared.md": "SHARED_BODY_SENTINEL",
+    });
+    // The project index reaches the SAME global file by absolute href.
+    const projectDir = {
+      ...mkStore(
+        projectRoot,
+        `- [Shared](${join(globalRoot, "shared.md")}) — cross-tier link\n`,
+        {},
+      ),
+      tier: "project" as const,
+      label: "project",
+    };
+
+    const { text } = buildMemoryInjection(projectDir, globalDir, 20000);
+    const occurrences = text.split("SHARED_BODY_SENTINEL").length - 1;
+    expect(occurrences).toBe(1);
+
+    rmSync(base, { recursive: true, force: true });
+  });
+});
+
 describe("injector read-side containment", () => {
   // Synthetic dirs (no real corpus needed)
   const mkDir = (root: string, tier: "project" | "global"): MemoryDirType => ({
