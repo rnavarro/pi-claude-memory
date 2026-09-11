@@ -67,6 +67,17 @@ let turnCount = 0;
 // branches. Null when no review is running.
 let autoLearnInFlight: Promise<number> | null = null;
 
+// Abort handle for the in-flight review when we own its signal (periodic and
+// compact launches pass none of their own). Shutdown-timeout and
+// session_start ABORT the review instead of abandoning it — an abandoned
+// review keeps writing into the shared store and races the next review.
+let autoLearnAbort: AbortController | null = null;
+
+// Session generation, bumped on every session_start. Completion handlers of
+// reviews launched under an older generation must not clear state or drain
+// the compact queue into a newer session.
+let autoLearnGeneration = 0;
+
 // A compaction snapshot waiting for the in-flight review to finish, so the
 // pre-compaction branch is not silently dropped when compact fires during a
 // running review. Drained in launchAutoLearn's completion handler. Last
@@ -76,7 +87,6 @@ interface PendingCompact {
   cfg: AutoLearnConfig;
   cwd: string;
   chunk: string;
-  existingIndex: string;
 }
 let pendingCompact: PendingCompact | null = null;
 
@@ -144,6 +154,13 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     frozenInjection = null;
     turnCount = 0;
     toolResultChunk = "";
+    // A new session invalidates the previous generation: an in-flight review
+    // belongs to the old session and must not write while the new one runs.
+    // Abort it, bump the generation so its completion handler leaves the
+    // new session's state alone, and clear the compact queue.
+    autoLearnAbort?.abort();
+    autoLearnAbort = null;
+    autoLearnGeneration++;
     autoLearnInFlight = null;
     pendingCompact = null;
     withDebugLogContext(
@@ -220,7 +237,6 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
           cfg: autoLearnCfg,
           cwd: ctx.cwd,
           chunk: truncated,
-          existingIndex,
         };
         return;
       }
@@ -246,20 +262,51 @@ async function handleSessionShutdown(
     async () => {
       debugLog("session.shutdown", { reason: event.reason, turnCount });
 
+      // Single shared absolute deadline: the in-flight wait and the final
+      // review COMBINED must not exceed shutdownTimeoutMs (Pi provides no
+      // timeout of its own). Previously the two phases could each consume
+      // the full budget, doubling the worst case.
+      const shutdownDeadline = Date.now() + config.shutdownTimeoutMs;
+      const remainingMs = () => Math.max(0, shutdownDeadline - Date.now());
+
       // If a periodic or compact-triggered review is still running, await it
-      // first under a deadline so a hung provider cannot block shutdown.
+      // under the shared deadline so a hung provider cannot block shutdown.
       if (autoLearnInFlight) {
         debugLog("auto_learn.shutdown_await_inflight", {});
+        let inflightSettled = true;
         try {
-          await raceTimeout(autoLearnInFlight, config.shutdownTimeoutMs);
-        } catch {
-          // timed out or errored — proceed to the final review regardless
+          await raceTimeout(autoLearnInFlight, remainingMs());
+        } catch (err) {
+          // Distinguish a hung review (our raceTimeout rejected) from a
+          // review that errored and is done. A hung review is still running
+          // — abort it below; either way do not start a second writer on
+          // top of it.
+          inflightSettled = !(err instanceof Error && err.message.includes("timed out"));
         }
-        // The in-flight review's .finally clears the flag, but it may not
-        // have run yet (our await continuation can resume before the chained
-        // .finally in the same microtask wave). Clear explicitly so the final
-        // launchAutoLearn below does not bail on the stale non-null flag and
-        // silently skip the shutdown review.
+        if (!inflightSettled) {
+          // On timeout the in-flight review is STILL RUNNING (periodic and
+          // compact launches own an abort controller precisely for this).
+          // Abort it and skip the final review: launching a competitor
+          // writer would race it into the same store (duplicate entries,
+          // lost index updates).
+          autoLearnAbort?.abort();
+          autoLearnAbort = null;
+          autoLearnInFlight = null;
+          pendingCompact = null;
+          debugLog("auto_learn.shutdown_timeout_abort", {});
+          console.error(
+            "[pi-claude-memory] auto-learn: in-flight review exceeded shutdown deadline; aborted, final review skipped",
+          );
+          return;
+        }
+        // The review settled (wrote, errored, or aborted elsewhere). Its
+        // .finally clears the flag, but it may not have run yet (our await
+        // continuation can resume before the chained .finally in the same
+        // microtask wave). Clear explicitly so the final launchAutoLearn
+        // below does not bail on the stale non-null flag.
+        // INVARIANT: nothing between here and the launchAutoLearn call may
+        // await — an await would let the settled review's .finally
+        // interleave, drain pendingCompact, and double-launch.
         autoLearnInFlight = null;
         // A queued compact snapshot is superseded by this shutdown review.
         pendingCompact = null;
@@ -300,10 +347,15 @@ async function handleSessionShutdown(
         maxOutputTokens: config.reviewMaxOutputTokens,
       };
 
-      // Await with our own timeout — Pi provides none.
-      const signal = AbortSignal.timeout(config.shutdownTimeoutMs);
+      // Final review. AbortSignal.timeout is cooperative cancellation only —
+      // a provider that ignores the signal would still hang the await, so
+      // race the whole launch against the remaining shared deadline too.
+      const signal = AbortSignal.timeout(remainingMs() || 1);
       try {
-        await launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, signal);
+        await raceTimeout(
+          launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, signal),
+          remainingMs(),
+        );
       } catch (err) {
         debugLog("auto_learn.shutdown_error", { error: String(err) });
         // Swallow — never block shutdown on an LLM error.
@@ -555,8 +607,14 @@ function launchAutoLearn(
     return Promise.resolve(0);
   }
 
-  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, signal);
+  // Reviews launched without a caller-supplied signal (periodic, compact)
+  // get an abort controller we own, so shutdown-timeout and session_start
+  // can cancel the review instead of abandoning it while it still writes.
+  const controller = signal ? null : new AbortController();
+  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, signal ?? controller?.signal);
+  const gen = autoLearnGeneration;
   autoLearnInFlight = promise;
+  autoLearnAbort = controller;
   promise
     .then((written) => {
       debugLog("auto_learn.result", { written });
@@ -577,10 +635,15 @@ function launchAutoLearn(
       return -1;
     })
     .finally(() => {
+      // A review from a previous session (generation bumped by session_start
+      // while this one was in flight) must not touch state or drain its
+      // completion into the new session.
+      if (gen !== autoLearnGeneration) return;
       // Clear the flag first, then drain a queued compaction snapshot. The
       // clear must happen here (not only in the shutdown await) so periodic
       // triggers see a clean slate.
       if (autoLearnInFlight === promise) autoLearnInFlight = null;
+      if (autoLearnAbort === controller) autoLearnAbort = null;
       drainPendingCompact();
     });
 
@@ -591,11 +654,19 @@ function launchAutoLearn(
  * launchAutoLearn's completion handler so a compact that arrived while a
  * review was running is not silently dropped. */
 function drainPendingCompact(): void {
-  if (!pendingCompact) return;
+  // Check the slot is free BEFORE taking the snapshot — if another review is
+  // somehow in flight, leave the snapshot queued for the next completion.
+  if (!pendingCompact || autoLearnInFlight) return;
   const p = pendingCompact;
   pendingCompact = null;
+  // Recompute the index summary at drain time. The review that just finished
+  // may have written memories after this snapshot was queued; replaying the
+  // queue-time summary would hide those entries from supersession and cause
+  // duplicate writes.
+  const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(p.cwd);
+  const existingIndex = buildExistingIndexSummary(resolved);
   debugLog("auto_learn.compact_drain", { chunkChars: p.chunk.length });
-  void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk, p.existingIndex);
+  void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk, existingIndex);
 }
 
 /** Race a promise against a timeout. Resolves with the promise's value, or
