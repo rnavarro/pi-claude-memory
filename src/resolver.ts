@@ -14,8 +14,18 @@ import { isAbsolute, resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
-const CLAUDE_PROJECTS_DIR = `${homedir()}/.claude/projects`;
-const CLAUDE_GLOBAL_DIR = `${homedir()}/.claude/memory`;
+/** Root of Claude Code's per-project memory stores. Computed lazily (not at
+ * module load) so tests that override process.env.HOME after importing the
+ * resolver see the temp home instead of the real one. */
+function claudeProjectsDir(): string {
+  return `${homedir()}/.claude/projects`;
+}
+
+/** Claude Code's global (cross-project) memory store. Lazily computed — see
+ * claudeProjectsDir(). */
+function claudeGlobalDir(): string {
+  return `${homedir()}/.claude/memory`;
+}
 
 /** Encode a path the way Claude Code does: "/" → "-". */
 export function encodePath(path: string): string {
@@ -25,7 +35,7 @@ export function encodePath(path: string): string {
 
 /** Get the project directory for an encoded cwd. */
 function projectDir(encoded: string): string {
-  return `${CLAUDE_PROJECTS_DIR}/${encoded}`;
+  return `${claudeProjectsDir()}/${encoded}`;
 }
 
 /**
@@ -38,7 +48,7 @@ function projectDir(encoded: string): string {
  * If the exact encoded dir doesn't exist, globs for candidates whose basename
  * matches the cwd basename (handles rename split-brain like pool_cover vs pool-cover).
  */
-export function resolveMemoryDirs(cwd: string): ResolveResult {
+export function resolveMemoryDirs(cwd: string, opts?: { exactOnly?: boolean }): ResolveResult {
   const warnings: string[] = [];
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
   const encoded = encodePath(absCwd);
@@ -52,8 +62,10 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
     project = resolveProjectMemory(exactDir, absCwd, warnings);
   }
 
-  // If exact match not found, try basename glob (rename split-brain handling)
-  if (!project) {
+  // If exact match not found, try basename glob (rename split-brain handling).
+  // Skipped for mutations (opts.exactOnly) so a write/remove never lands in
+  // another project's store via a fuzzy basename match.
+  if (!project && !opts?.exactOnly) {
     const cwdBasename = absCwd.split(sep).pop() ?? absCwd;
     if (cwdBasename) {
       const candidates = findProjectCandidates(cwdBasename);
@@ -72,13 +84,14 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
 
   // Resolve global tier
   let global: MemoryDir | null = null;
-  if (existsSync(CLAUDE_GLOBAL_DIR)) {
-    const globalIndexPath = `${CLAUDE_GLOBAL_DIR}/MEMORY.md`;
+  const globalDir = claudeGlobalDir();
+  if (existsSync(globalDir)) {
+    const globalIndexPath = `${globalDir}/MEMORY.md`;
     // Return the global dir even if MEMORY.md doesn't exist yet —
     // write_memory needs the dir to create it on first write.
     global = {
       tier: "global",
-      dir: CLAUDE_GLOBAL_DIR,
+      dir: globalDir,
       indexPath: globalIndexPath,
       label: "Global",
     };
@@ -105,7 +118,7 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
 export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
   const encoded = encodePath(absCwd);
-  const projectDir = `${CLAUDE_PROJECTS_DIR}/${encoded}`;
+  const projectDir = `${claudeProjectsDir()}/${encoded}`;
   const memorySubdir = `${projectDir}/memory`;
 
   try {
@@ -170,16 +183,17 @@ function resolveProjectMemory(
  * Returns paths sorted by most recently modified first.
  */
 function findProjectCandidates(cwdBasename: string): string[] {
-  if (!existsSync(CLAUDE_PROJECTS_DIR)) return [];
+  const projectsDir = claudeProjectsDir();
+  if (!existsSync(projectsDir)) return [];
 
   const encodedBasename = `-${cwdBasename}`;
   const candidates: { dir: string; mtime: number }[] = [];
 
-  for (const entry of readdirSync(CLAUDE_PROJECTS_DIR, { withFileTypes: true })) {
+  for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     // Match by suffix: encoded dir ends with -<basename>
     if (entry.name.endsWith(encodedBasename)) {
-      const dir = `${CLAUDE_PROJECTS_DIR}/${entry.name}`;
+      const dir = `${projectsDir}/${entry.name}`;
       // Only include if it has a MEMORY.md somewhere
       if (existsSync(`${dir}/memory/MEMORY.md`) || existsSync(`${dir}/MEMORY.md`)) {
         try {

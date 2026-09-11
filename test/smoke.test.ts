@@ -1,7 +1,9 @@
 // Quick smoke test against the real Claude Code memory corpus
 // Run: node --import tsx test/smoke.test.ts
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
@@ -12,7 +14,13 @@ const APP_CWD = "/home/user/workspace/my-app";
 const OTHER_CWD = "/home/user/workspace/other-project";
 const UNKNOWN_CWD = "/home/user/workspace/nonexistent-project";
 
-describe("resolver", () => {
+// The resolver and injector describes run against the real Claude Code
+// memory corpus on this machine. They are skipped when that corpus is
+// absent (e.g. CI / a fresh clone) so the suite stays portable; the pure
+// frontmatter and index-parser describes always run.
+const REAL_CORPUS = existsSync(APP_CWD) && existsSync(join(homedir(), ".claude/memory"));
+
+describe.skipIf(!REAL_CORPUS)("resolver", () => {
   it("encodes paths the way Claude Code does", () => {
     expect(encodePath(APP_CWD)).toBe("-home-user-workspace-my-app");
     expect(encodePath("/home/user/workspace/foo-bar")).toBe(
@@ -123,7 +131,7 @@ describe("index-parser", () => {
   });
 });
 
-describe("injector", () => {
+describe.skipIf(!REAL_CORPUS)("injector", () => {
   it("builds injection for my-app", () => {
     const result = resolveMemoryDirs(APP_CWD);
     const { text } = buildMemoryInjection(result.project, result.global);
@@ -141,5 +149,49 @@ describe("injector", () => {
     const { text } = buildMemoryInjection(result.project, result.global);
     expect(text).toContain("Global");
     expect(text).toContain("Prefer jq");
+  });
+});
+
+// Synthetic injector test — pure (temp dirs + hand-built MemoryDir), always
+// runs regardless of corpus availability. Exercises the large-file bypass:
+// an index-pinned (⛔) entry over 60 lines must be fully injected even
+// though its frontmatter has no pinned flag (finding #16), while an
+// unpinned large file stays index-only.
+describe("injector (synthetic, index-pin bypass)", () => {
+  it("fully injects an index-pinned large file; leaves unpinned large files index-only", () => {
+    const dir = join(tmpdir(), `pcm-pinbypass-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    // 80-line body — well over the 60-line threshold
+    const bigBody = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      `- ⛔ [Pinned big](pinned_big.md) — always in\n- [Unpinned big](unpinned_big.md) — index only\n`,
+    );
+    const mkFile = (name: string) =>
+      writeFileSync(
+        join(dir, name),
+        `---\ndescription: ${name}\ntype: reference\n---\n${bigBody}\n`,
+      );
+    // pinned_big.md deliberately has NO pinned frontmatter — the pin lives
+    // only in the index (⛔ marker), like entries written by other agents.
+    mkFile("pinned_big.md");
+    mkFile("unpinned_big.md");
+
+    const memDir = {
+      tier: "global" as const,
+      dir,
+      indexPath: join(dir, "MEMORY.md"),
+      label: "Test",
+    };
+    const { text } = buildMemoryInjection(null, memDir, 20000);
+
+    expect(text).toContain("#### Full Text");
+    // The index-pinned big file must be fully loaded...
+    expect(text).toContain("line 79");
+    // ...while the unpinned big file stays index-only.
+    const fullText = text.slice(text.indexOf("#### Full Text"));
+    expect(fullText).not.toContain("unpinned_big");
+
+    rmSync(dir, { recursive: true, force: true });
   });
 });

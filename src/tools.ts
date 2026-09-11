@@ -141,7 +141,9 @@ const writeTool = defineTool({
       bodyChars: params.body.length,
     });
     const tier = params.tier ?? "project";
-    const resolved = resolveMemoryDirs(ctx.cwd);
+    // Writes are mutations: exact project match only (no basename-glob
+    // fallback) so a write never lands in another project's store.
+    const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
     let dir = pickTier(resolved, tier);
     // For project-tier writes, create the dir if it doesn't exist yet.
     if (!dir && tier === "project") {
@@ -198,7 +200,8 @@ const removeTool = defineTool({
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     debugLog("tool.remove_memory", { name: params.name, tier: params.tier ?? "project" });
     const tier = params.tier ?? "project";
-    const resolved = resolveMemoryDirs(ctx.cwd);
+    // Removals are mutations: exact project match only (see write_memory).
+    const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
     const dir =
       pickTier(resolved, tier) ?? pickTier(resolved, tier === "project" ? "global" : "project");
     if (!dir) {

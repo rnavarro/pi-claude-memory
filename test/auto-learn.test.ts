@@ -2,12 +2,12 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildExistingIndexSummary, parseCandidates } from "../src/auto-learn.js";
-import { createProjectMemoryDir, resolveMemoryDirs } from "../src/resolver.js";
+import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
 
 let tmpDir: string;
 let origHome: string | undefined;
@@ -30,9 +30,11 @@ describe("buildExistingIndexSummary", () => {
     const projectHash = "-home-user-workspace-test";
     const projectDir = join(tmpDir, ".claude", "projects", projectHash, "memory");
 
-    // We can't easily test resolveMemoryDirs with a fake HOME because it looks
-    // up the real cwd. Instead, build the summary from a hand-built ResolveResult.
-    const { mkdirSync } = require("node:fs");
+    // We can't easily test resolveMemoryDirs with a fake cwd. Instead,
+    // build the summary from a hand-built ResolveResult. (With the resolver's
+    // lazy homedir this test's process.env.HOME override works; the dir
+    // layout here is hand-built rather than resolved.)
+
     mkdirSync(claudeDir, { recursive: true });
     mkdirSync(projectDir, { recursive: true });
     writeFileSync(join(claudeDir, "global_entry.md"), "# Global");
@@ -65,7 +67,7 @@ describe("buildExistingIndexSummary", () => {
 
   it("handles empty dirs gracefully", () => {
     const claudeDir = join(tmpDir, "empty-global");
-    const { mkdirSync } = require("node:fs");
+
     mkdirSync(claudeDir, { recursive: true });
 
     const resolved = {
@@ -85,7 +87,7 @@ describe("buildExistingIndexSummary", () => {
 
   it("emits slug: description from parsed MEMORY.md entries (not titles)", () => {
     const claudeDir = join(tmpDir, ".claude", "memory");
-    const { mkdirSync } = require("node:fs");
+
     mkdirSync(claudeDir, { recursive: true });
     writeFileSync(join(claudeDir, "prefer-jq.md"), "---\nname: prefer-jq\n---\nbody");
     writeFileSync(
@@ -110,6 +112,42 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).toContain("prefer-jq:");
     expect(summary).toContain("Use jq for JSON processing");
     expect(summary).not.toContain("Prefer jq");
+  });
+});
+
+describe("resolveMemoryDirs exactOnly", () => {
+  it("falls back to basename-glob match without exactOnly (read behavior)", () => {
+    // Simulate cwd /work/customer-b/app whose exact project store does not
+    // exist, while another project /work/customer-a/app does. The fuzzy
+    // (read) path still glob-matches the other store by basename — that is
+    // pre-existing read behavior.
+    const otherDir = join(tmpDir, ".claude", "projects", "-work-customer-a-app");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, "MEMORY.md"), "# Customer A\n");
+
+    const cwdB = join(tmpDir, "work", "customer-b", "app");
+    const fuzzy = resolveMemoryDirs(cwdB);
+    expect(fuzzy.project?.dir).toContain("customer-a");
+  });
+
+  it("returns null project with exactOnly:true instead of matching another project", () => {
+    const otherDir = join(tmpDir, ".claude", "projects", "-work-customer-a-app");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, "MEMORY.md"), "# Customer A\n");
+
+    const cwdB = join(tmpDir, "work", "customer-b", "app");
+    const exact = resolveMemoryDirs(cwdB, { exactOnly: true });
+    expect(exact.project).toBeNull();
+  });
+
+  it("still resolves an exact match with exactOnly:true", () => {
+    const cwdA = join(tmpDir, "work", "customer-a", "app");
+    const exactDir = join(tmpDir, ".claude", "projects", encodePath(cwdA));
+    const memorySub = join(exactDir, "memory");
+    mkdirSync(memorySub, { recursive: true });
+    writeFileSync(join(memorySub, "MEMORY.md"), "# Customer A\n");
+    const got = resolveMemoryDirs(cwdA, { exactOnly: true });
+    expect(got.project?.dir).toContain("customer-a");
   });
 });
 
