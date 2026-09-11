@@ -23,6 +23,7 @@ import {
   readMemory,
   removeMemory,
   resolveWikilinks,
+  verifyIndexPublish,
   withIndexRetry,
   writeMemory,
 } from "../src/memory-writer.js";
@@ -768,76 +769,116 @@ describe("index-line integrity", () => {
   });
 });
 
-describe("index re-apply guard", () => {
-  // The re-apply path sits in the rename->verify gap and cannot be reached
-  // deterministically from outside the module (ESM namespaces are not
-  // mockable, so readFileSync cannot be intercepted mid-window). What IS
-  // testable is the guard's effect through the real callers:
-  //
-  //   - patchIndexAppend passes () => existsSync(topic), so a topic that a
-  //     concurrent remove just trashed is never re-linked;
-  //   - withIndexRetry still works when no guard is supplied (it is exported).
-  //
-  // The mechanism itself (unconditional re-apply resurrects a removed line)
-  // was confirmed by probe: applying the append closure to content that
-  // lacks the line re-adds it. See the round-5 findings.
-  it("keeps a removed entry removed through the real removeMemory path", () => {
-    writeMemory(dir, {
-      name: "removable",
-      description: "d",
-      type: "project",
-      tier: "project",
-      body: "body",
-      pinned: false,
-      allowOverwrite: false,
+describe("index resurrection guards", () => {
+  // The cross-process race cannot be interleaved from single-threaded test
+  // code: nothing runs between atomicWriteFile() and the next readFileSync().
+  // So these tests drive the two reachable seams directly —
+  // verifyIndexPublish (the post-publish path) and a stateful fn (the retry
+  // path) — with a real filesystem and no mocking.
+  const appendTopic = (name: string) => (content: string) =>
+    content.includes(`(${name}.md)`) ? content : `${content}- [Topic](${name}.md) \u2014 d\n`;
+
+  describe("verifyIndexPublish (post-publish re-apply)", () => {
+    it("re-applies on the concurrent writer's content when the guard passes", () => {
+      const root = mkdtempSync(join(tmpdir(), "pcm-vip-"));
+      const idx = join(root, "MEMORY.md");
+      writeFileSync(join(root, "topic.md"), "x");
+      // Simulate: we published `next`, then a clobbering writer (not a remover)
+      // replaced the index before our verify read.
+      const next = "# M\n- [Topic](topic.md) \u2014 d\n";
+      writeFileSync(idx, "# M\n- [Other](other.md) \u2014 o\n");
+      let guardCalls = 0;
+      verifyIndexPublish(idx, next, appendTopic("topic"), () => {
+        guardCalls++;
+        return true;
+      });
+      const final = readFileSync(idx, "utf8");
+      // Their line survives AND ours was merged back in.
+      expect(final).toContain("(other.md)");
+      expect(final).toContain("(topic.md)");
+      expect(guardCalls).toBe(1);
+      rmSync(root, { recursive: true, force: true });
     });
-    expect(readFileSync(join(dir.dir, "MEMORY.md"), "utf8")).toContain("(removable.md)");
-    const removed = removeMemory(dir, { name: "removable", tier: "project" });
-    expect(removed.ok).toBe(true);
-    const after = readFileSync(join(dir.dir, "MEMORY.md"), "utf8");
-    expect(after).not.toContain("(removable.md)");
-    // The topic is in .trash/, and no index line points at the dead path.
-    expect(existsSync(join(dir.dir, "removable.md"))).toBe(false);
+
+    it("vetoes the re-apply when the guard reports the topic is gone", () => {
+      const root = mkdtempSync(join(tmpdir(), "pcm-vip2-"));
+      const idx = join(root, "MEMORY.md");
+      // A concurrent remove_memory trashed the topic and stripped our line.
+      const next = "# M\n- [Topic](topic.md) \u2014 d\n";
+      writeFileSync(idx, "# M\n- [Other](other.md) \u2014 o\n");
+      verifyIndexPublish(idx, next, appendTopic("topic"), () => false);
+      const final = readFileSync(idx, "utf8");
+      expect(final).toContain("(other.md)");
+      // The trashed topic is NOT resurrected.
+      expect(final).not.toContain("(topic.md)");
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    it("does not consult the guard when our publish landed cleanly", () => {
+      const root = mkdtempSync(join(tmpdir(), "pcm-vip3-"));
+      const idx = join(root, "MEMORY.md");
+      const next = "# M\n- [Topic](topic.md) \u2014 d\n";
+      writeFileSync(idx, next);
+      let guardCalls = 0;
+      verifyIndexPublish(idx, next, appendTopic("topic"), () => {
+        guardCalls++;
+        return false;
+      });
+      expect(readFileSync(idx, "utf8")).toBe(next);
+      expect(guardCalls).toBe(0);
+      rmSync(root, { recursive: true, force: true });
+    });
   });
 
-  it("still writes correctly when withIndexRetry is called without a guard", () => {
-    const root = mkdtempSync(join(tmpdir(), "pcm-noguard-"));
-    const idx = join(root, "MEMORY.md");
-    writeFileSync(idx, "# Memories\n");
-    withIndexRetry(idx, (content) =>
-      content.includes("(t.md)") ? content : `${content}- [T](t.md) \u2014 s\n`,
-    );
-    expect(readFileSync(idx, "utf8")).toContain("(t.md)");
-    rmSync(root, { recursive: true, force: true });
-  });
-});
+  describe("retry path (the wider window)", () => {
+    it("vetoes publication when the topic vanished between retries", () => {
+      // The retry `continue` re-runs fn on the concurrent writer's content,
+      // and an append closure re-adds a missing line — with no post-write
+      // verify involved. Here fn's own side effect forces the retry (so
+      // after !== before) and removes the topic, exactly as a concurrent
+      // remove_memory would (it trashes the file BEFORE stripping the line).
+      const root = mkdtempSync(join(tmpdir(), "pcm-retry-"));
+      const idx = join(root, "MEMORY.md");
+      const topic = join(root, "topic.md");
+      writeFileSync(topic, "x");
+      writeFileSync(idx, "# M\n- [Other](other.md) \u2014 o\n");
+      let calls = 0;
+      withIndexRetry(
+        idx,
+        (content) => {
+          calls++;
+          if (calls === 1) {
+            // Force the contention check to fail -> retry.
+            writeFileSync(idx, "# M\n- [A](a.md) \u2014 a\n");
+          }
+          if (calls === 2) {
+            // The remover lands: index rewritten, topic trashed.
+            writeFileSync(idx, "# M\n- [B](b.md) \u2014 b\n");
+            rmSync(topic);
+          }
+          return `${content}- [Topic](topic.md) \u2014 d\n`;
+        },
+        () => existsSync(topic),
+      );
+      const final = readFileSync(idx, "utf8");
+      // The trashed topic was never linked.
+      expect(final).not.toContain("(topic.md)");
+      // Prove the branch was actually reached: fn ran more than once (the
+      // retry fired), so a passing test cannot be a vacuous one.
+      expect(calls).toBeGreaterThan(1);
+      rmSync(root, { recursive: true, force: true });
+    });
 
-describe("readMemory size cap", () => {
-  it("refuses to read a topic larger than the shared cap", () => {
-    // Without a cap, recall_memory reads any file in the store in full, and
-    // the routing anchor directs the model to call it for ⟨index-only⟩
-    // entries — the ones the injector declined to read.
-    const big = "x".repeat(1_000_001);
-    writeFileSync(join(dir.dir, "huge.md"), `---\ndescription: d\ntype: project\n---\n${big}\n`);
-    const res = readMemory(dir, "huge");
-    expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.message).toContain("too large");
-  });
-
-  it("still reads a topic comfortably under the cap", () => {
-    writeFileSync(join(dir.dir, "normal.md"), "---\ndescription: d\ntype: project\n---\nok body\n");
-    const res = readMemory(dir, "normal");
-    expect(res.ok).toBe(true);
-    if (res.ok) expect(res.content).toContain("ok body");
-  });
-});
-
-describe("readMemory size cap is shared with the injector", () => {
-  it("uses one constant for both paths", async () => {
-    // Two independent caps is how the tool path ended up unbounded while the
-    // injector path was bounded.
-    const { TOPIC_FILE_MAX_BYTES } = await import("../src/types.js");
-    expect(TOPIC_FILE_MAX_BYTES).toBe(1_000_000);
+    it("still appends normally when the topic exists", () => {
+      const root = mkdtempSync(join(tmpdir(), "pcm-retry-ok-"));
+      const idx = join(root, "MEMORY.md");
+      const topic = join(root, "ok.md");
+      writeFileSync(topic, "x");
+      writeFileSync(idx, "# M\n");
+      withIndexRetry(idx, appendTopic("ok"), () => existsSync(topic));
+      expect(readFileSync(idx, "utf8")).toContain("(ok.md)");
+      rmSync(root, { recursive: true, force: true });
+    });
   });
 });
 

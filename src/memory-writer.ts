@@ -722,55 +722,73 @@ export function withIndexRetry(
     } else {
       debugLog("writer.index_retry_exhausted", { attempt, indexPath });
     }
-    atomicWriteFile(indexPath, next);
-    // Post-write verify: the re-read above guards only the window between
-    // read and re-read (pure string ops — microseconds), but the window
-    // between the re-read and the rename contains a full write+rename and is
-    // strictly LARGER. Verify what landed; if another writer replaced the
-    // index in that gap, re-apply the mutation once on their content so our
-    // entry is merged rather than lost.
+    // Guard EVERY publication, not just the post-write re-apply. The retry
+    // `continue` above is a second way to reach a publish: when contention is
+    // detected, the loop re-reads and re-runs `fn` on the concurrent writer's
+    // content — and an append closure re-adds a missing line there too. If the
+    // concurrent writer was a remover, that content has no line for us and the
+    // topic is already in .trash/, so without this check the retry publishes a
+    // link to a trashed file. This window is strictly wider than the
+    // rename->verify one (it needs only a concurrent index change between our
+    // two reads), and it was the more reachable of the two.
     //
-    // The re-apply is NOT unconditional. Re-running an append closure on
-    // someone else's content re-adds a line they may have deliberately
-    // removed: if a concurrent remove_memory stripped our line AND trashed
-    // the topic in this window, blindly re-applying resurrects a link to a
-    // file that is already in .trash/. verifyGuard lets the caller veto the
-    // re-apply when the topic it would link to no longer exists.
-    let landed: string;
-    try {
-      landed = readFileSync(indexPath, "utf8");
-    } catch {
-      // Index vanished post-write (concurrent removal) — nothing sane to do.
-      // Narrowed to the read: failures of the corrective write below must
-      // surface rather than masquerade as a missing index.
-      return;
-    }
-    if (landed === next) return; // our publish landed cleanly; nothing to do
-    // A writer replaced the index in the rename->verify gap. Re-run the
-    // mutation on THEIR content so our entry merges instead of being lost.
-    //
-    // The re-apply is not unconditional: an append closure cannot tell
-    // "my line was removed" from "my line was never added", so blindly
-    // re-running it re-links a topic a concurrent remove just trashed.
-    // verifyGuard lets the caller veto exactly that case.
+    // On the ordinary path the topic was just written, so this is one
+    // existsSync that always passes.
     if (verifyGuard && !verifyGuard()) {
-      debugLog("writer.index_reapply_vetoed", { indexPath });
+      debugLog("writer.index_publish_vetoed", { indexPath, attempt });
       return;
     }
-    // Re-read rather than reusing `landed`: the guard ran in between, and
-    // re-applying to a stale snapshot would clobber what landed since.
-    let fresh: string;
-    try {
-      fresh = readFileSync(indexPath, "utf8");
-    } catch {
-      return;
-    }
-    const reapplied = fn(fresh);
-    if (reapplied !== null && reapplied !== fresh) {
-      atomicWriteFile(indexPath, reapplied);
-      debugLog("writer.index_postwrite_reapply", { indexPath });
-    }
+    atomicWriteFile(indexPath, next);
+    verifyIndexPublish(indexPath, next, fn, verifyGuard);
     return;
+  }
+}
+
+/** Post-publish verification, with a guarded one-shot re-apply.
+ *
+ * Exported for tests. The race it handles is CROSS-PROCESS — a writer landing
+ * between our rename and this read — so a single-threaded test cannot
+ * interleave it and should pre-clobber the index and call this directly
+ * instead.
+ *
+ * Why the re-apply exists at all: a topic file with no index line is invisible
+ * to every injection (silent memory loss), whereas a stale link is a cosmetic
+ * dangling href that reconcileIndex already reports. When a concurrent writer
+ * replaced the index after our publish, re-running the mutation on THEIR
+ * content merges our entry back in rather than dropping it.
+ *
+ * Why it is guarded: an append closure cannot tell "my line was removed" from
+ * "my line was never added". Re-applying unconditionally re-links a topic that
+ * a concurrent remove_memory deliberately trashed. verifyGuard resolves the
+ * ambiguity at the filesystem level — and it is sound rather than racy because
+ * removeMemory trashes the topic BEFORE it strips the index line, so by the
+ * time the remover's index write lands the topic is already gone. */
+export function verifyIndexPublish(
+  indexPath: string,
+  next: string,
+  fn: (content: string) => string | null,
+  verifyGuard?: () => boolean,
+): void {
+  let landed: string;
+  try {
+    landed = readFileSync(indexPath, "utf8");
+  } catch {
+    // Index vanished post-write (concurrent removal) — nothing sane to do.
+    // Narrowed to the read: failures of the corrective write below must
+    // surface rather than masquerade as a missing index.
+    return;
+  }
+  if (landed === next) return; // our publish landed cleanly; nothing to do
+  // A writer replaced the index in the rename->verify gap. Re-run the mutation
+  // on THEIR content so our entry merges instead of being lost.
+  if (verifyGuard && !verifyGuard()) {
+    debugLog("writer.index_reapply_vetoed", { indexPath });
+    return;
+  }
+  const reapplied = fn(landed);
+  if (reapplied !== null && reapplied !== landed) {
+    atomicWriteFile(indexPath, reapplied);
+    debugLog("writer.index_postwrite_reapply", { indexPath });
   }
 }
 
