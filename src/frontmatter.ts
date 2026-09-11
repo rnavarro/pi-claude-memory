@@ -41,10 +41,11 @@ export function parseMemoryContent(
   filename: string,
   mtimeMs: number,
 ): ParsedFrontmatter {
-  const { frontmatter, body, hasFrontmatter } = splitFrontmatter(content);
+  const { body, hasFrontmatter, raw: parsedRaw } = splitFrontmatter(content);
 
-  if (!hasFrontmatter || frontmatter === null) {
-    // Gen 3: no frontmatter
+  if (!hasFrontmatter) {
+    // Gen 3: no usable frontmatter (absent, or a Markdown block that is not a
+    // YAML mapping — splitFrontmatter preserves the original text in that case)
     return {
       name: filename.replace(/\.md$/, ""),
       description: extractFirstHeading(body) || filename.replace(/\.md$/, ""),
@@ -58,7 +59,7 @@ export function parseMemoryContent(
     };
   }
 
-  const raw = parseYamlFrontmatter(frontmatter) ?? {};
+  const raw = parsedRaw ?? {};
   const name = extractString(raw, "name") ?? filename.replace(/\.md$/, "");
   const description = extractString(raw, "description") ?? "";
   const type = extractType(raw, filename);
@@ -84,27 +85,39 @@ function splitFrontmatter(content: string): {
   frontmatter: string | null;
   body: string;
   hasFrontmatter: boolean;
+  raw: Record<string, unknown> | null;
 } {
-  // Must start with --- on the first line
-  if (!content.startsWith(FRONTMATTER_DELIM)) {
-    return { frontmatter: null, body: content, hasFrontmatter: false };
+  const none = { frontmatter: null, body: content, hasFrontmatter: false, raw: null };
+  // The opening delimiter must be exactly `---` on its own first line. A
+  // `----` line is a Markdown horizontal rule, not a frontmatter opener.
+  const firstLine = content.split("\n", 1)[0].trim();
+  if (firstLine !== FRONTMATTER_DELIM) {
+    return none;
   }
 
   const lines = content.split("\n");
   // Find the closing ---
   for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === FRONTMATTER_DELIM) {
-      const frontmatter = lines.slice(1, i).join("\n");
-      const body = lines
-        .slice(i + 1)
-        .join("\n")
-        .replace(/^\n+/, ""); // strip leading blank lines
-      return { frontmatter, body, hasFrontmatter: true };
+    if (lines[i].trim() !== FRONTMATTER_DELIM) continue;
+    const frontmatter = lines.slice(1, i).join("\n");
+    const raw = parseYamlFrontmatter(frontmatter);
+    // Only treat the block as frontmatter when it PARSES as a YAML mapping.
+    // Otherwise it is Markdown that merely sits between two `---` rule lines
+    // (a YAML scalar, or prose): stripping it deleted those bytes from the
+    // body AND produced an empty metadata map, so the content vanished from
+    // both injection and recall. Keep the original text intact instead.
+    if (raw === null) {
+      return none;
     }
+    const body = lines
+      .slice(i + 1)
+      .join("\n")
+      .replace(/^\n+/, ""); // strip leading blank lines
+    return { frontmatter, body, hasFrontmatter: true, raw };
   }
 
   // No closing delimiter — treat as no frontmatter
-  return { frontmatter: null, body: content, hasFrontmatter: false };
+  return none;
 }
 
 /** Parse YAML frontmatter string into a record. Returns null on parse error. */
