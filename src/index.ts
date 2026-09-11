@@ -461,7 +461,7 @@ function handleTurnEnd(_event: TurnEndEvent, ctx: ExtensionContext): void {
 function handleToolResult(event: ToolResultEvent, ctx: ExtensionContext): void {
   const text = toolResultToText(event);
   if (text) {
-    appendToToolResultChunk(text);
+    toolResultChunk = appendToToolResultChunk(toolResultChunk, text);
     withDebugLogContext(
       { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
       () => debugLog("tool_result.captured", { toolName: event.toolName, chars: text.length }),
@@ -548,8 +548,9 @@ function serializeEntries(entries: SessionEntry[] | undefined): string {
   return serializeMessageEntries(messages);
 }
 
-/** Shared serializer for a list of message entries. */
-function serializeMessageEntries(entries: SessionMessageEntry[]): string {
+/** Shared serializer for a list of message entries. Exported for tests: it is
+ * pure over a message list and decides what the reviewer ever sees. */
+export function serializeMessageEntries(entries: SessionMessageEntry[]): string {
   // Take the last ~20 messages to stay within a reasonable size for the LLM.
   const recent = entries.slice(-20);
   const parts: string[] = [];
@@ -582,8 +583,9 @@ function serializeMessageEntries(entries: SessionMessageEntry[]): string {
   return parts.join("\n\n");
 }
 
-/** Convert a tool result event to text for the auto-learn chunk. */
-function toolResultToText(event: ToolResultEvent): string {
+/** Convert a tool result event to text for the auto-learn chunk.
+ * Exported for tests: pure over the event. */
+export function toolResultToText(event: ToolResultEvent): string {
   const toolName = "toolName" in event ? event.toolName : "unknown";
   const parts = event.content
     .map((c) => {
@@ -595,19 +597,23 @@ function toolResultToText(event: ToolResultEvent): string {
   return `#### ${toolName}\n${parts.join("\n")}`;
 }
 
-/** Append text to the tool result chunk, capping total size. */
-function appendToToolResultChunk(text: string): void {
-  if (!text) return;
-  const sep = toolResultChunk ? "\n\n" : "";
-  let combined = toolResultChunk + sep + text;
-  // Clamp to the cap by keeping the most recent content (tail). This also
-  // bounds the buffer when a single result exceeds the cap (the previous
+/** Append text to a tool-result buffer, capping total size.
+ *
+ * Pure and exported for tests: the clamp math (and the oversized-single-result
+ * case the previous slice(overflow+1) version got wrong) needs no module state
+ * to exercise. Callers hold the buffer themselves. */
+export function appendToToolResultChunk(current: string, text: string): string {
+  if (!text) return current;
+  const sep = current ? "\n\n" : "";
+  const combined = current + sep + text;
+  // Clamp by keeping the most recent content (tail). This also bounds the
+  // buffer when a single result exceeds the cap (the previous
   // slice(overflow+1) math left the buffer at MAX+1 and could exceed it
   // entirely for an oversized single result).
   if (combined.length > TOOL_RESULT_MAX_CHARS) {
-    combined = combined.slice(combined.length - TOOL_RESULT_MAX_CHARS);
+    return combined.slice(combined.length - TOOL_RESULT_MAX_CHARS);
   }
-  toolResultChunk = combined;
+  return combined;
 }
 
 /** Launch an auto-learn review with single-flight tracking.
