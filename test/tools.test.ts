@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodePath } from "../src/resolver.js";
-import { recallMemoryTool, removeMemoryTool, writeMemoryTool } from "../src/tools.js";
+import {
+  recallMemoryTool,
+  registerMemoryTools,
+  removeMemoryTool,
+  writeMemoryTool,
+} from "../src/tools.js";
 
 let tmpHome: string;
 let origHome: string | undefined;
@@ -352,5 +357,42 @@ describe("remove_memory cleans every index that references the topic", () => {
     expect(existsSync(join(projDir, "foo.md"))).toBe(true);
     expect(existsSync(join(globalDir, "foo.md"))).toBe(true);
     expect(readFileSync(join(globalDir, "MEMORY.md"), "utf8")).toContain("(foo.md)");
+  });
+});
+
+describe("registered tools run inside a debug-log context", () => {
+  it("emits tool-path diagnostics with no hand-established context", async () => {
+    // Tool calls arrive OUTSIDE the lifecycle handlers, so no AsyncLocalStorage
+    // context is active. Every debugLog in the read/write/remove path was
+    // silently discarded in production: the ambiguity diagnostic proved below
+    // existed, was unreachable, and a test that wrapped the call by hand passed
+    // anyway. Reaching the tool through registerMemoryTools is the point — it
+    // is the only path production uses.
+    const cwd = join(tmpHome, "work", "logged");
+    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    mkdirSync(projDir, { recursive: true });
+    writeFileSync(join(projDir, "MEMORY.md"), "# M\n");
+    // Two stems that slugify alike make readMemory log the ambiguity.
+    writeFileSync(join(projDir, "Foo Bar.md"), "---\ndescription: a\ntype: reference\n---\nA\n");
+    writeFileSync(join(projDir, "FOO  BAR.md"), "---\ndescription: b\ntype: reference\n---\nB\n");
+
+    const registered: Array<{ name: string; execute: (...a: unknown[]) => Promise<unknown> }> = [];
+    registerMemoryTools({
+      registerTool: (t: never) => {
+        registered.push(t);
+      },
+    } as never);
+    const tool = registered.find((t) => t.name === "recall_memory");
+    if (!tool) throw new Error("recall_memory was not registered");
+
+    await tool.execute("t1", { name: "foo bar" }, undefined, undefined, { cwd });
+
+    // No session_start ran, so the logger falls back to debug.ndjson under the
+    // agent dir this test controls through HOME.
+    const logPath = join(tmpHome, ".pi", "agent", "pi-claude-memory", "debug.ndjson");
+    expect(existsSync(logPath)).toBe(true);
+    const logged = readFileSync(logPath, "utf8");
+    expect(logged).toContain("tool.recall_memory");
+    expect(logged).toContain("topic_ambiguous");
   });
 });

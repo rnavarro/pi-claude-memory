@@ -97,6 +97,17 @@ let toolResultChunk = "";
 // Session ID for debug log file naming.
 let currentSessionId: string | undefined;
 
+/** Run a tool body inside the debug-log context for that call.
+ *
+ * Tool invocations arrive OUTSIDE the lifecycle handlers, so no
+ * AsyncLocalStorage context is active and every debugLog in the read/write/
+ * remove path was silently discarded: the diagnostics existed, and a test that
+ * established the context by hand passed, while production emitted nothing at
+ * all. */
+export function withToolLogContext<T>(cwd: string, fn: () => T): T {
+  return withDebugLogContext({ enabled: config.debugLog, cwd, sessionId: currentSessionId }, fn);
+}
+
 /** Extract session ID from extension context (best-effort). */
 function getSessionId(ctx: ExtensionContext): string | undefined {
   try {
