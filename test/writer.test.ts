@@ -1237,3 +1237,57 @@ describe("writer index reads are guarded like the parser's", () => {
     expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).toContain("(delta.md)");
   });
 });
+
+describe("write-time size validation", () => {
+  // The read paths cap topics at TOPIC_FILE_MAX_BYTES, but publication had no
+  // corresponding check: a larger body reported success, got an index line, and
+  // was then unreadable through recall_memory and silently dropped from
+  // injection. An over-long description could push MEMORY.md past the parser's
+  // cap instead, which makes parseIndexFile return null and hides EVERY entry
+  // in that tier.
+  const write = (name: string, body: string, description = `desc ${name}`) =>
+    writeMemory(dir, {
+      name,
+      description,
+      type: "project",
+      body,
+      pinned: false,
+      tier: "project",
+      allowOverwrite: false,
+    });
+
+  it("refuses a body the read paths would reject", () => {
+    const res = write("huge", "x".repeat(1_000_001));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.message).toContain("too large to write");
+    // Nothing half-written, and no index line for a body nobody can read.
+    expect(existsSync(join(tmpDir, "huge.md"))).toBe(false);
+  });
+
+  it("accepts a body just under the cap", () => {
+    const res = write("oksize", "y".repeat(999_000));
+    expect(res.ok).toBe(true);
+    const read = readMemory(dir, "oksize");
+    expect(read.ok).toBe(true);
+  });
+
+  it("refuses an index update that would cross the parser's cap", () => {
+    // Index sits just below INDEX_MAX_BYTES; a long description pushes the
+    // line past it, which would make the whole tier unparseable.
+    const line = "- [Filler](filler.md) — f\n";
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    // Sit just under the cap, sized in BYTES (the em-dash is 3 bytes).
+    const filler = `# M\n${line.repeat(Math.floor(950_000 / lineBytes))}`;
+    writeFileSync(join(tmpDir, "MEMORY.md"), filler);
+    const before = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
+    expect(Buffer.byteLength(before, "utf8")).toBeLessThan(1_000_000);
+
+    // The topic itself stays under the topic cap, so only the INDEX crosses.
+    const res = write("bigdesc", "body", "d".repeat(80_000));
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain("index update failed");
+    expect(res.message).toContain("cap");
+    // The existing index is untouched rather than truncated or corrupted.
+    expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).toBe(before);
+  });
+});
