@@ -56,7 +56,29 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
 
 const SETTINGS_KEY = "pi-claude-memory";
 
-/** Load config from Pi's settings.json, merged with defaults. */
+/** Validate a numeric config field: must be a finite integer within [min,max].
+ * Non-numeric, fractional, non-finite, or out-of-range values fall back to the
+ * default with a loud warning — a fractional shutdownTimeoutMs would
+ * previously reach AbortSignal.timeout and throw, a negative interval made
+ * every settle qualify, and JSON can carry non-finite values past typeof
+ * checks (Infinity, 1e999 parses to Infinity). */
+export function num(
+  value: unknown,
+  field: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    console.error(
+      `[pi-claude-memory] invalid value for ${field}: ${JSON.stringify(value)} ` +
+        `(must be an integer in [${min}, ${max}]) — using default ${fallback}`,
+    );
+    return fallback;
+  }
+  return value;
+}
+
 export function loadConfig(): PiClaudeMemoryConfig {
   const globalPath = join(getAgentDir(), "settings.json");
   if (!existsSync(globalPath)) return { ...DEFAULT_CONFIG };
@@ -73,23 +95,73 @@ export function loadConfig(): PiClaudeMemoryConfig {
       ...(typeof n.debugLog === "boolean" ? { debugLog: n.debugLog } : {}),
       ...(typeof n.autoLearn === "boolean" ? { autoLearn: n.autoLearn } : {}),
       ...(typeof n.reviewIntervalTurns === "number"
-        ? { reviewIntervalTurns: n.reviewIntervalTurns }
+        ? {
+            reviewIntervalTurns: num(
+              n.reviewIntervalTurns,
+              "reviewIntervalTurns",
+              DEFAULT_CONFIG.reviewIntervalTurns,
+              1,
+              1000,
+            ),
+          }
         : {}),
-      ...(typeof n.injectTokenCap === "number" ? { injectTokenCap: n.injectTokenCap } : {}),
+      ...(typeof n.injectTokenCap === "number"
+        ? {
+            injectTokenCap: num(
+              n.injectTokenCap,
+              "injectTokenCap",
+              DEFAULT_CONFIG.injectTokenCap,
+              0,
+              1000000,
+            ),
+          }
+        : {}),
       ...(isModelObj(n.reviewModel) ? { reviewModel: n.reviewModel } : {}),
       ...(isThinkingLevel(n.reviewThinking) ? { reviewThinking: n.reviewThinking } : {}),
       ...(typeof n.reviewMaxOutputTokens === "number"
-        ? { reviewMaxOutputTokens: n.reviewMaxOutputTokens }
+        ? {
+            reviewMaxOutputTokens: num(
+              n.reviewMaxOutputTokens,
+              "reviewMaxOutputTokens",
+              DEFAULT_CONFIG.reviewMaxOutputTokens,
+              1,
+              200000,
+            ),
+          }
         : {}),
       ...(typeof n.reviewMaxChunkChars === "number"
-        ? { reviewMaxChunkChars: n.reviewMaxChunkChars }
+        ? {
+            reviewMaxChunkChars: num(
+              n.reviewMaxChunkChars,
+              "reviewMaxChunkChars",
+              DEFAULT_CONFIG.reviewMaxChunkChars,
+              1,
+              10000000,
+            ),
+          }
         : {}),
       ...(typeof n.reviewOnShutdown === "boolean" ? { reviewOnShutdown: n.reviewOnShutdown } : {}),
       ...(typeof n.shutdownMinChunkChars === "number"
-        ? { shutdownMinChunkChars: n.shutdownMinChunkChars }
+        ? {
+            shutdownMinChunkChars: num(
+              n.shutdownMinChunkChars,
+              "shutdownMinChunkChars",
+              DEFAULT_CONFIG.shutdownMinChunkChars,
+              0,
+              10000000,
+            ),
+          }
         : {}),
       ...(typeof n.shutdownTimeoutMs === "number"
-        ? { shutdownTimeoutMs: n.shutdownTimeoutMs }
+        ? {
+            shutdownTimeoutMs: num(
+              n.shutdownTimeoutMs,
+              "shutdownTimeoutMs",
+              DEFAULT_CONFIG.shutdownTimeoutMs,
+              100,
+              600000,
+            ),
+          }
         : {}),
       ...(typeof n.reviewOnCompact === "boolean" ? { reviewOnCompact: n.reviewOnCompact } : {}),
     };

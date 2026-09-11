@@ -621,6 +621,24 @@ export function withIndexRetry(indexPath: string, fn: (content: string) => strin
       debugLog("writer.index_retry_exhausted", { attempt, indexPath });
     }
     atomicWriteFile(indexPath, next);
+    // Post-write verify: the re-read above guards only the window between
+    // read and re-read (pure string ops — microseconds), but the window
+    // between the re-read and the rename contains a full write+rename and is
+    // strictly LARGER. Verify what landed; if another writer replaced the
+    // index in that gap, re-apply the mutation once on their content so our
+    // entry is merged rather than lost.
+    try {
+      const landed = readFileSync(indexPath, "utf8");
+      if (landed !== next) {
+        const reapplied = fn(landed);
+        if (reapplied !== null && reapplied !== landed) {
+          atomicWriteFile(indexPath, reapplied);
+          debugLog("writer.index_postwrite_reapply", { indexPath });
+        }
+      }
+    } catch {
+      // index vanished post-write (concurrent removal) — nothing sane to do
+    }
     return;
   }
 }

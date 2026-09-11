@@ -321,7 +321,7 @@ describe("createProjectMemoryDir split-brain warning", () => {
       expect(
         errCalls.some((m) => m.includes("NEW project store") && m.includes(otherEncoded)),
       ).toBe(true);
-      expect(errCalls.some((m) => m.includes("shadow"))).toBe(true);
+      expect(errCalls.some((m) => m.includes("split-brain"))).toBe(true);
       // The new exact store dir was created anyway (writes must succeed;
       // MEMORY.md itself appears on first write).
       expect(existsSync(created.dir)).toBe(true);

@@ -129,10 +129,18 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   // loudly instead of silently orphaning it.
   const siblings = findProjectCandidates(absCwd.split(sep).pop() ?? absCwd);
   if (siblings.length > 0) {
+    // Suffix matching is heuristic: "/home/x/my-<basename>" also ends with
+    // "-<basename>", so candidates can be unrelated stores. Worded as
+    // "possible" and hedged accordingly — but still surfaced: the cost of
+    // a false positive is one console line, the cost of a missed real
+    // split-brain is silently shadowed memories.
     console.error(
-      `[pi-claude-memory] creating a NEW project store for ${absCwd} while ${siblings.length} ` +
-        `basename-matched store(s) already exist (${siblings.join(", ")}). Those memories will be ` +
-        `shadowed by the new store — rename an existing dir to ${encoded} to adopt them.`,
+      `[pi-claude-memory] creating a NEW project store for ${absCwd}. ` +
+        `Possible rename split-brain: ${siblings.length} store(s) whose encoded ` +
+        `names end in "-${absCwd.split(sep).pop()}" already exist ` +
+        `(${siblings.join(", ")}) — possibly unrelated projects. If one IS a ` +
+        `renamed cwd of this project, rename it to ${encoded} to adopt its ` +
+        `memories; otherwise ignore this notice.`,
     );
     debugLog("resolver.split_brain_shadows_existing_store", {
       cwd: absCwd,

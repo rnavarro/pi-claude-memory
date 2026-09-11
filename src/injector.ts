@@ -8,8 +8,8 @@
 // 5. Large files get index-only with ⟨index-only⟩ marker (model can fetch via recall_memory)
 // 6. Project tier injected first so it wins the shared budget (see buildMemoryInjection)
 
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { basename } from "node:path";
+import { lstatSync, readFileSync } from "node:fs";
+import { basename, resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
@@ -83,13 +83,13 @@ export function buildMemoryInjection(
   let hasAnyEntries = false;
 
   if (project) {
-    const block = buildTierInjection(project, project.label, budget, warnings);
+    const block = buildTierInjection(project, project.label, budget, warnings, global?.dir);
     if (block.text) blocks.push(block.text);
     if (block.hasEntries) hasAnyEntries = true;
   }
 
   if (global) {
-    const block = buildTierInjection(global, "Global", budget, warnings);
+    const block = buildTierInjection(global, "Global", budget, warnings, project?.dir);
     if (block.text) blocks.push(block.text);
     if (block.hasEntries) hasAnyEntries = true;
   }
@@ -122,6 +122,7 @@ function buildTierInjection(
   label: string,
   budget: { remaining: number },
   warnings: string[],
+  otherTierDir?: string | null,
 ): InjectionBlock {
   const parsed = parseIndexFile(dir);
   if (!parsed) {
@@ -145,9 +146,12 @@ function buildTierInjection(
   }
 
   // Load all topic files
+  // otherTierDir approves cross-tier absolute hrefs (a project index linking
+  // to a global topic) while rejecting everything outside the two stores.
   const files = loadTopicFiles(
     dir,
     parsed.entries.map((e) => e.filePath),
+    otherTierDir,
   );
   if (recon.unindexed.length > 0) {
     warnings.push(
@@ -200,29 +204,79 @@ function buildTierInjection(
   };
 }
 
-/** Load topic files from disk, keyed by filePath. */
-function loadTopicFiles(_dir: MemoryDir, filePaths: string[]): Map<string, MemoryFile> {
+/** Topic files larger than this are skipped outright (not just filtered by
+ * the token budget): the size check runs BEFORE reading so a huge non-memory
+ * file linked from a hand-edited index cannot flood the read. */
+const TOPIC_FILE_MAX_BYTES = 1_000_000;
+
+/** Load topic files from disk, keyed by filePath.
+ *
+ * Read-side containment: index hrefs resolve to arbitrary paths (including
+ * absolute cross-tier links), so each file is validated against the
+ * approved memory roots (its own tier's dir plus the other tier's dir) with
+ * lexical containment, must be a plain regular file (lstat rejects symlinks
+ * — a symlinked "topic" could point anywhere on disk), and must be under
+ * the size cap — all BEFORE any bytes are read into what becomes the system
+ * prompt. */
+function loadTopicFiles(
+  dir: MemoryDir,
+  filePaths: string[],
+  otherTierDir?: string | null,
+): Map<string, MemoryFile> {
+  const allowedRoots = [resolve(dir.dir)];
+  if (otherTierDir) allowedRoots.push(resolve(otherTierDir));
   const files = new Map<string, MemoryFile>();
   for (const filePath of filePaths) {
-    if (!existsSync(filePath)) continue;
     try {
-      const filename = basename(filePath);
+      const resolvedPath = resolve(filePath);
+      // Containment: only files inside an approved memory root may enter
+      // the prompt. A hand-edited index line pointing at /etc/passwd or
+      // ../secrets gets skipped here, before any read.
+      const contained = allowedRoots.some(
+        (r) => resolvedPath === r || resolvedPath.startsWith(`${r}${sep}`),
+      );
+      if (!contained) {
+        debugLog("injector.topic_containment_reject", { filePath, tier: dir.tier });
+        continue;
+      }
+      // Regular plain files only: a symlinked topic could lead outside the
+      // store; directories/fifos are never memory topics.
+      let st: import("node:fs").Stats;
+      try {
+        st = lstatSync(resolvedPath);
+      } catch {
+        continue;
+      }
+      if (st.isSymbolicLink() || !st.isFile()) {
+        debugLog("injector.topic_not_regular_file", { filePath, tier: dir.tier });
+        continue;
+      }
+      // Size cap before reading.
+      if (st.size > TOPIC_FILE_MAX_BYTES) {
+        debugLog("injector.topic_oversize_skip", {
+          filePath,
+          size: st.size,
+          cap: TOPIC_FILE_MAX_BYTES,
+        });
+        continue;
+      }
+      const filename = basename(resolvedPath);
       // Skip MEMORY.md itself
       if (filename === "MEMORY.md") continue;
       // One read + one stat per file: read the bytes once, stat for mtime,
       // and parse from the in-memory string (parseMemoryContent) instead of
       // having parseMemoryFile read the file a second time.
-      const content = readFileSync(filePath, "utf8");
+      const content = readFileSync(resolvedPath, "utf8");
       let mtime = 0;
       try {
-        mtime = statSync(filePath).mtimeMs;
+        mtime = st.mtimeMs;
       } catch {
         // stat failure — inject with mtime 0 (sorts last)
       }
       const frontmatter = parseMemoryContent(content, filename, mtime);
-      files.set(filePath, {
+      files.set(resolvedPath, {
         filename,
-        filePath,
+        filePath: resolvedPath,
         frontmatter,
         size: content.length,
         mtime,

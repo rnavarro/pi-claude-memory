@@ -97,7 +97,6 @@ interface MemoryCandidate {
  * @param cfg Auto-learn config
  * @param cwd Current working directory (for tier resolution)
  * @param chunk Recent conversation text to review
- * @param existingIndex Summary of existing memory entries (to avoid duplicates)
  * @returns number of memories written, or -1 on failure
  */
 export async function runAutoLearn(
@@ -105,7 +104,6 @@ export async function runAutoLearn(
   cfg: AutoLearnConfig,
   cwd: string,
   chunk: string,
-  existingIndex: string,
   signal?: AbortSignal,
 ): Promise<number> {
   if (!chunk.trim()) return 0;
@@ -127,6 +125,24 @@ export async function runAutoLearn(
     return -1;
   }
 
+  // Build the reviewer's view of the store HERE — after auth, from a fresh
+  // resolution — so the existing-index summary and the mtime snapshot agree
+  // with each other and with the dirs the write loop will use. Callers
+  // previously built the summary BEFORE auth (from the session's frozen,
+  // fuzzy resolution): a user edit during the auth wait made the snapshot
+  // newer than the summary the model reasoned from, and the overwrite guard
+  // would then accept clobbering that edit. One fresh resolve closes it.
+  // Auto-learn writes are mutations: exact project match only (no
+  // basename-glob fallback) so a review never writes into another project's
+  // store via a fuzzy match. For a new project this yields project=null and
+  // the project tier is created on first write below.
+  const resolved = resolveMemoryDirs(cwd, { exactOnly: true });
+  const existingIndex = buildExistingIndexSummary(resolved);
+  // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
+  // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
+  // silently clobbering a newer edit with a stale review decision.
+  const mtimes = snapshotMtimes([resolved.global, resolved.project]);
+
   const userText = `EXISTING MEMORY INDEX (avoid duplicates):
 ${existingIndex || "(empty — no existing memories)"}
 
@@ -145,16 +161,6 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       },
     ],
   };
-
-  // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
-  // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
-  // silently clobbering a newer edit with a stale review decision.
-  // Auto-learn writes are mutations: exact project match only (no
-  // basename-glob fallback) so a review never writes into another project's
-  // store via a fuzzy match. For a new project this yields project=null and
-  // the project tier is created on first write below.
-  const resolved = resolveMemoryDirs(cwd, { exactOnly: true });
-  const mtimes = snapshotMtimes([resolved.global, resolved.project]);
 
   // Follow pi-observational-memory's pattern: only pass reasoning if the
   // model supports it AND thinking is not "off". When thinking is "off",
