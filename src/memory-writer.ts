@@ -442,14 +442,23 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   try {
     patchIndexAppend(dir, {
       filename,
-      // Derive the display title from the SLUG, not the raw name: slugify
-      // strips characters that are not legal in a filename, and the index
-      // line interpolates the title inside [..]. A raw name containing ']'
-      // (e.g. "a]b" -> ab.md) produced `- [A]b](ab.md) — ...`, which no
-      // index regex can ever match, so every later write appended a
-      // duplicate and removal could not strip the line. Using the slug keeps
-      // title and filename in agreement by construction.
-      title: deriveTitle(slug),
+      // Derive the display title from the RESOLVED FILENAME STEM, not from the
+      // slug. Two reasons:
+      //
+      // 1. The index line interpolates the title inside [..]. A raw name
+      //    containing ']' (e.g. "a]b" -> ab.md) produced `- [A]b](ab.md) — ...`,
+      //    which no index regex can ever match, so every later write appended a
+      //    duplicate and removal could not strip the line. A filename stem has
+      //    already been through slugify OR was already a legal name on disk, so
+      //    it is safe here either way.
+      // 2. Deriving from the SLUG mangled titles for the many real entries whose
+      //    stems contain an underscore: slugify strips '_', so a supersession of
+      //    the real `feedback_prefer_jq.md` rewrote its line to
+      //    `- [Feedbackpreferjq](feedback_prefer_jq.md)`. Title and filename
+      //    disagreed — the opposite of what the previous comment here claimed.
+      //    The stem also keeps the title in agreement with the href by
+      //    construction, which is what the comment was reaching for.
+      title: deriveTitle(filename.replace(/\.md$/, "")),
       summary: req.description,
       pinned: req.pinned,
     });
@@ -462,9 +471,13 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
       label: dir.label,
       error: indexError,
     });
+    // Deliberately not rewritten by unrelated later writes. `patchIndexAppend`
+    // only ever touches the entry being written, so this topic stays unindexed
+    // (and therefore uninjected) until something rewrites THIS entry. The
+    // message must not imply otherwise.
     console.error(
       `[pi-claude-memory] wrote ${filename} but failed to update ${dir.indexPath}: ${indexError}. ` +
-        `The topic file exists but has no index line, so it will not be injected until the next successful write to this store.`,
+        `The topic file exists but has no index line, so it will not be injected until this entry is written again.`,
     );
   }
 
@@ -491,17 +504,21 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   };
 }
 
-/** Derive a human-readable title from the entry slug.
+/** Derive a human-readable title from the entry's FILENAME STEM.
  *
  * The title is the bracket display text in MEMORY.md; the summary after the
- * dash carries the description. Always prettify the slug so the two halves
- * are not identical — duplicated text both wastes injected tokens every turn
- * and breaks supersession identity (the auto-learn prompt tells the LLM to
- * match the existing entry's identifier, which must be the slug, not the
- * description). */
+ * dash carries the description. Prettifying keeps the two halves from being
+ * identical — duplicated text both wastes injected tokens every turn and
+ * breaks supersession identity (the auto-learn prompt tells the LLM to match
+ * the existing entry's identifier, which must be the slug, not the
+ * description).
+ *
+ * Splits on BOTH '-' and '_': the store is full of Claude Code entries whose
+ * stems use underscores (`feedback_prefer_jq`, `user_location`), and splitting
+ * only on hyphens left those as a single unsplit word. */
 function deriveTitle(name: string): string {
   return name
-    .split("-")
+    .split(/[-_]+/)
     .filter(Boolean)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(" ");
@@ -1057,12 +1074,4 @@ export function verifyIndexPublish(
 /** Escape a string for safe embedding in a RegExp. */
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Resolve a relative href from MEMORY.md against the memory dir. */
-export function resolveHrefSafe(href: string, baseDir: string): string {
-  // Cross-tier absolute hrefs (e.g. /home/user/.claude/memory/...)
-  if (href.startsWith("/")) return resolve(href);
-  // Relative hrefs resolve against the dir of MEMORY.md
-  return resolve(dirname(baseDir), href);
 }

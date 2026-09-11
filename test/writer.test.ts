@@ -1336,3 +1336,72 @@ describe("cross-tier removal survives a symlinked store root", () => {
     expect(readFileSync(projIndex, "utf8")).not.toContain("topic.md");
   });
 });
+
+describe("entry identity for underscore-named entries", () => {
+  const writeJq = (over = {}) =>
+    writeMemory(dir, {
+      name: "feedback_prefer_jq",
+      description: "new desc",
+      type: "feedback",
+      body: "new body",
+      pinned: false,
+      tier: "project",
+      allowOverwrite: true,
+      ...over,
+    });
+
+  it("derives a readable title from the stem instead of mangling it", () => {
+    // Real corpus stems look like this (feedback_prefer_jq.md, user_location.md).
+    // slugify() STRIPS underscores, so deriving the title from the slug
+    // rewrote the line to `- [Feedbackpreferjq](feedback_prefer_jq.md)`,
+    // putting the title and the filename in disagreement — which the old
+    // comment claimed was impossible "by construction".
+    writeFileSync(
+      join(tmpDir, "feedback_prefer_jq.md"),
+      "---\ndescription: old\ntype: feedback\n---\nold\n",
+    );
+    writeFileSync(
+      join(tmpDir, "MEMORY.md"),
+      "# M\n- [feedback_prefer_jq.md](feedback_prefer_jq.md) — old\n",
+    );
+    const res = writeJq();
+    expect(res.ok).toBe(true);
+    const idx = readFileSync(dir.indexPath, "utf8");
+    expect(idx).not.toContain("Feedbackpreferjq");
+    expect(idx).toContain("[Feedback Prefer Jq](feedback_prefer_jq.md)");
+  });
+
+  it("resolves the exact stem, and the documented suffix form does not work", () => {
+    // Locks the recall_memory docstring: it used to advertise
+    // 'never-push-master' for feedback_never_push_master.md, which the matcher
+    // can never resolve (the stem's slug keeps no separator, so the suffix
+    // form slugifies differently). The description now names the full stem.
+    writeFileSync(
+      join(tmpDir, "feedback_never_push_master.md"),
+      "---\ndescription: np\ntype: feedback\n---\nnp\n",
+    );
+    expect(readMemory(dir, "feedback_never_push_master").ok).toBe(true);
+    expect(readMemory(dir, "never-push-master").ok).toBe(false);
+  });
+
+  it("does not promise that an unrelated later write repairs the index", () => {
+    // The failure note said the topic "will not be injected until the next
+    // successful write to this store". patchIndexAppend only ever touches the
+    // entry being written, so an unrelated write does nothing for this one.
+    const outside = join(tmpDir, "outside.md");
+    writeFileSync(outside, "untouched\n");
+    // A symlinked index is refused by the writer's own guard.
+    symlinkSync(outside, join(tmpDir, "MEMORY.md"));
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = writeJq();
+      expect(res.ok).toBe(true);
+      expect(res.message).toContain("index update failed");
+      const logged = spy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(logged).not.toContain("next successful write to this store");
+      expect(logged).toContain("until this entry is written again");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

@@ -30,7 +30,7 @@ const recallTool = defineTool({
   parameters: Type.Object({
     name: Type.String({
       description:
-        "Memory entry name (slug) or filename. Matches the filename stem (e.g. 'never-push-master' for feedback_never_push_master.md).",
+        "Memory entry name or filename. Matches the filename itself, or any spelling that slugifies to the same value as the file's stem. Give the FULL stem for underscore-named entries: 'feedback_never_push_master', not 'never-push-master'.",
     }),
     tier: Type.Optional(
       Type.Union([Type.Literal("project"), Type.Literal("global")], {
