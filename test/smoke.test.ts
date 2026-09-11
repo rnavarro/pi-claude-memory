@@ -106,6 +106,60 @@ Three-persona audit across all 8 site routers.`;
   });
 });
 
+describe("frontmatter: a non-frontmatter block is never stripped", () => {
+  // splitFrontmatter accepted anything between two `---` lines and returned a
+  // body with the middle removed, then `parseYamlFrontmatter(...) ?? {}` threw
+  // the parsed result away. A Markdown preference sitting between two rule
+  // lines therefore vanished from BOTH the body and the metadata — silent data
+  // loss in injection and recall alike.
+  it("preserves prose between two --- rule lines", () => {
+    const content = `---
+Keep this important preference.
+---
+Remaining text.`;
+    const parsed = parseMemoryContent(content, "note.md", Date.now());
+    expect(parsed.body).toContain("Keep this important preference.");
+    expect(parsed.body).toContain("Remaining text.");
+    // It is not frontmatter, and nothing was silently discarded.
+    expect(parsed.hasFrontmatter).toBe(false);
+  });
+
+  it("preserves content when the block is unparseable YAML", () => {
+    const content = `---
+{ this is: not: valid: yaml
+---
+body after`;
+    const parsed = parseMemoryContent(content, "note.md", Date.now());
+    expect(parsed.body).toContain("not: valid: yaml");
+    expect(parsed.body).toContain("body after");
+  });
+
+  it("does not treat a ---- rule as a frontmatter opener", () => {
+    const content = `----
+name: not frontmatter
+----
+body`;
+    const parsed = parseMemoryContent(content, "note.md", Date.now());
+    expect(parsed.hasFrontmatter).toBe(false);
+    expect(parsed.body).toContain("name: not frontmatter");
+  });
+
+  it("still strips a block that really is frontmatter", () => {
+    const content = `---
+name: real
+description: a real memory
+type: feedback
+---
+the body`;
+    const parsed = parseMemoryContent(content, "real.md", Date.now());
+    expect(parsed.hasFrontmatter).toBe(true);
+    expect(parsed.name).toBe("real");
+    expect(parsed.type).toBe("feedback");
+    expect(parsed.body).not.toContain("type: feedback");
+    expect(parsed.body).toContain("the body");
+  });
+});
+
 describe("index-parser", () => {
   it("parses link entries and non-link lines", () => {
     const content = `# My App - Working Memory
