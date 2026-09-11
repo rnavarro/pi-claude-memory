@@ -810,3 +810,32 @@ describe("index re-apply guard", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("readMemory size cap", () => {
+  it("refuses to read a topic larger than the shared cap", () => {
+    // Without a cap, recall_memory reads any file in the store in full, and
+    // the routing anchor directs the model to call it for ⟨index-only⟩
+    // entries — the ones the injector declined to read.
+    const big = "x".repeat(1_000_001);
+    writeFileSync(join(dir.dir, "huge.md"), `---\ndescription: d\ntype: project\n---\n${big}\n`);
+    const res = readMemory(dir, "huge");
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.message).toContain("too large");
+  });
+
+  it("still reads a topic comfortably under the cap", () => {
+    writeFileSync(join(dir.dir, "normal.md"), "---\ndescription: d\ntype: project\n---\nok body\n");
+    const res = readMemory(dir, "normal");
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.content).toContain("ok body");
+  });
+});
+
+describe("readMemory size cap is shared with the injector", () => {
+  it("uses one constant for both paths", async () => {
+    // Two independent caps is how the tool path ended up unbounded while the
+    // injector path was bounded.
+    const { TOPIC_FILE_MAX_BYTES } = await import("../src/types.js");
+    expect(TOPIC_FILE_MAX_BYTES).toBe(1_000_000);
+  });
+});

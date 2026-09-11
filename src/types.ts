@@ -1,5 +1,15 @@
 // Shared types for pi-claude-memory
 
+/** Maximum bytes read from a single topic file.
+ *
+ * Enforced on BOTH read paths: the injector (before bytes enter the system
+ * prompt) and readMemory (the recall_memory tool, which the routing anchor
+ * explicitly directs the model to use for ⟨index-only⟩ entries). Keeping one
+ * constant in a shared module is the point — the two paths drifting is how
+ * the tool side ended up uncapped while the injector side was bounded.
+ */
+export const TOPIC_FILE_MAX_BYTES = 1_000_000;
+
 /** Memory tier: project-specific or global (cross-project). */
 export type MemoryTier = "project" | "global";
 

@@ -159,3 +159,25 @@ describe("recall_memory with an absent project store", () => {
     expect(text).toContain("No memory directory available");
   });
 });
+
+describe("tool error handling", () => {
+  it("write_memory returns ok:false instead of rejecting when the write fails", async () => {
+    // Make the topic path unwritable by planting a DIRECTORY where the file
+    // must go — the writer's mkdir/rename then fails.
+    const cwd = join(tmpHome, "work", "errproj");
+    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    mkdirSync(join(projDir, "blocked.md"), { recursive: true });
+
+    const res = await writeMemoryTool.execute(
+      "t-err",
+      { name: "blocked", description: "d", type: "project", body: "b" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    // Must not throw: a rejected tool call is worse than an ok:false result.
+    const text = (res.content[0] as { type: string; text: string }).text;
+    expect(typeof text).toBe("string");
+    expect((res.details as { ok: boolean }).ok).toBe(false);
+  });
+});
