@@ -45,10 +45,16 @@ function projectDir(encoded: string): string {
  * 1. Standard: <project>/memory/MEMORY.md + <project>/memory/*.md
  * 2. Root-level: <project>/MEMORY.md + <project>/memory/*.md (other-project anomaly)
  *
- * If the exact encoded dir doesn't exist, globs for candidates whose basename
- * matches the cwd basename (handles rename split-brain like pool_cover vs pool-cover).
+ * Resolution is EXACT for every operation — reads, writes, and removals all
+ * share one rule. The basename-glob fallback that reads used to apply was
+ * removed: suffix matching on the encoded name cannot tell "this project at
+ * an old path" from "an unrelated project whose basename ends the same way"
+ * (encodePath is lossy, '/' → '-', so /x/my-app and /y/control encode
+ * to names sharing the -control suffix), and a wrong guess injects another
+ * project's memories into this one's prompt. Renames are reported in
+ * orphanStores as a signpost for the user to act on instead.
  */
-export function resolveMemoryDirs(cwd: string, opts?: { exactOnly?: boolean }): ResolveResult {
+export function resolveMemoryDirs(cwd: string): ResolveResult {
   const warnings: string[] = [];
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
   const encoded = encodePath(absCwd);
@@ -62,22 +68,21 @@ export function resolveMemoryDirs(cwd: string, opts?: { exactOnly?: boolean }): 
     project = resolveProjectMemory(exactDir, absCwd, warnings);
   }
 
-  // If exact match not found, try basename glob (rename split-brain handling).
-  // Skipped for mutations (opts.exactOnly) so a write/remove never lands in
-  // another project's store via a fuzzy basename match.
-  if (!project && !opts?.exactOnly) {
+  // No exact store. Same-basename stores become a REPORT, not a match:
+  // findProjectCandidates' suffix test cannot distinguish a renamed cwd from
+  // an unrelated project (a cwd named "control" matches every store ending
+  // "-control"), so adoption must be a deliberate user action.
+  let orphanStores: string[] = [];
+  if (!project) {
     const cwdBasename = absCwd.split(sep).pop() ?? absCwd;
     if (cwdBasename) {
-      const candidates = findProjectCandidates(cwdBasename);
-      if (candidates.length === 1) {
-        project = resolveProjectMemory(candidates[0], absCwd, warnings);
-      } else if (candidates.length > 1) {
+      orphanStores = findProjectCandidates(cwdBasename);
+      if (orphanStores.length > 0) {
         warnings.push(
-          `Ambiguous project match: ${candidates.length} dirs for basename "${cwdBasename}". ` +
-            `Using most recently modified: ${candidates[0]}`,
+          `No memory store for ${absCwd}, but ${orphanStores.length} same-basename store(s) exist: ` +
+            `${orphanStores.join(", ")}. If one is this project at an old path, rename it to ` +
+            `${encoded} to adopt its memories.`,
         );
-        // Sort by mtime desc, already done in findProjectCandidates
-        project = resolveProjectMemory(candidates[0], absCwd, warnings);
       }
     }
   }
@@ -107,7 +112,7 @@ export function resolveMemoryDirs(cwd: string, opts?: { exactOnly?: boolean }): 
     warnings,
   });
 
-  return { project, global, warnings };
+  return { project, global, warnings, orphanStores };
 }
 
 /**
@@ -121,30 +126,10 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   const projectDir = `${claudeProjectsDir()}/${encoded}`;
   const memorySubdir = `${projectDir}/memory`;
 
-  // Split-brain warning: if a basename-matched store already exists (rename
-  // split-brain), the fresh exact dir we create will shadow it — resolution
-  // prefers the exact dir from now on, making prior memories invisible to
-  // reads. Mutations resolve exact-only (they must never land in another
-  // project's store), so this write cannot adopt the existing store; note it
-  // in the debug log rather than in the TUI.
-  const siblings = findProjectCandidates(absCwd.split(sep).pop() ?? absCwd);
-  if (siblings.length > 0) {
-    // Suffix matching is heuristic: "/home/x/my-<basename>" also ends with
-    // "-<basename>", so candidates can be unrelated stores. This is advisory
-    // only, and it fires once per candidate while the write loop runs — it
-    // belongs in the debug log, not in the middle of the rendered
-    // conversation. Set debugLog:true in settings.json to see it.
-    //
-    // The information is not lost: the resolved store is still created, and
-    // the debug entry records every candidate for later inspection.
-    debugLog("resolver.split_brain_shadows_existing_store", {
-      cwd: absCwd,
-      encoded,
-      siblings,
-      note: `new project store created for ${absCwd}; ${siblings.length} same-basename store(s) exist (${siblings.join(", ")}) — if one is a renamed cwd of this project, rename it to ${encoded} to adopt its memories`,
-    });
-  }
-
+  // No same-basename scan here: resolution is exact everywhere, so there is
+  // nothing to "shadow". A same-basename store is already reported by
+  // resolveMemoryDirs (orphanStores) before any write, and the injected
+  // signpost tells the user how to adopt it.
   try {
     mkdirSync(memorySubdir, { recursive: true });
     debugLog("resolver.create_project_dir", { cwd: absCwd, encoded, memorySubdir });
@@ -222,6 +207,24 @@ function resolveProjectMemory(
   // MEMORY.md doesn't exist in either location
   warnings.push(`Project dir ${projectDir} exists but has no MEMORY.md`);
   return null;
+}
+
+/**
+ * One-line adoption signpost for the injected prompt. Rendered at most once
+ * per session (the injection block freezes at session start), naming the
+ * stores that look like this project's old paths and the exact rename that
+ * would adopt one. Pure so the rendered line is testable; the model may relay
+ * it to the user but must not read from or write to those stores.
+ */
+export function orphanSignpost(cwd: string, orphans: string[]): string {
+  const abs = isAbsolute(cwd) ? cwd : resolve(cwd);
+  const encoded = encodePath(abs);
+  return (
+    `[pi-claude-memory] No memory store exists for this project yet, but ${orphans.length} ` +
+    `store(s) from same-basename paths exist: ${orphans.join(", ")}. If one belongs to this ` +
+    `project (renamed or moved), the user can rename it to ${encoded} inside ~/.claude/projects ` +
+    `to adopt its memories. Do not read from or write to those stores.`
+  );
 }
 
 /**

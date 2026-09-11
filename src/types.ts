@@ -117,4 +117,13 @@ export interface ResolveResult {
   global: MemoryDir | null;
   /** Warnings encountered during resolution. */
   warnings: string[];
+  /**
+   * Stores whose encoded name ends with this cwd's basename, reported ONLY
+   * when no exact store resolved for this project. These look like this
+   * project's old paths (a rename or move), but suffix matching cannot
+   * distinguish that from an unrelated project whose basename ends the same
+   * way, so they are surfaced for the user to adopt deliberately — never
+   * matched implicitly, and never written to.
+   */
+  orphanStores?: string[];
 }
