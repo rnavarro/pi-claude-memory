@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -16,10 +17,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
 import {
+  atomicWriteFileNoClobber,
   buildFrontmatterYaml,
   readMemory,
   removeMemory,
   resolveWikilinks,
+  withIndexRetry,
   writeMemory,
 } from "../src/memory-writer.js";
 import type { MemoryDir } from "../src/types.js";
@@ -566,5 +569,49 @@ describe("mutation guards", () => {
     expect(existsSync(linkPath)).toBe(true);
 
     rmSync(outsideDir, { recursive: true, force: true });
+  });
+});
+
+describe("index concurrency primitives", () => {
+  it("atomicWriteFileNoClobber refuses to destroy a concurrently created file", () => {
+    const target = join(dir.dir, "race.md");
+    // First publication wins
+    expect(atomicWriteFileNoClobber(target, "first\n")).toBe(true);
+    // A competing writer created the target in the meantime — must NOT clobber
+    expect(atomicWriteFileNoClobber(target, "second\n")).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe("first\n");
+    // No temp litter left behind
+    const leftovers = readdirSync(dir.dir).filter((f) => f.includes(".tmp"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("withIndexRetry merges concurrent index edits instead of losing them", () => {
+    const indexPath = join(dir.dir, "MEMORY.md");
+    writeFileSync(indexPath, "BASE\n");
+    let competitorLanded = false;
+
+    withIndexRetry(indexPath, (content) => {
+      if (!competitorLanded) {
+        // Simulate a competing writer landing between our read and re-read
+        competitorLanded = true;
+        writeFileSync(indexPath, `${content}COMPETITOR\n`);
+      }
+      return `${content}MINE\n`;
+    });
+
+    const final = readFileSync(indexPath, "utf8");
+    expect(final).toContain("COMPETITOR");
+    expect(final).toContain("MINE");
+  });
+
+  it("withIndexRetry treats a null return as nothing-to-do and writes no file", () => {
+    const missing = join(dir.dir, "does-not-exist.md");
+    withIndexRetry(missing, () => "should never be written\n");
+    expect(existsSync(missing)).toBe(false);
+
+    const existing = join(dir.dir, "noop.md");
+    writeFileSync(existing, "unchanged\n");
+    withIndexRetry(existing, (content) => (content === "changed" ? "x" : null));
+    expect(readFileSync(existing, "utf8")).toBe("unchanged\n");
   });
 });
