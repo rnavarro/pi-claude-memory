@@ -339,7 +339,25 @@ export function parseCandidates(reply: string): MemoryCandidate[] {
   try {
     const parsed = JSON.parse(jsonText) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter(isValidCandidate);
+    const valid = parsed.filter(isValidCandidate);
+    // Say what was dropped and why. A candidate whose tier the schema does not
+    // accept (the summary header used to render the store LABEL, and a model
+    // echoing it wrote "my-app") was filtered here in total silence,
+    // which is indistinguishable from the model having proposed nothing.
+    if (valid.length !== parsed.length) {
+      debugLog("auto_learn.candidates_rejected", {
+        proposed: parsed.length,
+        accepted: valid.length,
+        rejected: parsed
+          .filter((c) => !isValidCandidate(c))
+          .slice(0, 5)
+          .map((c) => {
+            const o = c as { name?: unknown; tier?: unknown };
+            return { name: String(o?.name ?? "?"), tier: String(o?.tier ?? "?") };
+          }),
+      });
+    }
+    return valid;
   } catch {
     return [];
   }
@@ -387,27 +405,64 @@ export function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> 
     } catch {
       continue;
     }
+    const found: Array<{ stem: string; mtime: number }> = [];
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".md") || entry.name === "MEMORY.md") continue;
       try {
-        const mtime = statSync(join(dir.dir, entry.name)).mtimeMs;
-        const stem = entry.name.replace(/\.md$/, "");
-        // Key by the RAW stem (what buildExistingIndexSummary advertises to
-        // the model) AND by its slug (what the write path targets and the
-        // overwrite guard looks up). A topic whose stem is not slug-normal
-        // ("Foo Bar.md", or uppercase) otherwise had a summary advertising
-        // "Foo Bar" while the guard asked for "foo-bar": the lookup missed
-        // and every supersession of that entry silently no-opped.
-        map.set(`${dir.tier}:${stem}`, mtime);
-        const slug = slugify(stem);
-        if (slug && slug !== stem) map.set(`${dir.tier}:${slug}`, mtime);
+        found.push({
+          stem: entry.name.replace(/\.md$/, ""),
+          mtime: statSync(join(dir.dir, entry.name)).mtimeMs,
+        });
       } catch {
         // skip unreadable
       }
     }
+    applyStemKeys(map, dir.tier, found);
   }
   return map;
 }
+
+/** Key a tier's topic stems into the mtime map, real stems before aliases.
+ *
+ * Two passes, not one: keying each entry's stem and slug together made the
+ * result depend on the order stems arrived in. With both "foo-bar.md" and a
+ * slug-alike such as "foo-bar:.md" on disk, whichever came last owned the
+ * "foo-bar" key, so an alias could overwrite a real stem's mtime. The
+ * overwrite guard then compares the write target against the OTHER file's
+ * mtime and logs skip_stale_overwrite — blaming a concurrent edit that never
+ * happened, and silently dropping the supersession. Real stems are therefore
+ * all written first, and an alias only fills a key no real stem claimed.
+ *
+ * Exported because the ordering invariant cannot be exercised through
+ * snapshotMtimes: whether the bad order arises depends on readdir order, which
+ * on this filesystem puts the ASCII-uppercase slug-alikes first. */
+export function applyStemKeys(
+  map: Map<string, number>,
+  tier: string,
+  found: Array<{ stem: string; mtime: number }>,
+): void {
+  // Real stems win their own key, always.
+  for (const { stem, mtime } of found) {
+    map.set(`${tier}:${stem}`, mtime);
+  }
+  // Slugs are a fallback key for stems that are not slug-normal: the overwrite
+  // guard looks up slugify(candidate.name) while the summary advertises the raw
+  // stem, so an uppercase or spaced stem would otherwise miss and silently
+  // no-op the supersession.
+  for (const { stem, mtime } of found) {
+    const slug = slugify(stem);
+    if (slug && slug !== stem && !map.has(`${tier}:${slug}`)) {
+      map.set(`${tier}:${slug}`, mtime);
+    }
+  }
+}
+
+/** Character budget for entry SUMMARIES in the reviewer's index summary.
+ *
+ * Identities are never budgeted (every entry must stay matchable for
+ * supersession); only the descriptions are, so a large store cannot inflate
+ * the review prompt without bound. */
+const SUMMARY_BUDGET_CHARS = 6000;
 
 /** Build a compact summary of the existing memory index for the LLM.
  *
@@ -466,12 +521,28 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
   for (const dir of [resolved.global, resolved.project]) {
     if (!dir) continue;
     const headerIndex = lines.length;
-    lines.push(`## ${dir.label} tier`);
+    // Name the TIER in the header, not just the label. A project store's label
+    // is the cwd basename ("## my-app tier"), while the candidate schema
+    // accepts only "project" or "global", so a model echoing the header
+    // produced an invalid tier that parseCandidates then dropped in silence.
+    // The label stays for context; the valid token comes first.
+    lines.push(`## ${dir.tier} tier (${dir.label})`);
     const before = lines.length;
     try {
       const parsed = parseIndexFile(dir);
       if (parsed && parsed.entries.length > 0) {
-        for (const entry of parsed.entries.slice(0, 50)) {
+        // EVERY entry is listed by identity. The previous slice(0, 50) hid the
+        // rest from the reviewer permanently: this machine's real global index
+        // has 222 entries and writes append, so anything past the cutoff could
+        // never be matched for supersession no matter how many reviews ran.
+        // The advertised "match the existing identifier" mechanism simply did
+        // not apply to them, and they accumulated as duplicates. Identities are
+        // what supersession keys on, so they are never dropped; only the
+        // SUMMARIES are budgeted, which bounds prompt size without losing
+        // matchability.
+        let summaryChars = 0;
+        let trimmed = 0;
+        for (const entry of parsed.entries) {
           // The stem is the stable identifier: the writer keys overwrite
           // targets on slugify(candidate.name), so the model must return THIS
           // slug to supersede. The owning tier is stated explicitly because a
@@ -479,10 +550,19 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
           const owner = ownerOf(entry.filePath, dir);
           const tierNote = owner.tier === dir.tier ? "" : ` [owner: ${owner.tier}]`;
-          lines.push(`- ${stem}: ${entry.summary}${tierNote}`);
+          if (summaryChars + entry.summary.length <= SUMMARY_BUDGET_CHARS) {
+            lines.push(`- ${stem}: ${entry.summary}${tierNote}`);
+            summaryChars += entry.summary.length;
+          } else {
+            lines.push(`- ${stem}${tierNote}`);
+            trimmed++;
+          }
         }
-        if (parsed.entries.length > 50) {
-          lines.push(`... and ${parsed.entries.length - 50} more`);
+        if (trimmed > 0) {
+          lines.push(
+            `(summaries omitted for ${trimmed} of ${parsed.entries.length} entries to bound size; ` +
+              "every identifier is listed above, so supersede by matching one)",
+          );
         }
       } else {
         // Fallback: no parseable index, list filename stems if any files exist
@@ -492,7 +572,9 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
         if (files.length === 0) {
           lines.push("(no entries)");
         } else {
-          for (const f of files.slice(0, 50)) {
+          // No parseable index: list every file stem, so identities stay
+          // complete. (This too was capped at 50, hiding files outright.)
+          for (const f of files) {
             lines.push(`- ${f.replace(/\.md$/, "")}`);
           }
         }
