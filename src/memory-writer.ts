@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -55,6 +56,14 @@ export interface RemoveMemoryRequest {
   name: string;
   /** Tier: "project" or "global". */
   tier: "project" | "global";
+  /** Other stores whose indexes may also link this topic.
+   *
+   * A topic owned by one tier can be linked from the OTHER tier's index by an
+   * absolute href — the my-app project index on this machine links two
+   * global topics that way. Removing from the owning tier alone leaves the
+   * other tier advertising a topic that no longer exists, so the caller passes
+   * the other resolved store and its dangling line is stripped too. */
+  alsoUnlink?: MemoryDir[];
 }
 
 /** Result of a write or remove operation. */
@@ -596,6 +605,10 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   }
   const destDir = mkdtempSync(join(trashDir, `${filename}.`));
   const trashPath = join(destDir, filename);
+  // Pin the canonical identity BEFORE the move. Index lines pointing at this
+  // topic — in this store or the other tier — are matched against it, and after
+  // renameSync the leaf is gone so realpath can no longer resolve it.
+  const targetPath = canonicalTopicTarget(filePath);
   renameSync(filePath, trashPath);
 
   // Remove the link entry from MEMORY.md. Report honestly when no line was
@@ -609,7 +622,7 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   let linkRemoved = false;
   let indexError: string | null = null;
   try {
-    linkRemoved = removeFromIndex(dir, filename);
+    linkRemoved = removeFromIndex(dir, targetPath);
   } catch (err) {
     indexError = String(err);
     debugLog("writer.remove_index_failed", {
@@ -621,6 +634,33 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     });
   }
 
+  // Strip links to the same topic from the other tier's index.
+  //
+  // A topic owned here can be linked from the other store by an absolute href,
+  // which is how the real my-app project index references two global
+  // topics. Removing the owning copy alone left that store advertising advice
+  // that no longer exists, so the caller (which already resolves both tiers)
+  // passes the other store in and the dangling line goes too. Matching uses the
+  // canonical target captured above, so an alias spelling or a symlinked store
+  // root still matches.
+  const crossUnlinked: string[] = [];
+  const crossFailed: string[] = [];
+  for (const other of req.alsoUnlink ?? []) {
+    if (other.indexPath === dir.indexPath || other.dir === dir.dir) continue;
+    try {
+      if (removeFromIndex(other, targetPath)) crossUnlinked.push(other.label);
+    } catch (err) {
+      crossFailed.push(other.label);
+      debugLog("writer.remove_cross_unlink_failed", {
+        filename,
+        fromTier: dir.tier,
+        otherTier: other.tier,
+        otherIndex: other.indexPath,
+        error: String(err),
+      });
+    }
+  }
+
   debugLog("writer.remove_ok", {
     filename,
     tier: dir.tier,
@@ -628,14 +668,26 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     trashPath,
     linkRemoved,
     indexError,
+    crossUnlinked,
+    crossFailed,
   });
+
+  const crossNote =
+    crossUnlinked.length > 0
+      ? ` Removed its cross-tier link from ${crossUnlinked.join(", ")} tier.`
+      : "";
+  const crossFailNote =
+    crossFailed.length > 0
+      ? ` Could not update the cross-tier index in ${crossFailed.join(", ")} tier; it may still link this topic.`
+      : "";
 
   if (indexError) {
     return {
       ok: true,
       message:
         `Moved memory ${filename} to .trash/ in ${dir.label} tier, but could not update ` +
-        `${dir.indexPath}: ${indexError}. Its index line, if any, still points at the trashed file.`,
+        `${dir.indexPath}: ${indexError}. Its index line, if any, still points at the trashed file.` +
+        crossFailNote,
       filePath: trashPath,
     };
   }
@@ -643,30 +695,48 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   return {
     ok: true,
     message: linkRemoved
-      ? `Moved memory ${filename} to .trash/ in ${dir.label} tier`
-      : `Moved memory ${filename} to .trash/ in ${dir.label} tier, but no matching MEMORY.md line was found to remove`,
+      ? `Moved memory ${filename} to .trash/ in ${dir.label} tier.${crossNote}${crossFailNote}`
+      : `Moved memory ${filename} to .trash/ in ${dir.label} tier, but no matching MEMORY.md line was found to remove.${crossNote}${crossFailNote}`,
     filePath: trashPath,
   };
 }
 
-/** Remove a link entry from MEMORY.md by filename. Publishes via
+/** Canonical identity of a topic path, for matching index lines.
+ *
+ * Captured BEFORE the file is moved to .trash/. After a move the leaf is gone,
+ * so realpathSync fails on both sides and a lexical comparison against a
+ * symlinked store root (`/alias/topic.md` vs the `/real/store/topic.md` an
+ * absolute href holds) no longer matches — the index line would survive with
+ * nothing left to match against. Resolving while the file still exists pins the
+ * identity. Falls back to the lexical path when the file is unreadable. */
+export function canonicalTopicTarget(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+/** Remove a link entry from MEMORY.md by resolved target path. Publishes via
  * withIndexRetry (atomic writes + lost-update merge retry).
  *
  * Returns whether any line was actually removed. Callers report success to
  * the user, and a removal that silently no-ops leaves an index line pointing
  * at a file already moved to .trash/ — the caller needs to know so it does
  * not claim the link was removed. */
-function removeFromIndex(dir: MemoryDir, filename: string): boolean {
+function removeFromIndex(dir: MemoryDir, targetPath: string): boolean {
   const indexPath = dir.indexPath;
   if (!existsSync(indexPath)) return false;
 
   // Match by resolved target (see patchIndexAppend). A spelling-based regex
   // misses an absolute-href line for the same file, so the file was trashed
   // while its link survived — the tool still reported "removed its MEMORY.md
-  // link". The target path is the one the parser and containment guard use.
-  const targetPath = join(dir.dir, filename);
+  // link". The target is passed in rather than rebuilt from the filename so a
+  // cross-tier line matching the same file (by absolute href, or through a
+  // symlinked store root) is found even after the topic has been moved and
+  // realpath no longer resolves it.
   const linkRegex = new RegExp(
-    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(filename)}\\)(?:\\s*[—-]\\s*.+)?$`,
+    `^-\\s+(?:[^\\[]+\\s+)?\\[[^\\]]+\\]\\(${escapeRegex(basename(targetPath))}\\)(?:\\s*[—-]\\s*.+)?$`,
   );
   let removed = false;
   withIndexRetry(indexPath, (content) => {

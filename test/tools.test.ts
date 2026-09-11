@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodePath } from "../src/resolver.js";
-import { recallMemoryTool, writeMemoryTool } from "../src/tools.js";
+import { recallMemoryTool, removeMemoryTool, writeMemoryTool } from "../src/tools.js";
 
 let tmpHome: string;
 let origHome: string | undefined;
@@ -196,5 +196,62 @@ describe("write_memory guidelines do not promise a reviewer", () => {
     expect(joined).not.toMatch(/reviewer sweeps/i);
     // The anchor owns the statement, so the guideline points at it.
     expect(joined).toContain("memory anchor");
+  });
+});
+
+describe("remove_memory cross-tier", () => {
+  let cwd: string;
+  let projDir: string;
+  let globalDir: string;
+  let projIndex: string;
+  let globalIndex: string;
+
+  const run = (params: Record<string, unknown>) =>
+    removeMemoryTool.execute("t1", params, undefined as never, undefined as never, makeCtx(cwd));
+
+  const textOf = (res: { content: { type: string; text?: string }[] }) =>
+    (res.content[0] as { type: string; text: string }).text;
+
+  beforeEach(() => {
+    cwd = join(tmpHome, "work", "proj");
+    projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    globalDir = join(tmpHome, ".claude", "memory");
+    mkdirSync(projDir, { recursive: true });
+    mkdirSync(globalDir, { recursive: true });
+    projIndex = join(projDir, "MEMORY.md");
+    globalIndex = join(globalDir, "MEMORY.md");
+    // Global OWNS the topic; the project index reaches it by absolute href —
+    // the shape the real my-app store has.
+    writeFileSync(join(globalDir, "shared.md"), "---\ndescription: s\ntype: reference\n---\ns\n");
+    writeFileSync(globalIndex, "# G\n- [Shared](shared.md) — s\n");
+    writeFileSync(projIndex, `# P\n- [Shared](${join(globalDir, "shared.md")}) — s\n`);
+  });
+
+  it("removes a global entry with no tier named even though a project store exists", async () => {
+    // The previous fallback fired only when the requested tier had NO
+    // directory. With a project store present, this answered "not found" in
+    // project and never consulted global, while recall_memory found it fine.
+    const res = await run({ name: "shared" });
+    expect((res.details as { ok: boolean }).ok).toBe(true);
+    expect(existsSync(join(globalDir, "shared.md"))).toBe(false);
+    expect(readFileSync(globalIndex, "utf8")).not.toContain("shared.md");
+    expect(textOf(res)).toContain("Global tier");
+  });
+
+  it("strips the other tier's dangling cross-tier link in the same operation", async () => {
+    const res = await run({ name: "shared" });
+    // The project index linked the trashed file by absolute href. Leaving that
+    // line behind advertises a memory that no longer exists.
+    expect(readFileSync(projIndex, "utf8")).not.toContain("shared.md");
+    expect(textOf(res)).toContain("cross-tier link");
+  });
+
+  it("honors an explicitly named tier strictly", async () => {
+    const res = await run({ name: "shared", tier: "project" });
+    expect((res.details as { ok: boolean }).ok).toBe(false);
+    // Nothing removed from either store.
+    expect(existsSync(join(globalDir, "shared.md"))).toBe(true);
+    expect(readFileSync(globalIndex, "utf8")).toContain("shared.md");
+    expect(readFileSync(projIndex, "utf8")).toContain("shared.md");
   });
 });

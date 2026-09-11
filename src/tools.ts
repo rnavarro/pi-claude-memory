@@ -249,28 +249,58 @@ const removeTool = defineTool({
     debugLog("tool.remove_memory", { name: params.name, tier: params.tier ?? "project" });
     const explicitTier = params.tier !== undefined;
     const tier = params.tier ?? "project";
+    const otherTier = tier === "project" ? "global" : "project";
     // Removals are mutations: exact project match only (see write_memory).
     const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
-    // An explicitly named tier must be honored — silently falling back to
-    // the other tier would delete from a different store than asked. The
-    // cross-tier fallback stays only for the default tier, where the caller
-    // said "remove X" without naming where it lives.
-    let dir = pickTier(resolved, tier);
-    if (!dir && !explicitTier) {
-      dir = pickTier(resolved, tier === "project" ? "global" : "project");
+
+    // Candidate order mirrors recall_memory: the requested tier first, then the
+    // other tier ONLY when the caller did not name one. An explicitly named tier
+    // is honored strictly, so a same-named entry in another store is never
+    // removed by accident.
+    //
+    // The fallback has to be ENTRY-level, not directory-level. Falling back only
+    // when the requested tier had no directory at all meant that with a project
+    // store present, `remove_memory feedback_prefer_jq` (a real global entry)
+    // resolved the project dir, answered "not found", and never consulted
+    // global — while recall_memory, which the anchor tells the model to use
+    // when a memory is wrong, found the same entry without trouble.
+    const ordered: Array<"project" | "global"> = explicitTier ? [tier] : [tier, otherTier];
+    const candidates: MemoryDir[] = [];
+    for (const t of ordered) {
+      const d = pickTier(resolved, t);
+      if (d && !candidates.some((c) => c.dir === d.dir)) candidates.push(d);
     }
-    if (!dir) {
+
+    if (candidates.length === 0) {
       return {
         content: [{ type: "text", text: `No ${tier} memory directory available.` }],
         details: undefined as unknown,
       };
     }
 
-    // Same reasoning as write_memory: the file move and index rewrite can
-    // throw, and invalidation must run even then.
-    let result: MemoryOpResult;
+    // Try each candidate until one actually holds the entry. A "not found" in
+    // the first tier is not an answer while another tier is untried; any other
+    // failure is reported as-is.
+    let result: MemoryOpResult | null = null;
+    let dir: MemoryDir = candidates[0];
+    let firstMiss: string | null = null;
     try {
-      result = removeMemory(dir, { name: params.name, tier });
+      for (const candidate of candidates) {
+        const attempt = removeMemory(candidate, {
+          name: params.name,
+          tier: candidate.tier,
+          // Both stores are resolved here, so the other one's index can have
+          // its dangling cross-tier link stripped in the same operation.
+          alsoUnlink: candidates.filter((c) => c !== candidate),
+        });
+        if (!attempt.ok) {
+          firstMiss ??= attempt.message;
+          continue;
+        }
+        result = attempt;
+        dir = candidate;
+        break;
+      }
     } catch (err) {
       debugLog("tool.remove_memory_error", { name: params.name, tier, error: String(err) });
       result = { ok: false, message: `Failed to remove memory ${params.name}: ${String(err)}` };
@@ -279,9 +309,14 @@ const removeTool = defineTool({
       // the removed entry in the index.
       invalidateResolveCache();
     }
+
+    const finalResult: MemoryOpResult = result ?? {
+      ok: false,
+      message: firstMiss ?? `Memory not found: ${params.name}`,
+    };
     return {
-      content: [{ type: "text", text: result.message }],
-      details: { ok: result.ok, tier: dir.tier, trashPath: result.filePath } as unknown,
+      content: [{ type: "text", text: finalResult.message }],
+      details: { ok: finalResult.ok, tier: dir.tier, trashPath: finalResult.filePath } as unknown,
     };
   },
 });

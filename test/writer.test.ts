@@ -1291,3 +1291,48 @@ describe("write-time size validation", () => {
     expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).toBe(before);
   });
 });
+
+describe("cross-tier removal survives a symlinked store root", () => {
+  it("strips an absolute cross-tier link whose topic was reached through a symlink", () => {
+    // /alias -> realGlobal. The owning store is addressed through the alias,
+    // but the other tier's index holds the REAL absolute path. After the move
+    // both realpath calls fail (the leaf is gone), so a target rebuilt from the
+    // filename after the move — or resolved lexically — no longer matches and
+    // the line survives. Pinning the canonical identity BEFORE the move is what
+    // makes the alias spelling and the real path meet.
+    const realGlobal = join(tmpDir, "real-global");
+    mkdirSync(realGlobal, { recursive: true });
+    writeFileSync(join(realGlobal, "topic.md"), "---\ndescription: t\ntype: reference\n---\nt\n");
+    writeFileSync(join(realGlobal, "MEMORY.md"), "# G\n- [Topic](topic.md) — t\n");
+    const alias = join(tmpDir, "alias-global");
+    symlinkSync(realGlobal, alias);
+
+    const proj = join(tmpDir, "proj");
+    mkdirSync(proj, { recursive: true });
+    const projIndex = join(proj, "MEMORY.md");
+    // Absolute href to the CANONICAL path, as the parser stores it.
+    writeFileSync(projIndex, `# P\n- [Topic](${join(realGlobal, "topic.md")}) — t\n`);
+
+    const aliasDir = {
+      tier: "global" as const,
+      dir: alias,
+      indexPath: join(alias, "MEMORY.md"),
+      label: "global",
+    };
+    const projDir = {
+      tier: "project" as const,
+      dir: proj,
+      indexPath: projIndex,
+      label: "proj",
+    };
+
+    const res = removeMemory(aliasDir, {
+      name: "topic",
+      tier: "global",
+      alsoUnlink: [projDir],
+    });
+
+    expect(res.ok).toBe(true);
+    expect(readFileSync(projIndex, "utf8")).not.toContain("topic.md");
+  });
+});
