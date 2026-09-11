@@ -109,15 +109,38 @@ export function buildMemoryInjection(
   // wins when competing for the same budget.
   const budget = { remaining: tokenCap, total: tokenCap };
   let hasAnyEntries = false;
+  // Cumulative set of topic paths whose bodies are already in this prompt.
+  // Shared across tiers so a topic reached by BOTH indexes — a project index
+  // may link an absolute href into the global store, and the global index
+  // lists the same file relatively — is injected once. Previously each tier
+  // built its own set, so the file's body was emitted twice AND charged twice
+  // against the shared budget. It is also the set the index renderer consults,
+  // so the second tier marks the entry as already-present instead of
+  // ⟨index-only⟩ when the body is in fact there.
+  const alreadyLoaded = new Set<string>();
 
   if (project) {
-    const block = buildTierInjection(project, project.label, budget, warnings, global?.dir);
+    const block = buildTierInjection(
+      project,
+      project.label,
+      budget,
+      warnings,
+      global?.dir,
+      alreadyLoaded,
+    );
     if (block.text) blocks.push(block.text);
     if (block.hasEntries) hasAnyEntries = true;
   }
 
   if (global) {
-    const block = buildTierInjection(global, "Global", budget, warnings, project?.dir);
+    const block = buildTierInjection(
+      global,
+      "Global",
+      budget,
+      warnings,
+      project?.dir,
+      alreadyLoaded,
+    );
     if (block.text) blocks.push(block.text);
     if (block.hasEntries) hasAnyEntries = true;
   }
@@ -156,6 +179,7 @@ function buildTierInjection(
   budget: { remaining: number; total: number },
   warnings: string[],
   otherTierDir?: string | null,
+  alreadyLoaded: Set<string> = new Set(),
 ): InjectionBlock {
   const parsed = parseIndexFile(dir);
   if (!parsed) {
@@ -199,12 +223,14 @@ function buildTierInjection(
     text: fullTextSection,
     loadedPaths,
     tokens,
-  } = buildFullTextSection(files, parsed.entries, budget, warnings);
+  } = buildFullTextSection(files, parsed.entries, budget, warnings, alreadyLoaded);
 
   // Build the index section (always injected — it's cheap and information-dense)
   // Mark entries whose bodies are NOT loaded with ⟨index-only⟩ so the model
   // knows which entries to recall_memory vs which are already in full text.
-  const indexSection = renderIndexSection(parsed, loadedPaths);
+  // Render against the CUMULATIVE set: a body injected under the other tier is
+  // present in this prompt, so marking it index-only would be a lie.
+  const indexSection = renderIndexSection(parsed, alreadyLoaded);
 
   const parts: string[] = [];
   parts.push(`### Memory (${label})\n`);
@@ -373,6 +399,7 @@ function buildFullTextSection(
   entries: IndexEntry[],
   budget: { remaining: number; total: number },
   warnings: string[],
+  alreadyLoaded: Set<string>,
 ): { text: string; loadedPaths: Set<string>; filesLoaded: number; tokens: number } {
   // Build a priority-ordered list of candidate files
   const candidates = prioritizeFiles(files, entries);
@@ -388,6 +415,13 @@ function buildFullTextSection(
   let filesLoaded = 0;
 
   for (const file of candidates) {
+    // Already injected by the other tier: record it as present (so the index
+    // renderer clears its ⟨index-only⟩ marker) but do not emit the body twice
+    // or charge its tokens to the budget a second time.
+    if (alreadyLoaded.has(file.filePath)) {
+      loadedPaths.add(file.filePath);
+      continue;
+    }
     const effectivePinned = Boolean(file.frontmatter.pinned) || indexPinned.has(file.filePath);
     if (file.lineCount > SMALL_FILE_LINE_THRESHOLD && !effectivePinned) {
       continue; // large files get index-only unless pinned
@@ -416,6 +450,7 @@ function buildFullTextSection(
     budget.remaining -= bodyTokens;
     filesLoaded++;
     loadedPaths.add(file.filePath);
+    alreadyLoaded.add(file.filePath);
   }
 
   return {

@@ -9,7 +9,7 @@
 // Fire-and-forget: never blocks the user's turn. All errors are caught and
 // logged to stderr.
 
-import { type Dirent, existsSync, readdirSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -427,9 +427,38 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
   // and could return a project-tier overwrite for a topic it had only ever
   // seen in global. The write loop picks its directory from the candidate's
   // tier, so that overwrite would land on an unrelated same-named project file.
+  //
+  // Both sides are canonicalized: entry.filePath comes from resolveHref, which
+  // realpath's the target, while MemoryDir.dir is built lexically from
+  // homedir(). If any component of the store is a symlink (a dotfiles-managed
+  // ~/.claude), every canonical entry path fails a lexical prefix test and
+  // attribution silently falls back to the LINKING tier — reintroducing the
+  // exact misattribution this function exists to prevent. The injector
+  // canonicalizes both sides for the same reason.
+  const canonicalRoots = new Map<MemoryDir, string>();
+  const canonicalDir = (dir: MemoryDir): string => {
+    const cached = canonicalRoots.get(dir);
+    if (cached !== undefined) return cached;
+    let root: string;
+    try {
+      root = realpathSync(dir.dir);
+    } catch {
+      root = dir.dir; // missing store — the lexical path is all we have
+    }
+    canonicalRoots.set(dir, root);
+    return root;
+  };
   const ownerOf = (filePath: string, fallback: MemoryDir): MemoryDir => {
+    let canonicalPath = filePath;
+    try {
+      canonicalPath = realpathSync(filePath);
+    } catch {
+      // Missing target keeps the lexical path (resolveHref does the same).
+    }
     for (const d of [resolved.project, resolved.global]) {
-      if (d && (filePath === d.dir || filePath.startsWith(`${d.dir}/`))) return d;
+      if (!d) continue;
+      const root = canonicalDir(d);
+      if (canonicalPath === root || canonicalPath.startsWith(`${root}/`)) return d;
     }
     return fallback;
   };

@@ -2,7 +2,15 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -402,6 +410,52 @@ describe("buildExistingIndexSummary tier attribution", () => {
     };
     const summary = buildExistingIndexSummary(resolved as never);
     // The entry is attributed to global, not silently to project.
+    expect(summary).toContain("[owner: global]");
+  });
+});
+
+describe("tier attribution survives a symlinked store root", () => {
+  it("still attributes cross-tier entries to the owning tier", () => {
+    // entry.filePath is realpath'd by resolveHref, while MemoryDir.dir was
+    // built lexically from homedir(). With any store component behind a
+    // symlink (a dotfiles-managed ~/.claude), a lexical prefix test fails for
+    // EVERY entry and ownerOf silently falls back to the linking tier —
+    // reintroducing the misattribution the round-5 fix removed.
+    const realGlobal = join(tmpDir, "real-claude", "memory");
+    mkdirSync(realGlobal, { recursive: true });
+    writeFileSync(
+      join(realGlobal, "shared-slug.md"),
+      "---\ndescription: GLOBAL OWNER\ntype: reference\n---\ng\n",
+    );
+    // The store is reached through a symlink, which is how dir would look if
+    // ~/.claude itself were a symlink.
+    const linkGlobal = join(tmpDir, "link-claude-memory");
+    symlinkSync(realGlobal, linkGlobal);
+
+    const proj = join(tmpDir, "work", "proj");
+    mkdirSync(proj, { recursive: true });
+    // The project index links the CANONICAL path (as resolveHref produces).
+    writeFileSync(
+      join(proj, "MEMORY.md"),
+      `# P\n- [Shared](${join(realGlobal, "shared-slug.md")}) — global-owned entry\n`,
+    );
+
+    const resolved = {
+      project: {
+        tier: "project" as const,
+        dir: proj,
+        indexPath: join(proj, "MEMORY.md"),
+        label: "project",
+      },
+      global: {
+        tier: "global" as const,
+        dir: linkGlobal, // lexical path through the symlink
+        indexPath: join(linkGlobal, "MEMORY.md"),
+        label: "global",
+      },
+      warnings: [],
+    };
+    const summary = buildExistingIndexSummary(resolved as never);
     expect(summary).toContain("[owner: global]");
   });
 });
