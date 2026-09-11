@@ -363,3 +363,45 @@ describe("snapshotMtimes keys", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("buildExistingIndexSummary tier attribution", () => {
+  it("marks an entry linked by another tier's index with its OWNING tier", () => {
+    // A project index may link to a global topic via an absolute href. The
+    // summary must not present that entry as a project slug: the write loop
+    // picks its directory from the candidate's tier, so a mis-attributed
+    // entry lets the model overwrite an unrelated same-named project file
+    // using contents it only ever saw in global.
+    const proj = join(tmpDir, "work", "proj");
+    const glob = join(tmpDir, ".claude", "memory");
+    mkdirSync(proj, { recursive: true });
+    mkdirSync(glob, { recursive: true });
+    // Global owns shared-slug.md …
+    writeFileSync(
+      join(glob, "shared-slug.md"),
+      "---\ndescription: GLOBAL OWNER\ntype: reference\n---\ng\n",
+    );
+    // … and the project index links to it cross-tier.
+    writeFileSync(
+      join(proj, "MEMORY.md"),
+      `# P\n- [Shared](/${glob}/shared-slug.md) — global-owned entry\n`,
+    );
+    const resolved = {
+      project: {
+        tier: "project" as const,
+        dir: proj,
+        indexPath: join(proj, "MEMORY.md"),
+        label: "project",
+      },
+      global: {
+        tier: "global" as const,
+        dir: glob,
+        indexPath: join(glob, "MEMORY.md"),
+        label: "global",
+      },
+      warnings: [],
+    };
+    const summary = buildExistingIndexSummary(resolved as never);
+    // The entry is attributed to global, not silently to project.
+    expect(summary).toContain("[owner: global]");
+  });
+});

@@ -31,7 +31,11 @@ export interface PiClaudeMemoryConfig {
   reviewMaxChunkChars: number;
   /** Fire auto-learn on session shutdown (catches short sessions). */
   reviewOnShutdown: boolean;
-  /** Minimum chunk chars to trigger shutdown auto-learn. */
+  /** Minimum chunk chars to trigger a review from the COMPACT and SHUTDOWN
+   * paths. Both use this one threshold: they fire at the same kind of moment
+   * (the conversation is being restructured or is ending) and there is no
+   * reason for them to differ. Named for shutdown only because that was the
+   * first caller — see handleSessionBeforeCompact in index.ts. */
   shutdownMinChunkChars: number;
   /** Timeout (ms) for shutdown auto-learn LLM call. */
   shutdownTimeoutMs: number;
@@ -70,6 +74,10 @@ export function num(
   max: number,
 ): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+    // Deliberately console.error, and deliberately one line: a malformed
+    // settings.json value is a user-actionable fault, not background chatter.
+    // This does NOT fire during normal operation (it requires a bad config),
+    // so it cannot land mid-conversation the way auto-learn progress used to.
     console.error(
       `[pi-claude-memory] invalid value for ${field}: ${JSON.stringify(value)} ` +
         `(must be an integer in [${min}, ${max}]) — using default ${fallback}`,

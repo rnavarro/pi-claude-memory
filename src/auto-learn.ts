@@ -411,19 +411,38 @@ export function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> 
  * Falls back to readdir filenames only if MEMORY.md is unparseable. */
 export function buildExistingIndexSummary(resolved: ResolveResult): string {
   const lines: string[] = [];
+  // Each entry must be advertised under the tier that OWNS it, not under the
+  // tier whose index happens to link it. A project index can link to a global
+  // topic (cross-tier absolute hrefs are supported), and the summary used to
+  // group such an entry under "project" while reducing the href to a bare
+  // basename — so the model saw global contents described as a project slug
+  // and could return a project-tier overwrite for a topic it had only ever
+  // seen in global. The write loop picks its directory from the candidate's
+  // tier, so that overwrite would land on an unrelated same-named project file.
+  const ownerOf = (filePath: string, fallback: MemoryDir): MemoryDir => {
+    for (const d of [resolved.project, resolved.global]) {
+      if (d && (filePath === d.dir || filePath.startsWith(`${d.dir}/`))) return d;
+    }
+    return fallback;
+  };
+
   for (const dir of [resolved.global, resolved.project]) {
     if (!dir) continue;
+    const headerIndex = lines.length;
     lines.push(`## ${dir.label} tier`);
+    const before = lines.length;
     try {
       const parsed = parseIndexFile(dir);
       if (parsed && parsed.entries.length > 0) {
         for (const entry of parsed.entries.slice(0, 50)) {
-          // Emit the filename stem (slug) as the stable identifier before the
-          // colon — the writer keys overwrite targets on slugify(candidate.name),
-          // so the LLM must return THAT slug to supersede, not the display title
-          // (which may differ from the filename and would create a duplicate).
+          // The stem is the stable identifier: the writer keys overwrite
+          // targets on slugify(candidate.name), so the model must return THIS
+          // slug to supersede. The owning tier is stated explicitly because a
+          // slug alone is ambiguous across stores.
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
-          lines.push(`- ${stem}: ${entry.summary}`);
+          const owner = ownerOf(entry.filePath, dir);
+          const tierNote = owner.tier === dir.tier ? "" : ` [owner: ${owner.tier}]`;
+          lines.push(`- ${stem}: ${entry.summary}${tierNote}`);
         }
         if (parsed.entries.length > 50) {
           lines.push(`... and ${parsed.entries.length - 50} more`);
@@ -443,6 +462,11 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
       }
     } catch {
       lines.push("(unreadable)");
+    }
+    // Drop a section that carries a header but no entries we could attribute
+    // to this tier, so the model is not handed a header implying ownership.
+    if (lines.length === before && headerIndex < lines.length) {
+      lines.length = headerIndex;
     }
   }
   return lines.join("\n");
