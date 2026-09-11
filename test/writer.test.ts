@@ -1622,3 +1622,33 @@ describe("cross-tier unlink matches the topic, not a same-named file", () => {
     expect(readFileSync(join(glob, "MEMORY.md"), "utf8")).toContain("(user_location.md)");
   });
 });
+
+describe("an exact name resolves to the exact file", () => {
+  it("prefers the caller's exact stem over a slug-alike when both exist", () => {
+    // Two different topics whose stems differ only by the characters slugify
+    // folds. Slug-first made `readMemory(dir, "Foo Bar")` read foo-bar.md, so an
+    // exact, on-disk name resolved to a DIFFERENT topic — and an overwrite or a
+    // removal landed on the wrong file.
+    writeFileSync(
+      join(tmpDir, "Foo Bar.md"),
+      "---\ndescription: spaced\ntype: reference\n---\nSPACED\n",
+    );
+    writeFileSync(
+      join(tmpDir, "foo-bar.md"),
+      "---\ndescription: slugged\ntype: reference\n---\nSLUGGED\n",
+    );
+
+    const spaced = readMemory(dir, "Foo Bar");
+    const slugged = readMemory(dir, "foo-bar");
+    if (!spaced.ok || !slugged.ok) throw new Error("expected both names to resolve");
+    expect(spaced.content).toContain("SPACED");
+    expect(slugged.content).toContain("SLUGGED");
+
+    // The destructive path follows the same identity: the exact file goes and
+    // the slug-alike survives.
+    const res = removeMemory(dir, { name: "Foo Bar", tier: "project" });
+    expect(res.ok).toBe(true);
+    expect(existsSync(join(tmpDir, "Foo Bar.md"))).toBe(false);
+    expect(existsSync(join(tmpDir, "foo-bar.md"))).toBe(true);
+  });
+});
