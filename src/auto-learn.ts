@@ -372,7 +372,7 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
  * same-slug file in the other tier must not stand in for the target's
  * mtime (project iterated after global would otherwise overwrite the
  * global key and phantom-mismatch every global overwrite). */
-function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
+export function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
   const map = new Map<string, number>();
   for (const dir of dirs) {
     if (!dir || !existsSync(dir.dir)) continue;
@@ -385,10 +385,17 @@ function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".md") || entry.name === "MEMORY.md") continue;
       try {
-        map.set(
-          `${dir.tier}:${entry.name.replace(/\.md$/, "")}`,
-          statSync(join(dir.dir, entry.name)).mtimeMs,
-        );
+        const mtime = statSync(join(dir.dir, entry.name)).mtimeMs;
+        const stem = entry.name.replace(/\.md$/, "");
+        // Key by the RAW stem (what buildExistingIndexSummary advertises to
+        // the model) AND by its slug (what the write path targets and the
+        // overwrite guard looks up). A topic whose stem is not slug-normal
+        // ("Foo Bar.md", or uppercase) otherwise had a summary advertising
+        // "Foo Bar" while the guard asked for "foo-bar": the lookup missed
+        // and every supersession of that entry silently no-opped.
+        map.set(`${dir.tier}:${stem}`, mtime);
+        const slug = slugify(stem);
+        if (slug && slug !== stem) map.set(`${dir.tier}:${slug}`, mtime);
       } catch {
         // skip unreadable
       }
