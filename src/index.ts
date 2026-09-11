@@ -21,7 +21,7 @@ import type {
   ToolResultEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { type AutoLearnConfig, buildExistingIndexSummary, runAutoLearn } from "./auto-learn.js";
+import { type AutoLearnConfig, runAutoLearn } from "./auto-learn.js";
 import { loadConfig, type PiClaudeMemoryConfig } from "./config.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { buildMemoryInjection } from "./injector.js";
@@ -217,8 +217,8 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         toolResultChars: toolText.length,
       });
 
-      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
-      const existingIndex = buildExistingIndexSummary(resolved);
+      // runAutoLearn builds the existing-index summary itself, after auth,
+      // from a fresh exact resolution — callers no longer pass a stale one.
       const autoLearnCfg: AutoLearnConfig = {
         everyTurns: config.reviewIntervalTurns,
         model: config.reviewModel,
@@ -240,7 +240,7 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         };
         return;
       }
-      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex);
+      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated);
     },
   );
 }
@@ -308,8 +308,10 @@ async function handleSessionShutdown(
         // await — an await would let the settled review's .finally
         // interleave, drain pendingCompact, and double-launch.
         autoLearnInFlight = null;
-        // A queued compact snapshot is superseded by this shutdown review.
-        pendingCompact = null;
+        // NOTE: a queued compact snapshot is NOT cleared here — its material
+        // (pre-compaction) is merged into the final chunk below instead of
+        // being dropped. Only the timeout branch above may discard it, since
+        // that path skips the final review entirely to avoid a double writer.
       }
 
       // Now build a final chunk from whatever conversation we have. At
@@ -317,7 +319,16 @@ async function handleSessionShutdown(
       // we supply our own abort signal with a deadline.
       const branchText = serializeBranch(ctx);
       const toolText = toolResultChunk;
-      const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+      let chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+
+      // A queued pre-compaction snapshot must NOT be discarded: compaction
+      // already destroyed the raw messages it captured, so the current
+      // post-compaction branch is not a substitute for its material. Prepend
+      // it to the final review input (bounded by the same shared deadline).
+      if (pendingCompact) {
+        chunk = `### Pre-compaction snapshot\n${pendingCompact.chunk}\n\n${chunk}`;
+        pendingCompact = null;
+      }
 
       if (chunk.trim().length < config.shutdownMinChunkChars) {
         debugLog("auto_learn.skip_shutdown", {
@@ -338,8 +349,6 @@ async function handleSessionShutdown(
         toolResultChars: toolText.length,
       });
 
-      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
-      const existingIndex = buildExistingIndexSummary(resolved);
       const autoLearnCfg: AutoLearnConfig = {
         everyTurns: config.reviewIntervalTurns,
         model: config.reviewModel,
@@ -360,7 +369,7 @@ async function handleSessionShutdown(
       shutdownTimer.unref?.();
       try {
         await raceTimeout(
-          launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, shutdownController),
+          launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, shutdownController),
           remainingMs(),
         );
       } catch (err) {
@@ -501,9 +510,6 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
         toolResultChars: toolText.length,
       });
 
-      const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(ctx.cwd);
-      const existingIndex = buildExistingIndexSummary(resolved);
-
       const autoLearnCfg: AutoLearnConfig = {
         everyTurns: config.reviewIntervalTurns,
         model: config.reviewModel,
@@ -512,7 +518,7 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
       };
 
       // Fire-and-forget: never block the user's next turn.
-      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex);
+      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated);
     },
   );
 }
@@ -611,7 +617,6 @@ function launchAutoLearn(
   cfg: AutoLearnConfig,
   cwd: string,
   chunk: string,
-  existingIndex: string,
   callerController?: AbortController,
 ): Promise<number> {
   if (autoLearnInFlight) {
@@ -626,7 +631,7 @@ function launchAutoLearn(
   // caller controller (shutdown) is registered the same way — autoLearnAbort
   // must point at the controller whose signal the review actually holds.
   const controller = callerController ?? new AbortController();
-  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, controller.signal);
+  const promise = runAutoLearn(ctx, cfg, cwd, chunk, controller.signal);
   const gen = autoLearnGeneration;
   autoLearnInFlight = promise;
   autoLearnAbort = controller;
@@ -674,14 +679,11 @@ function drainPendingCompact(): void {
   if (!pendingCompact || autoLearnInFlight) return;
   const p = pendingCompact;
   pendingCompact = null;
-  // Recompute the index summary at drain time. The review that just finished
-  // may have written memories after this snapshot was queued; replaying the
-  // queue-time summary would hide those entries from supersession and cause
-  // duplicate writes.
-  const resolved = frozenInjection?.resolved ?? resolveMemoryDirs(p.cwd);
-  const existingIndex = buildExistingIndexSummary(resolved);
+  // runAutoLearn rebuilds the index summary itself from a fresh exact
+  // resolution — the just-finished review's new memories are visible to
+  // supersession.
   debugLog("auto_learn.compact_drain", { chunkChars: p.chunk.length });
-  void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk, existingIndex);
+  void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk);
 }
 
 /** Race a promise against a timeout. Resolves with the promise's value, or

@@ -1,14 +1,15 @@
 // Quick smoke test against the real Claude Code memory corpus
 // Run: node --import tsx test/smoke.test.ts
 
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
 import { buildMemoryInjection } from "../src/injector.js";
 import { encodePath, resolveMemoryDirs } from "../src/resolver.js";
+import type { MemoryDir as MemoryDirType } from "../src/types.js";
 
 const APP_CWD = "/home/user/workspace/my-app";
 const OTHER_CWD = "/home/user/workspace/other-project";
@@ -193,5 +194,91 @@ describe("injector (synthetic, index-pin bypass)", () => {
     expect(fullText).not.toContain("unpinned_big");
 
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("injector read-side containment", () => {
+  // Synthetic dirs (no real corpus needed)
+  const mkDir = (root: string, tier: "project" | "global"): MemoryDirType => ({
+    tier,
+    dir: root,
+    indexPath: join(root, "MEMORY.md"),
+    label: tier,
+  });
+
+  it("skips index hrefs pointing outside the memory stores", () => {
+    const projRoot = mkdtempSync(join(tmpdir(), "pcm-contain-p-"));
+    const globalRoot = mkdtempSync(join(tmpdir(), "pcm-contain-g-"));
+    mkdirSync(projRoot, { recursive: true });
+    mkdirSync(globalRoot, { recursive: true });
+
+    // Legitimate topic
+    writeFileSync(
+      join(projRoot, "inside.md"),
+      "---\ndescription: d\ntype: project\n---\ninside body\n",
+    );
+    // Outside absolute href
+    const outsideDir = mkdtempSync(join(tmpdir(), "pcm-outside-"));
+    const outsidePath = join(outsideDir, "victim.md");
+    writeFileSync(outsidePath, "---\ndescription: d\ntype: project\n---\nsecret outside body\n");
+    // Symlinked "topic" inside the store pointing outside
+    symlinkSync(outsidePath, join(projRoot, "sneaky.md"));
+
+    // Traversal href (../ relative escapes projRoot)
+    writeFileSync(
+      join(outsideDir, "traversal.md"),
+      "---\ndescription: d\ntype: project\n---\ntraversal body\n",
+    );
+
+    writeFileSync(
+      join(projRoot, "MEMORY.md"),
+      `- [Inside](inside.md) — in\n` +
+        `- [Victim](${outsidePath}) — out\n` +
+        `- [Sneaky](sneaky.md) — sneaky\n` +
+        `- [Traversal](../../${basename(outsideDir)}/traversal.md) — trav\n`,
+    );
+
+    const { text, warnings } = buildMemoryInjection(
+      mkDir(projRoot, "project"),
+      mkDir(globalRoot, "global"),
+      5000,
+      true,
+    );
+    expect(text).toContain("inside body");
+    expect(text).not.toContain("secret outside body");
+    expect(text).not.toContain("traversal body");
+    // Inside-body link present in index regardless of full-text load
+    expect(warnings.join("\n")).not.toContain("secret");
+
+    rmSync(projRoot, { recursive: true, force: true });
+    rmSync(globalRoot, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  it("still loads legitimate cross-tier absolute hrefs", () => {
+    const projRoot = mkdtempSync(join(tmpdir(), "pcm-cross-p-"));
+    const globalRoot = mkdtempSync(join(tmpdir(), "pcm-cross-g-"));
+    mkdirSync(projRoot, { recursive: true });
+    mkdirSync(globalRoot, { recursive: true });
+
+    writeFileSync(
+      join(globalRoot, "shared.md"),
+      "---\ndescription: d\ntype: reference\n---\ncross-tier body\n",
+    );
+    writeFileSync(
+      join(projRoot, "MEMORY.md"),
+      `- [Shared](${join(globalRoot, "shared.md")}) — cross-tier\n`,
+    );
+
+    const { text } = buildMemoryInjection(
+      mkDir(projRoot, "project"),
+      mkDir(globalRoot, "global"),
+      5000,
+      true,
+    );
+    expect(text).toContain("cross-tier body");
+
+    rmSync(projRoot, { recursive: true, force: true });
+    rmSync(globalRoot, { recursive: true, force: true });
   });
 });
