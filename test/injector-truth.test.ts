@@ -137,3 +137,20 @@ describe("anchor gating keeps the index guidance", () => {
     expect(text).not.toContain("ctx_search");
   });
 });
+
+describe("injector marks unfetchable topics honestly", () => {
+  it("marks an oversize topic as unavailable, not as fetchable", () => {
+    // The file is present on disk but over TOPIC_FILE_MAX_BYTES, so
+    // loadTopicFiles skips it — and readMemory refuses it for the same reason.
+    // ⟨index-only⟩ is an instruction to call recall_memory, so marking it that
+    // way sent the model to a tool call that could not succeed: the same class
+    // the ⟨missing⟩ marker fixed, one branch short.
+    const proj = mkStore("p2", "project", "proj", "# P\n- [Big](big.md) — b\n", {
+      "big.md": doc("x".repeat(1_100_000)),
+    });
+    const { text } = buildMemoryInjection(proj, null, 20_000);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("⟨unavailable⟩");
+    expect(section).not.toContain("⟨index-only⟩");
+  });
+});
