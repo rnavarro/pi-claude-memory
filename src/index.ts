@@ -347,18 +347,31 @@ async function handleSessionShutdown(
         maxOutputTokens: config.reviewMaxOutputTokens,
       };
 
-      // Final review. AbortSignal.timeout is cooperative cancellation only —
-      // a provider that ignores the signal would still hang the await, so
-      // race the whole launch against the remaining shared deadline too.
-      const signal = AbortSignal.timeout(remainingMs() || 1);
+      // Final review. Own an AbortController (not just a timed signal) so
+      // this launch is reachable via autoLearnAbort — otherwise session_start
+      // of a replacement session cannot abort a shutdown review still
+      // writing — and race the await so a provider that ignores the signal
+      // cannot hang shutdown.
+      const shutdownController = new AbortController();
+      const shutdownTimer = setTimeout(
+        () => shutdownController.abort(),
+        Math.max(remainingMs(), 1),
+      );
+      shutdownTimer.unref?.();
       try {
         await raceTimeout(
-          launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, signal),
+          launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated, existingIndex, shutdownController),
           remainingMs(),
         );
       } catch (err) {
+        // Deadline hit or the review errored: abort either way — a provider
+        // that ignored the signal may still be mid-write, and the write loop
+        // checks signal.aborted between candidates.
+        shutdownController.abort();
         debugLog("auto_learn.shutdown_error", { error: String(err) });
         // Swallow — never block shutdown on an LLM error.
+      } finally {
+        clearTimeout(shutdownTimer);
       }
     },
   );
@@ -599,7 +612,7 @@ function launchAutoLearn(
   cwd: string,
   chunk: string,
   existingIndex: string,
-  signal?: AbortSignal,
+  callerController?: AbortController,
 ): Promise<number> {
   if (autoLearnInFlight) {
     debugLog("auto_learn.skip_inflight", {});
@@ -607,11 +620,13 @@ function launchAutoLearn(
     return Promise.resolve(0);
   }
 
-  // Reviews launched without a caller-supplied signal (periodic, compact)
-  // get an abort controller we own, so shutdown-timeout and session_start
-  // can cancel the review instead of abandoning it while it still writes.
-  const controller = signal ? null : new AbortController();
-  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, signal ?? controller?.signal);
+  // Reviews launched without a caller-supplied controller (periodic,
+  // compact) get one we own, so shutdown-timeout and session_start can
+  // cancel the review instead of abandoning it while it still writes. A
+  // caller controller (shutdown) is registered the same way — autoLearnAbort
+  // must point at the controller whose signal the review actually holds.
+  const controller = callerController ?? new AbortController();
+  const promise = runAutoLearn(ctx, cfg, cwd, chunk, existingIndex, controller.signal);
   const gen = autoLearnGeneration;
   autoLearnInFlight = promise;
   autoLearnAbort = controller;

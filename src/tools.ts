@@ -10,7 +10,7 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache } from "./index.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
-import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
+import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { ResolveResult } from "./types.js";
 
 /** Pick a tier dir from a resolve result. */
@@ -41,20 +41,54 @@ const recallTool = defineTool({
     "recall_memory - Read a Claude Code memory entry by name with [[wikilink]] resolution.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     debugLog("tool.recall_memory", { name: params.name, tier: params.tier ?? "project" });
-    const tier = params.tier ?? "project";
     const resolved = resolveMemoryDirs(ctx.cwd);
+    const defaultTier = params.tier === undefined;
+    const tier = params.tier ?? "project";
+    const otherTier = tier === "project" ? "global" : "project";
 
-    // Try the requested tier first, fall back to the other.
-    const dir =
-      pickTier(resolved, tier) ?? pickTier(resolved, tier === "project" ? "global" : "project");
-    if (!dir) {
+    // No memory dir at all.
+    if (!pickTier(resolved, tier) && !pickTier(resolved, otherTier)) {
       return {
         content: [{ type: "text", text: `No memory directory available (tier=${tier}).` }],
         details: undefined as unknown,
       };
     }
 
+    const dir = pickTier(resolved, tier);
+    if (!dir) {
+      return {
+        content: [{ type: "text", text: `No memory directory available (tier=${tier}).` }],
+        details: undefined as unknown,
+      };
+    }
     const result = readMemory(dir, params.name);
+
+    // Entry-level fallback: an omitted tier promises "falls back to global if
+    // not found" — the ENTRY may live in the other tier, not just the dir.
+    // An explicitly named tier is honored strictly so same-slug entries
+    // cannot be confused across tiers.
+    if (!result.ok && defaultTier) {
+      const otherDir = pickTier(resolved, otherTier);
+      if (otherDir && otherDir !== dir) {
+        const fallback = readMemory(otherDir, params.name);
+        if (fallback.ok) {
+          debugLog("tool.recall_memory.fallback", {
+            name: params.name,
+            tier: otherDir.tier,
+          });
+          const fallbackHeader = `**${otherDir.label} tier** — \`${fallback.filePath}\`\n\n`;
+          return {
+            content: [{ type: "text", text: fallbackHeader + fallback.content }],
+            details: {
+              tier: otherDir.tier,
+              filePath: fallback.filePath,
+              name: fallback.frontmatter.name,
+            } as unknown,
+          };
+        }
+      }
+    }
+
     if (!result.ok) {
       return {
         content: [{ type: "text", text: result.message }],
@@ -145,9 +179,12 @@ const writeTool = defineTool({
     // fallback) so a write never lands in another project's store.
     const resolved = resolveMemoryDirs(ctx.cwd, { exactOnly: true });
     let dir = pickTier(resolved, tier);
-    // For project-tier writes, create the dir if it doesn't exist yet.
+    // Create the dir if it doesn't exist yet (fresh installations have no
+    // store — reads stay side-effect-free, writes create on demand).
     if (!dir && tier === "project") {
       dir = createProjectMemoryDir(ctx.cwd);
+    } else if (!dir && tier === "global") {
+      dir = createGlobalMemoryDir();
     }
     if (!dir) {
       return {
@@ -228,6 +265,10 @@ const removeTool = defineTool({
     };
   },
 });
+
+export const recallMemoryTool = recallTool;
+export const writeMemoryTool = writeTool;
+export const removeMemoryTool = removeTool;
 
 /** Register all memory tools. */
 export function registerMemoryTools(pi: ExtensionAPI): void {

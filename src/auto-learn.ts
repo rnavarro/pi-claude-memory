@@ -17,7 +17,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { parseIndexFile } from "./index-parser.js";
 import { slugify, writeMemory } from "./memory-writer.js";
-import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
+import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
 /** Configuration for auto-learning. */
@@ -230,9 +230,17 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   // Write each candidate. Count successes.
   let written = 0;
   for (const c of candidates) {
+    // Abort between candidates: a shutdown-timeout abort raised mid-loop
+    // must stop the remaining fs writes as soon as possible.
+    if (signal?.aborted) {
+      debugLog("auto_learn.skip_writes_aborted", { remaining: candidates.length - written });
+      break;
+    }
     let dir: MemoryDir | null = c.tier === "global" ? resolved.global : resolved.project;
     if (!dir && c.tier === "project") {
       dir = createProjectMemoryDir(cwd);
+    } else if (!dir && c.tier === "global") {
+      dir = createGlobalMemoryDir();
     }
     if (!dir) {
       // Requested tier unavailable — skip silently. The model will learn from
@@ -269,18 +277,26 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
         continue;
       }
     }
-    const result = writeMemory(dir, {
-      name: c.name,
-      description: c.description,
-      type: c.type,
-      body: c.body,
-      pinned: c.pinned,
-      tier: c.tier,
-      priority: c.priority ?? null,
-      // Auto-learn overwrites only when the LLM signals supersession
-      allowOverwrite: c.overwrite === true,
-    });
-    if (result.ok) written++;
+    // Per-candidate try/catch: one bad candidate (fs error, portability
+    // throw) must not drop the rest of the batch — a thrown error here
+    // would otherwise reject runAutoLearn and lose all remaining writes.
+    try {
+      const result = writeMemory(dir, {
+        name: c.name,
+        description: c.description,
+        type: c.type,
+        body: c.body,
+        pinned: c.pinned,
+        tier: c.tier,
+        priority: c.priority ?? null,
+        // Auto-learn overwrites only when the LLM signals supersession
+        allowOverwrite: c.overwrite === true,
+      });
+      if (result.ok) written++;
+    } catch (err) {
+      debugLog("auto_learn.write_error", { name: c.name, tier: c.tier, error: String(err) });
+      console.error(`[pi-claude-memory] auto-learn write failed for ${c.name}: ${String(err)}`);
+    }
   }
 
   debugLog("auto_learn.complete", {
