@@ -8,8 +8,8 @@
 // 5. Large files get index-only with ⟨index-only⟩ marker (model can fetch via recall_memory)
 // 6. Project tier injected first so it wins the shared budget (see buildMemoryInjection)
 
-import { lstatSync, readFileSync } from "node:fs";
-import { basename, resolve, sep } from "node:path";
+import { closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { basename, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
@@ -213,70 +213,89 @@ const TOPIC_FILE_MAX_BYTES = 1_000_000;
  *
  * Read-side containment: index hrefs resolve to arbitrary paths (including
  * absolute cross-tier links), so each file is validated against the
- * approved memory roots (its own tier's dir plus the other tier's dir) with
- * lexical containment, must be a plain regular file (lstat rejects symlinks
- * — a symlinked "topic" could point anywhere on disk), and must be under
- * the size cap — all BEFORE any bytes are read into what becomes the system
- * prompt. */
+ * approved memory roots (its own tier's dir plus the other tier's dir),
+ * must be a plain regular file, and must be under the size cap — all BEFORE
+ * any bytes are read into what becomes the system prompt.
+ *
+ * Containment is checked on the CANONICAL path (realpathSync), not the
+ * lexical one: `resolve()` is pure string math, so a symlinked DIRECTORY
+ * inside the store (memory/bridge -> /) passes a lexical check and then
+ * has its children injected. Both sides are canonicalized — the memory
+ * roots themselves may live behind a symlink (a dotfiles-managed
+ * ~/.claude, for instance), so canonicalizing only the candidate would
+ * reject every legitimate file.
+ *
+ * The final read goes through an open file descriptor that is fstat'd, so
+ * the regular-file and size checks and the bytes come from the SAME inode;
+ * a pathname check followed by a pathname read is two lookups that a
+ * concurrent swap can desynchronize. */
 function loadTopicFiles(
   dir: MemoryDir,
   filePaths: string[],
   otherTierDir?: string | null,
 ): Map<string, MemoryFile> {
-  const allowedRoots = [resolve(dir.dir)];
-  if (otherTierDir) allowedRoots.push(resolve(otherTierDir));
+  // Canonicalize the approved roots once. A root that cannot be realpath'd
+  // (does not exist yet) simply cannot contain anything.
+  const allowedRoots: string[] = [];
+  for (const root of [dir.dir, otherTierDir]) {
+    if (!root) continue;
+    try {
+      allowedRoots.push(realpathSync(root));
+    } catch {
+      // root missing — contributes no allowed prefix
+    }
+  }
   const files = new Map<string, MemoryFile>();
   for (const filePath of filePaths) {
     try {
-      const resolvedPath = resolve(filePath);
-      // Containment: only files inside an approved memory root may enter
-      // the prompt. A hand-edited index line pointing at /etc/passwd or
-      // ../secrets gets skipped here, before any read.
+      // Canonical path: follows symlinks in EVERY component, and doubles as
+      // the existence check (realpath throws ENOENT for a missing file).
+      const realPath = realpathSync(filePath);
+      // Containment against canonical roots. A path resolving outside every
+      // store is skipped before any read — whether it got there via ../, an
+      // absolute href, or a symlinked intermediate directory.
       const contained = allowedRoots.some(
-        (r) => resolvedPath === r || resolvedPath.startsWith(`${r}${sep}`),
+        (r) => realPath === r || realPath.startsWith(`${r}${sep}`),
       );
       if (!contained) {
-        debugLog("injector.topic_containment_reject", { filePath, tier: dir.tier });
+        debugLog("injector.topic_containment_reject", { filePath, realPath, tier: dir.tier });
         continue;
       }
-      // Regular plain files only: a symlinked topic could lead outside the
-      // store; directories/fifos are never memory topics.
-      let st: import("node:fs").Stats;
-      try {
-        st = lstatSync(resolvedPath);
-      } catch {
-        continue;
-      }
-      if (st.isSymbolicLink() || !st.isFile()) {
-        debugLog("injector.topic_not_regular_file", { filePath, tier: dir.tier });
-        continue;
-      }
-      // Size cap before reading.
-      if (st.size > TOPIC_FILE_MAX_BYTES) {
-        debugLog("injector.topic_oversize_skip", {
-          filePath,
-          size: st.size,
-          cap: TOPIC_FILE_MAX_BYTES,
-        });
-        continue;
-      }
-      const filename = basename(resolvedPath);
+      const filename = basename(realPath);
       // Skip MEMORY.md itself
       if (filename === "MEMORY.md") continue;
-      // One read + one stat per file: read the bytes once, stat for mtime,
-      // and parse from the in-memory string (parseMemoryContent) instead of
-      // having parseMemoryFile read the file a second time.
-      const content = readFileSync(resolvedPath, "utf8");
+      // Open once, then validate and read the same inode.
+      let fd: number;
+      try {
+        fd = openSync(realPath, "r");
+      } catch {
+        continue;
+      }
+      let content: string;
       let mtime = 0;
       try {
+        const st = fstatSync(fd);
+        if (!st.isFile()) {
+          debugLog("injector.topic_not_regular_file", { filePath, realPath, tier: dir.tier });
+          continue;
+        }
+        if (st.size > TOPIC_FILE_MAX_BYTES) {
+          debugLog("injector.topic_oversize_skip", {
+            filePath,
+            size: st.size,
+            cap: TOPIC_FILE_MAX_BYTES,
+          });
+          continue;
+        }
         mtime = st.mtimeMs;
-      } catch {
-        // stat failure — inject with mtime 0 (sorts last)
+        content = readFileSync(fd, "utf8");
+      } finally {
+        closeSync(fd);
       }
       const frontmatter = parseMemoryContent(content, filename, mtime);
-      files.set(resolvedPath, {
+      files.set(realPath, {
         filename,
-        filePath: resolvedPath,
+        filePath: realPath,
         frontmatter,
         size: content.length,
         mtime,

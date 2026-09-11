@@ -282,3 +282,78 @@ describe("injector read-side containment", () => {
     rmSync(globalRoot, { recursive: true, force: true });
   });
 });
+
+describe("injector containment: symlinked ancestors and roots", () => {
+  const mk = (root: string, tier: "project" | "global"): MemoryDirType => ({
+    tier,
+    dir: root,
+    indexPath: join(root, "MEMORY.md"),
+    label: tier,
+  });
+  const FM = "---\ndescription: d\ntype: project\n---\n";
+
+  it("rejects a topic reached through a symlinked DIRECTORY inside the store", () => {
+    const proj = mkdtempSync(join(tmpdir(), "pcm-anc-p-"));
+    const glob = mkdtempSync(join(tmpdir(), "pcm-anc-g-"));
+    const outside = mkdtempSync(join(tmpdir(), "pcm-anc-o-"));
+    writeFileSync(join(outside, "secret.md"), `${FM}ANCESTOR_LINK_SECRET\n`);
+    // A symlinked directory INSIDE the store: lexical containment passes,
+    // so this is only closed by canonicalizing the path.
+    symlinkSync(outside, join(proj, "bridge"));
+    writeFileSync(join(proj, "MEMORY.md"), "- [S](bridge/secret.md) — bridged\n");
+
+    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
+    expect(text).not.toContain("ANCESTOR_LINK_SECRET");
+
+    for (const d of [proj, glob, outside]) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("still loads a store whose own path is behind a symlink", () => {
+    const real = mkdtempSync(join(tmpdir(), "pcm-link-real-"));
+    const linkParent = mkdtempSync(join(tmpdir(), "pcm-link-p-"));
+    const glob = mkdtempSync(join(tmpdir(), "pcm-link-g-"));
+    writeFileSync(join(real, "t.md"), `${FM}VIA_LINKED_ROOT\n`);
+    writeFileSync(join(real, "MEMORY.md"), "- [T](t.md) — x\n");
+    const linked = join(linkParent, "store");
+    symlinkSync(real, linked);
+
+    const { text } = buildMemoryInjection(mk(linked, "project"), mk(glob, "global"), 5000, true);
+    expect(text).toContain("VIA_LINKED_ROOT");
+    // The body is in the prompt, so the index line must NOT claim otherwise.
+    // (Match on the link line, not the anchor, which mentions the phrase.)
+    expect(text).not.toContain("(t.md) — x ⟨index-only⟩");
+
+    for (const d of [real, linkParent, glob]) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("loads a topic referenced by a non-canonical absolute href", () => {
+    const proj = mkdtempSync(join(tmpdir(), "pcm-nc-p-"));
+    const glob = mkdtempSync(join(tmpdir(), "pcm-nc-g-"));
+    writeFileSync(join(proj, "ok.md"), `${FM}NONCANON_BODY\n`);
+    // Doubled separator in an absolute href: previously reached the injector
+    // as a different string than the loader's key, so the entry was injected
+    // AND marked index-only.
+    writeFileSync(join(proj, "MEMORY.md"), `- [Ok](${join(proj, "//ok.md")}) — x\n`);
+
+    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
+    expect(text).toContain("NONCANON_BODY");
+    expect(text).not.toContain("//ok.md) — x ⟨index-only⟩");
+
+    for (const d of [proj, glob]) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("ignores an index whose path is a directory or symlink", () => {
+    const proj = mkdtempSync(join(tmpdir(), "pcm-idx-p-"));
+    const glob = mkdtempSync(join(tmpdir(), "pcm-idx-g-"));
+    const outside = mkdtempSync(join(tmpdir(), "pcm-idx-o-"));
+    writeFileSync(join(outside, "MEMORY.md"), `- [Evil](${join(outside, "evil.md")}) — x\n`);
+    writeFileSync(join(outside, "evil.md"), `${FM}SYMLINKED_INDEX_PAYLOAD\n`);
+    // MEMORY.md itself as a symlink to an outside index.
+    symlinkSync(join(outside, "MEMORY.md"), join(proj, "MEMORY.md"));
+
+    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
+    expect(text).not.toContain("SYMLINKED_INDEX_PAYLOAD");
+
+    for (const d of [proj, glob, outside]) rmSync(d, { recursive: true, force: true });
+  });
+});
