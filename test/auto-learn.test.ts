@@ -199,6 +199,22 @@ describe("parseCandidates", () => {
     expect(cands[0].priority).toBe(5);
   });
 
+  it("rejects fractional priority (must be integer to match read-side validation)", () => {
+    const reply = JSON.stringify([
+      {
+        name: "bad-prio",
+        description: "Fractional priority",
+        type: "feedback",
+        body: "b",
+        tier: "project",
+        pinned: false,
+        priority: 4.5,
+      },
+    ]);
+    const cands = parseCandidates(reply);
+    expect(cands).toEqual([]);
+  });
+
   it("returns empty array for empty array input", () => {
     expect(parseCandidates("[]")).toEqual([]);
   });

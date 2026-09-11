@@ -77,20 +77,40 @@ function slugify(name: string): string {
  * across overwrites.
  */
 export function buildFrontmatterYaml(
-  entry: Pick<WriteMemoryRequest, "name" | "description" | "type" | "pinned">,
+  entry: Pick<WriteMemoryRequest, "name" | "description" | "type" | "pinned" | "priority">,
   modified: string,
   preservedMetadata: Record<string, unknown> = {},
 ): string {
   // Use the yaml package so output is guaranteed valid (never string-template).
-  // Spread preserved first, then our values override fields we own
+  // Spread preserved first, then our values override fields we own. We
+  // explicitly manage the fields we own (node_type, type, modified, pinned,
+  // priority) so a preserved value never survives an overwrite that intends to
+  // clear it — e.g. pinned:false must delete a preserved pinned:true, and an
+  // absent/invalid priority must delete a preserved one.
   const metadata: Record<string, unknown> = {
     ...preservedMetadata,
     node_type: "memory",
     type: entry.type,
     modified,
   };
+  // pinned is owned: set when true, delete when false so a preserved
+  // pinned:true does not survive an overwrite that clears it.
   if (entry.pinned) {
     metadata.pinned = true;
+  } else {
+    delete metadata.pinned;
+  }
+  // priority is owned: emit only a valid integer 1-5. Anything else clears it
+  // so a stale preserved priority cannot survive a write that omits it.
+  if (
+    typeof entry.priority === "number" &&
+    Number.isInteger(entry.priority) &&
+    entry.priority >= 1 &&
+    entry.priority <= 5
+  ) {
+    metadata.priority = entry.priority;
+  } else {
+    delete metadata.priority;
   }
   const doc: Record<string, unknown> = {
     name: entry.name,
@@ -104,7 +124,7 @@ export function buildFrontmatterYaml(
 /** Round-trip validate: parse what we just emitted, confirm fields survive. */
 function roundTripValidate(
   yamlText: string,
-  expected: Pick<WriteMemoryRequest, "name" | "description" | "type">,
+  expected: Pick<WriteMemoryRequest, "name" | "description" | "type" | "pinned" | "priority">,
 ): boolean {
   const m = yamlText.match(/^---\n([\s\S]*?)\n---\n/);
   if (!m) return false;
@@ -116,6 +136,18 @@ function roundTripValidate(
     if (!meta) return false;
     if (meta.type !== expected.type) return false;
     if (meta.node_type !== "memory") return false;
+    // pinned must round-trip: present+true when expected, absent when not.
+    if (expected.pinned && meta.pinned !== true) return false;
+    if (!expected.pinned && meta.pinned !== undefined) return false;
+    // priority must round-trip when a valid integer was provided.
+    if (
+      typeof expected.priority === "number" &&
+      Number.isInteger(expected.priority) &&
+      expected.priority >= 1 &&
+      expected.priority <= 5
+    ) {
+      if (meta.priority !== expected.priority) return false;
+    }
     return true;
   } catch {
     return false;
@@ -128,8 +160,10 @@ function roundTripValidate(
  * - false (auto-learn): if the file exists, skip and return ok=false.
  *   This prevents clobbering Claude Code-authored memories on slug collision.
  * - true (write_memory tool): if the file exists, overwrite it but preserve
- *   originSessionId and original modified timestamp from the existing file's
- *   raw frontmatter, so Claude Code's provenance metadata survives.
+ *   originSessionId (and other unknown metadata fields) from the existing
+ *   file's raw frontmatter, so Claude Code's provenance metadata survives.
+ *   The modified timestamp is always refreshed to now (recency sort wants the
+ *   latest write time, not the original).
  */
 export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpResult {
   const slug = slugify(req.name);
