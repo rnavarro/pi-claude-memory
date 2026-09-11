@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { composeShutdownChunk } from "../src/index.js";
+import { composeShutdownChunk, truncateReviewChunk } from "../src/index.js";
 
 describe("composeShutdownChunk", () => {
   it("returns the live chunk untouched when there is no snapshot", () => {
@@ -59,5 +59,27 @@ describe("composeShutdownChunk", () => {
 
   it("handles a zero cap without throwing", () => {
     expect(() => composeShutdownChunk("s", "l", 0)).not.toThrow();
+  });
+});
+
+describe("truncateReviewChunk", () => {
+  // The periodic and compaction chunks are chronological, so the head is the
+  // OLDEST conversation. Both used chunk.slice(0, max), which kept the oldest
+  // turns and dropped the newest corrections — for compaction, discarding the
+  // recent raw material at the very event meant to preserve it.
+  it("passes a chunk through untouched when it fits", () => {
+    expect(truncateReviewChunk("short", 100)).toBe("short");
+  });
+
+  it("keeps the TAIL (most recent) and marks the front", () => {
+    const chunk = `OLDEST_TURN${"a".repeat(400)}NEWEST_TURN`;
+    const out = truncateReviewChunk(chunk, 50);
+    expect(out).toContain("NEWEST_TURN"); // the recent material survives
+    expect(out).not.toContain("OLDEST_TURN"); // the oldest is what gets dropped
+    expect(out.startsWith("... [truncated]")).toBe(true);
+  });
+
+  it("does not throw on a zero cap", () => {
+    expect(() => truncateReviewChunk("x".repeat(100), 0)).not.toThrow();
   });
 });
