@@ -9,7 +9,7 @@
 // 6. Project tier injected first so it wins the shared budget (see buildMemoryInjection)
 
 import { closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
-import { basename, sep } from "node:path";
+import { basename, resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
@@ -23,7 +23,7 @@ const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candi
 /**
  * Routing anchor for when memory entries exist. Tells the model how to use
  * memory tools and how they coexist with ctx_search.
-/**
+ *
  * Matches context-mode's terse, directive arrow-syntax.
  *
  * The reviewer sentence is generated per-session rather than hardcoded: with
@@ -33,9 +33,12 @@ const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candi
  */
 export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. The memory below is already in context — never re-read a loaded entry.
 Index entry marked ⟨index-only⟩ → recall_memory(name); unmarked entries are already in full.
+Entry marked ⟨missing⟩ → its file is gone from disk; do not call recall_memory for it.
+An entry tagged [in global tier] lives in the global store, so pass that tier to recall_memory.
 User correction, stated preference, or verified fix → write_memory this turn.{{REVIEWER}}
 Memory that is now wrong → remove_memory (never leave it to rot).
-Durable facts across sessions → the index below. What happened in a prior session (errors, commands, prompts) → ctx_search.
+Durable facts across sessions → the index below.
+What happened in a prior session (errors, commands, prompts) → ctx_search.
 Never store ephemeral state, TODOs, or commit hashes.`;
 
 /**
@@ -119,30 +122,28 @@ export function buildMemoryInjection(
   // ⟨index-only⟩ when the body is in fact there.
   const alreadyLoaded = new Set<string>();
 
+  // Prepare BOTH tiers (loading their full text and consuming the shared
+  // budget) before rendering EITHER index. Rendering as we went meant the first
+  // tier's index was written against a loadedPaths set that could not yet
+  // include a body the second tier was about to inject: a cross-tier entry
+  // could sit in the prompt in full AND still be advertised as ⟨index-only⟩,
+  // inviting a recall_memory call for text already in context — the one thing
+  // the anchor tells the model never to do.
+  const prepared: PreparedTier[] = [];
   if (project) {
-    const block = buildTierInjection(
-      project,
-      project.label,
-      budget,
-      warnings,
-      global?.dir,
-      alreadyLoaded,
+    prepared.push(
+      prepareTier(project, project.label, budget, warnings, global?.dir, alreadyLoaded),
     );
-    if (block.text) blocks.push(block.text);
-    if (block.hasEntries) hasAnyEntries = true;
+  }
+  if (global) {
+    prepared.push(prepareTier(global, "Global", budget, warnings, project?.dir, alreadyLoaded));
   }
 
-  if (global) {
-    const block = buildTierInjection(
-      global,
-      "Global",
-      budget,
-      warnings,
-      project?.dir,
-      alreadyLoaded,
-    );
-    if (block.text) blocks.push(block.text);
-    if (block.hasEntries) hasAnyEntries = true;
+  const knownDirs = [project, global].filter((d): d is MemoryDir => !!d);
+  for (const tier of prepared) {
+    const text = renderTier(tier, alreadyLoaded, knownDirs, sep);
+    if (text) blocks.push(text);
+    if (tier.hasEntries) hasAnyEntries = true;
   }
 
   // Choose anchor variant based on whether any entries exist, and state the
@@ -153,7 +154,13 @@ export function buildMemoryInjection(
     reviewIntervalTurns,
   );
 
-  // Gate the ctx_search clause when the tool isn't registered
+  // Gate the ctx_search clause when the tool isn't registered.
+  //
+  // That clause lives on its OWN line in the template. It used to share a line
+  // with "Durable facts across sessions → the index below.", so this strip
+  // deleted the sentence explaining what the injected index is FOR — the model
+  // lost the index guidance as collateral damage from hiding a tool it has no
+  // access to.
   const finalAnchor = hasCtxSearch ? anchor : anchor.replace(/\n.*ctx_search\..*$/m, "");
 
   debugLog("injector.build", {
@@ -172,24 +179,47 @@ export function buildMemoryInjection(
   };
 }
 
-/** Build injection text for a single tier. Mutates the shared budget object. */
-function buildTierInjection(
+/** A tier whose full text has been loaded, awaiting index rendering.
+ *
+ * The index is rendered in a SECOND pass (see buildMemoryInjection) so it can
+ * be written against the complete loadedPaths set, and can mark entries that
+ * reconcileIndex found missing. */
+interface PreparedTier {
+  dir: MemoryDir;
+  label: string;
+  parsed: ReturnType<typeof parseIndexFile>;
+  /** Canonical paths of index entries whose file is gone (from reconcileIndex). */
+  missing: Set<string>;
+  fullTextSection: string;
+  loadedPaths: Set<string>;
+  tokens: number;
+  hasEntries: boolean;
+}
+
+/** Load a tier's topic files and consume budget. Mutates the shared budget.
+ *
+ * Rendering is deliberately NOT done here: it must wait until every tier has
+ * loaded, so ⟨index-only⟩ reflects the finished prompt rather than a
+ * half-built one. */
+function prepareTier(
   dir: MemoryDir,
   label: string,
   budget: { remaining: number; total: number },
   warnings: string[],
   otherTierDir?: string | null,
   alreadyLoaded: Set<string> = new Set(),
-): InjectionBlock {
+): PreparedTier {
   const parsed = parseIndexFile(dir);
   if (!parsed) {
     return {
-      text: "",
+      dir,
+      label,
+      parsed: null,
+      missing: new Set(),
+      fullTextSection: "",
       loadedPaths: new Set(),
-      filesLoaded: 0,
       tokens: 0,
       hasEntries: false,
-      warnings,
     };
   }
 
@@ -225,24 +255,6 @@ function buildTierInjection(
     tokens,
   } = buildFullTextSection(files, parsed.entries, budget, warnings, alreadyLoaded);
 
-  // Build the index section (always injected — it's cheap and information-dense)
-  // Mark entries whose bodies are NOT loaded with ⟨index-only⟩ so the model
-  // knows which entries to recall_memory vs which are already in full text.
-  // Render against the CUMULATIVE set: a body injected under the other tier is
-  // present in this prompt, so marking it index-only would be a lie.
-  const indexSection = renderIndexSection(parsed, alreadyLoaded);
-
-  const parts: string[] = [];
-  parts.push(`### Memory (${label})\n`);
-
-  if (indexSection) {
-    parts.push(`#### Index\n\n${indexSection}`);
-  }
-
-  if (fullTextSection) {
-    parts.push(`#### Full Text (always loaded)\n\n${fullTextSection}`);
-  }
-
   debugLog("injector.tier", {
     label,
     entryCount: parsed.entries.length,
@@ -254,18 +266,85 @@ function buildTierInjection(
   });
 
   return {
-    text: parts.join("\n"),
+    dir,
+    label,
+    parsed,
+    missing: new Set(recon.missing.map((e) => e.filePath)),
+    fullTextSection,
     loadedPaths,
-    filesLoaded: loadedPaths.size,
     tokens,
     hasEntries: parsed.entries.length > 0,
-    warnings,
   };
 }
 
-/** Topic files larger than this are skipped outright (not just filtered by
- * the token budget): the size check runs BEFORE reading so a huge non-memory
- * file linked from a hand-edited index cannot flood the read. */
+/** Render one prepared tier: header, index, and full text.
+ *
+ * Runs after every tier has loaded, so the index is marked against the
+ * COMPLETE set of bodies in this prompt.
+ *
+ * `knownDirs` is used to say which store actually OWNS an entry. A project
+ * index can link a global topic by absolute href, and without the annotation
+ * the entry renders under "Memory (<project>)" with nothing to say otherwise —
+ * so a model that reads that heading and calls recall_memory with the project
+ * tier gets "not found" for a file sitting one tier away. */
+function renderTier(
+  tier: PreparedTier,
+  loadedPaths: Set<string>,
+  knownDirs: MemoryDir[],
+  separator: string,
+): string {
+  if (!tier.parsed) return "";
+
+  const indexSection = renderIndexSection(tier.parsed, loadedPaths, tier.missing, (filePath) =>
+    owningTierOf(filePath, knownDirs, tier.dir, separator),
+  );
+
+  const parts: string[] = [];
+  parts.push(`### Memory (${tier.label})\n`);
+  if (indexSection) {
+    parts.push(`#### Index\n\n${indexSection}`);
+  }
+  if (tier.fullTextSection) {
+    parts.push(`#### Full Text (always loaded)\n\n${tier.fullTextSection}`);
+  }
+  return parts.join("\n");
+}
+
+/** Canonicalize a path for containment comparison (realpath, lexical fallback). */
+function canonicalizePath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+/** Which resolved store owns this topic, or null if it belongs to none of
+ * them.
+ *
+ * Both sides are canonicalized: entry paths come from resolveHref, which
+ * realpath's the target, while MemoryDir.dir is built lexically from homedir().
+ * Comparing a canonical path against a lexical root silently fails whenever a
+ * store component is a symlink, which would drop every annotation. */
+function owningTierOf(
+  filePath: string,
+  knownDirs: MemoryDir[],
+  linkingDir: MemoryDir,
+  separator: string,
+): MemoryDir | null {
+  const target = canonicalizePath(filePath);
+  let owner: MemoryDir | null = null;
+  for (const d of knownDirs) {
+    const root = canonicalizePath(d.dir);
+    if (target === root || target.startsWith(`${root}${separator}`)) {
+      owner = d;
+      break;
+    }
+  }
+  if (!owner) return null;
+  // Only worth annotating when it is NOT the tier this index belongs to.
+  return canonicalizePath(owner.dir) === canonicalizePath(linkingDir.dir) ? null : owner;
+}
 
 /** Load topic files from disk, keyed by filePath.
  *
@@ -368,17 +447,36 @@ function loadTopicFiles(
 
 /** Render the MEMORY.md index section (all lines, preserving structure).
  *  Entries whose bodies are NOT loaded in full are marked ⟨index-only⟩. */
+/** The fetch marker for one index entry.
+ *
+ * A file reconcileIndex found missing is NOT fetchable, so it must not be
+ * marked ⟨index-only⟩ (what it used to get, since a missing file is never in
+ * loadedPaths) — that told the model to call recall_memory every turn for
+ * something guaranteed to fail. */
+function markerFor(filePath: string, loadedPaths: Set<string>, missing: Set<string>): string {
+  if (missing.has(filePath)) return " ⟨missing⟩";
+  return loadedPaths.has(filePath) ? "" : " ⟨index-only⟩";
+}
+
 function renderIndexSection(
   parsed: { lines: (IndexEntry | IndexLine)[] },
   loadedPaths: Set<string>,
+  missing: Set<string>,
+  ownerOf: (filePath: string) => MemoryDir | null,
 ): string {
   return parsed.lines
     .map((line) => {
       if ("title" in line) {
         // IndexEntry — reconstruct the link line
         const pin = line.pinned ? "⛔ " : "";
-        const marker = loadedPaths.has(line.filePath) ? "" : " ⟨index-only⟩";
-        return `- ${pin}[${line.title}](${line.href}) — ${line.summary}${marker}`;
+        // A file reconcileIndex found missing is NOT fetchable. Marking it
+        // ⟨index-only⟩ (what it used to get, since a missing file is never in
+        // loadedPaths) told the model to call recall_memory for it every single
+        // turn, and that call was guaranteed to fail.
+        const marker = markerFor(line.filePath, loadedPaths, missing);
+        const owner = ownerOf(line.filePath);
+        const ownerNote = owner ? ` [in ${owner.tier} tier]` : "";
+        return `- ${pin}[${line.title}](${line.href}) — ${line.summary}${ownerNote}${marker}`;
       }
       return line.text;
     })
