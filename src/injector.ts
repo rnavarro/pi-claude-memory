@@ -34,6 +34,7 @@ const SMALL_FILE_LINE_THRESHOLD = 60; // files with <= this many lines are candi
 export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. The memory below is already in context — never re-read a loaded entry.
 Index entry marked ⟨index-only⟩ → recall_memory(name); unmarked entries are already in full.
 Entry marked ⟨missing⟩ → its file is gone from disk; do not call recall_memory for it.
+Entry marked ⟨unavailable⟩ → present on disk but not readable as a memory; do not call recall_memory for it.
 An entry tagged [in global tier] lives in the global store, so pass that tier to recall_memory.
 User correction, stated preference, or verified fix → write_memory this turn.{{REVIEWER}}
 Memory that is now wrong → remove_memory (never leave it to rot).
@@ -192,6 +193,8 @@ interface PreparedTier {
   parsed: ReturnType<typeof parseIndexFile>;
   /** Canonical paths of index entries whose file is gone (from reconcileIndex). */
   missing: Set<string>;
+  /** Canonical paths present on disk but NOT injectable, so a fetch would fail. */
+  unfetchable: Set<string>;
   fullTextSection: string;
   loadedPaths: Set<string>;
   tokens: number;
@@ -218,6 +221,7 @@ function prepareTier(
       label,
       parsed: null,
       missing: new Set(),
+      unfetchable: new Set(),
       fullTextSection: "",
       loadedPaths: new Set(),
       tokens: 0,
@@ -237,7 +241,7 @@ function prepareTier(
   // Load all topic files
   // otherTierDir approves cross-tier absolute hrefs (a project index linking
   // to a global topic) while rejecting everything outside the two stores.
-  const files = loadTopicFiles(
+  const { files, unfetchable } = loadTopicFiles(
     dir,
     parsed.entries.map((e) => e.filePath),
     otherTierDir,
@@ -272,6 +276,7 @@ function prepareTier(
     label,
     parsed,
     missing: new Set(recon.missing.map((e) => e.filePath)),
+    unfetchable,
     fullTextSection,
     loadedPaths,
     tokens,
@@ -297,8 +302,10 @@ function renderTier(
 ): string {
   if (!tier.parsed) return "";
 
-  const indexSection = renderIndexSection(tier.parsed, loadedPaths, tier.missing, (filePath) =>
-    owningTierOf(filePath, knownDirs, tier.dir, separator),
+  const indexSection = renderIndexSection(
+    tier.parsed,
+    { loaded: loadedPaths, missing: tier.missing, unfetchable: tier.unfetchable },
+    (filePath) => owningTierOf(filePath, knownDirs, tier.dir, separator),
   );
 
   const parts: string[] = [];
@@ -372,7 +379,7 @@ function loadTopicFiles(
   dir: MemoryDir,
   filePaths: string[],
   otherTierDir?: string | null,
-): Map<string, MemoryFile> {
+): { files: Map<string, MemoryFile>; unfetchable: Set<string> } {
   // Canonicalize the approved roots once. A root that cannot be realpath'd
   // (does not exist yet) simply cannot contain anything.
   const allowedRoots: string[] = [];
@@ -385,6 +392,10 @@ function loadTopicFiles(
     }
   }
   const files = new Map<string, MemoryFile>();
+  // Paths that ARE on disk but that we refuse to inject. They are not
+  // "missing", and they are not fetchable either, so the index must not
+  // advertise them the way it advertises an entry whose body simply did not fit.
+  const unfetchable = new Set<string>();
   for (const filePath of filePaths) {
     try {
       // Canonical path: follows symlinks in EVERY component, and doubles as
@@ -398,6 +409,7 @@ function loadTopicFiles(
       );
       if (!contained) {
         debugLog("injector.topic_containment_reject", { filePath, realPath, tier: dir.tier });
+        unfetchable.add(realPath);
         continue;
       }
       const filename = basename(realPath);
@@ -415,6 +427,9 @@ function loadTopicFiles(
         // deliberately: it validates the very inode we then read.
         fd = openSync(realPath, constants.O_RDONLY | constants.O_NONBLOCK);
       } catch {
+        // A failed open leaves the path known, so it can still be marked
+        // unfetchable below rather than advertised as fetchable.
+        unfetchable.add(realPath);
         continue;
       }
       let content: string;
@@ -423,6 +438,7 @@ function loadTopicFiles(
         const st = fstatSync(fd);
         if (!st.isFile()) {
           debugLog("injector.topic_not_regular_file", { filePath, realPath, tier: dir.tier });
+          unfetchable.add(realPath);
           continue;
         }
         if (st.size > TOPIC_FILE_MAX_BYTES) {
@@ -431,6 +447,7 @@ function loadTopicFiles(
             size: st.size,
             cap: TOPIC_FILE_MAX_BYTES,
           });
+          unfetchable.add(realPath);
           continue;
         }
         mtime = st.mtimeMs;
@@ -448,10 +465,12 @@ function loadTopicFiles(
         lineCount: content.split("\n").length,
       });
     } catch {
-      // skip unreadable files
+      // Skip unreadable files. No unfetchable entry: realpathSync itself threw,
+      // so there is no canonical key to mark, and reconcileIndex already reports
+      // such an entry as missing.
     }
   }
-  return files;
+  return { files, unfetchable };
 }
 
 /** Render the MEMORY.md index section (all lines, preserving structure).
@@ -462,15 +481,29 @@ function loadTopicFiles(
  * marked ⟨index-only⟩ (what it used to get, since a missing file is never in
  * loadedPaths) — that told the model to call recall_memory every turn for
  * something guaranteed to fail. */
-function markerFor(filePath: string, loadedPaths: Set<string>, missing: Set<string>): string {
-  if (missing.has(filePath)) return " ⟨missing⟩";
-  return loadedPaths.has(filePath) ? "" : " ⟨index-only⟩";
+/** The fetchability sets an index line is judged against. Bundled because
+ *  they are always consulted together, and three parallel sets in a signature
+ *  is a standing invitation to pass them in the wrong order. */
+interface FetchState {
+  loaded: Set<string>;
+  missing: Set<string>;
+  unfetchable: Set<string>;
+}
+
+function markerFor(filePath: string, fetch: FetchState): string {
+  if (fetch.missing.has(filePath)) return " ⟨missing⟩";
+  if (fetch.loaded.has(filePath)) return "";
+  // Present on disk but not injectable: a non-regular file, a file over the
+  // size cap, or one resolving outside both stores. recall_memory refuses these
+  // for the same reasons, so ⟨index-only⟩ would send the model to a tool call
+  // that cannot succeed — the class ⟨missing⟩ already fixed, one branch short.
+  if (fetch.unfetchable.has(filePath)) return " ⟨unavailable⟩";
+  return " ⟨index-only⟩";
 }
 
 function renderIndexSection(
   parsed: { lines: (IndexEntry | IndexLine)[] },
-  loadedPaths: Set<string>,
-  missing: Set<string>,
+  fetch: FetchState,
   ownerOf: (filePath: string) => MemoryDir | null,
 ): string {
   return parsed.lines
@@ -478,11 +511,12 @@ function renderIndexSection(
       if ("title" in line) {
         // IndexEntry — reconstruct the link line
         const pin = line.pinned ? "⛔ " : "";
-        // A file reconcileIndex found missing is NOT fetchable. Marking it
-        // ⟨index-only⟩ (what it used to get, since a missing file is never in
-        // loadedPaths) told the model to call recall_memory for it every single
-        // turn, and that call was guaranteed to fail.
-        const marker = markerFor(line.filePath, loadedPaths, missing);
+        // A file that is missing, or present but rejected by the same guards
+        // recall_memory applies, is NOT fetchable. Marking either ⟨index-only⟩
+        // (what they used to get, since neither is ever in loadedPaths) told the
+        // model to call recall_memory for it every single turn, and that call
+        // was guaranteed to fail.
+        const marker = markerFor(line.filePath, fetch);
         const owner = ownerOf(line.filePath);
         const ownerNote = owner ? ` [in ${owner.tier} tier]` : "";
         return `- ${pin}[${line.title}](${line.href}) — ${line.summary}${ownerNote}${marker}`;
