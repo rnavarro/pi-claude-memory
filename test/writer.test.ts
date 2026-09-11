@@ -766,3 +766,47 @@ describe("index-line integrity", () => {
     expect(existsSync(join(dir.dir, "orphan.md"))).toBe(true);
   });
 });
+
+describe("index re-apply guard", () => {
+  // The re-apply path sits in the rename->verify gap and cannot be reached
+  // deterministically from outside the module (ESM namespaces are not
+  // mockable, so readFileSync cannot be intercepted mid-window). What IS
+  // testable is the guard's effect through the real callers:
+  //
+  //   - patchIndexAppend passes () => existsSync(topic), so a topic that a
+  //     concurrent remove just trashed is never re-linked;
+  //   - withIndexRetry still works when no guard is supplied (it is exported).
+  //
+  // The mechanism itself (unconditional re-apply resurrects a removed line)
+  // was confirmed by probe: applying the append closure to content that
+  // lacks the line re-adds it. See the round-5 findings.
+  it("keeps a removed entry removed through the real removeMemory path", () => {
+    writeMemory(dir, {
+      name: "removable",
+      description: "d",
+      type: "project",
+      tier: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    expect(readFileSync(join(dir.dir, "MEMORY.md"), "utf8")).toContain("(removable.md)");
+    const removed = removeMemory(dir, { name: "removable", tier: "project" });
+    expect(removed.ok).toBe(true);
+    const after = readFileSync(join(dir.dir, "MEMORY.md"), "utf8");
+    expect(after).not.toContain("(removable.md)");
+    // The topic is in .trash/, and no index line points at the dead path.
+    expect(existsSync(join(dir.dir, "removable.md"))).toBe(false);
+  });
+
+  it("still writes correctly when withIndexRetry is called without a guard", () => {
+    const root = mkdtempSync(join(tmpdir(), "pcm-noguard-"));
+    const idx = join(root, "MEMORY.md");
+    writeFileSync(idx, "# Memories\n");
+    withIndexRetry(idx, (content) =>
+      content.includes("(t.md)") ? content : `${content}- [T](t.md) \u2014 s\n`,
+    );
+    expect(readFileSync(idx, "utf8")).toContain("(t.md)");
+    rmSync(root, { recursive: true, force: true });
+  });
+});
