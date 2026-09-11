@@ -181,3 +181,20 @@ describe("tool error handling", () => {
     expect((res.details as { ok: boolean }).ok).toBe(false);
   });
 });
+
+describe("write_memory guidelines do not promise a reviewer", () => {
+  // The guideline is the text the model reads immediately before deciding
+  // whether to call write_memory. It hardcoded "A background reviewer sweeps
+  // every 10 turns", contradicting the injected anchor whenever autoLearn was
+  // off or the interval differed — and with autoLearn off it told the model to
+  // withhold routine memories from a sweep that never runs.
+  it("states no reviewer cadence in the static guideline", () => {
+    const guidelines = (writeMemoryTool as unknown as { promptGuidelines: string[] })
+      .promptGuidelines;
+    const joined = guidelines.join("\n");
+    expect(joined).not.toContain("every 10 turns");
+    expect(joined).not.toMatch(/reviewer sweeps/i);
+    // The anchor owns the statement, so the guideline points at it.
+    expect(joined).toContain("memory anchor");
+  });
+});

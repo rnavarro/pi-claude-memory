@@ -253,7 +253,9 @@ async function handleSessionShutdown(
   event: SessionShutdownEvent,
   ctx: ExtensionContext,
 ): Promise<void> {
-  debugLog("index.shutdown_fired", { reason: event.reason, turnCount });
+  // No debugLog before entering the context: debugLog is a no-op unless a
+  // withDebugLogContext store is active, so a call here could never emit. The
+  // equivalent line inside the callback below is the one that works.
   await withDebugLogContext(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     async () => {

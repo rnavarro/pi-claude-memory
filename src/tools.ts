@@ -150,7 +150,15 @@ const writeTool = defineTool({
   promptSnippet:
     "write_memory - Write a Claude Code memory entry (auto-learned fact or reference). Shares store with Claude Code.",
   promptGuidelines: [
-    "Use write_memory proactively only for explicit signals: user corrections, stated preferences, or verified fixes. A background reviewer sweeps every 10 turns for routine learning — don't duplicate it.",
+    // No reviewer clause here. This guideline used to hardcode "A background
+    // reviewer sweeps every 10 turns", which contradicted the injected anchor
+    // whenever autoLearn was off or the interval differed — and this is the
+    // text the model reads right before deciding whether to call write_memory,
+    // so with autoLearn off it told the model to withhold routine memories
+    // from a sweep that never runs. The anchor is injected every turn and now
+    // states the reviewer honestly for the current config; keeping one source
+    // of truth is the fix, not a second copy that can drift again.
+    "Use write_memory proactively only for explicit signals: user corrections, stated preferences, or verified fixes. Whether routine observations are captured automatically depends on configuration — follow the memory anchor in your context.",
     "Do NOT write memories for ephemeral state, TODOs, or debugging steps — those belong in session notes, not durable memory.",
     "Pick the right type: feedback=behavioral rule (always inject), reference=lookup material (on-demand), project=project-specific fact, user=user preference.",
     "Keep descriptions to one line — they appear in the MEMORY.md index that is injected every turn.",
