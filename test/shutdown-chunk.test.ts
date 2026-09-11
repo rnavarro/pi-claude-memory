@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { composeShutdownChunk, truncateReviewChunk } from "../src/index.js";
+import {
+  composeShutdownChunk,
+  shouldSkipShutdownReview,
+  truncateReviewChunk,
+} from "../src/index.js";
+
+describe("shouldSkipShutdownReview", () => {
+  it("never skips when no review has completed yet", () => {
+    expect(shouldSkipShutdownReview(-1, 0, false)).toBe(false);
+    expect(shouldSkipShutdownReview(-1, 0, true)).toBe(false);
+  });
+
+  it("skips when a successful review covered everything and nothing new arrived", () => {
+    expect(shouldSkipShutdownReview(5, 5, false)).toBe(true);
+  });
+
+  it("does not skip when new material arrived after the last review", () => {
+    expect(shouldSkipShutdownReview(5, 6, false)).toBe(false);
+  });
+
+  it("never skips when a compaction snapshot is queued", () => {
+    expect(shouldSkipShutdownReview(5, 5, true)).toBe(false);
+  });
+});
 
 describe("composeShutdownChunk", () => {
   it("returns the live chunk untouched when there is no snapshot", () => {
