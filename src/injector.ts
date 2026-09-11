@@ -399,8 +399,10 @@ function buildFullTextSection(
       // of size", but the shared budget still bounds it: a single pinned body
       // larger than the cap, or several pinned bodies exhausting it, gets
       // demoted to ⟨index-only⟩. That is the right outcome (overdrawing the
-      // budget would blow the context window), but it must not be silent —
-      // the user needs to know a pinned entry is not arriving in full.
+      // budget would blow the context window). The demotion is recorded in the
+      // debug log rather than the console: this runs at prompt-build time on
+      // EVERY turn the entry is over budget, so a console line would repeat
+      // once per turn for as long as the condition holds.
       if (effectivePinned) {
         warnings.push(
           `pinned entry ${file.filename} is index-only this turn: ${bodyTokens} tokens exceeds the ${budget.remaining} remaining of the ${budget.total}-token budget`,
