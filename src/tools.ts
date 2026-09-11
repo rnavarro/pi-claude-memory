@@ -72,10 +72,18 @@ const recallTool = defineTool({
     }
 
     let miss: string | null = null;
+    // "not found" is the least informative failure there is. `miss ??=` kept the
+    // FIRST one, so with an entry absent from the first tier but present and
+    // unreadable (oversize, unreadable file) in the second, the caller was told
+    // the memory does not exist — and a model told that may simply write it
+    // again, creating a duplicate of a file that is sitting right there.
+    const isNotFound = (m: string) => /not found/i.test(m);
     for (const dir of candidates) {
       const result = readMemory(dir, params.name);
       if (!result.ok) {
-        miss ??= result.message;
+        if (miss === null || (isNotFound(miss) && !isNotFound(result.message))) {
+          miss = result.message;
+        }
         continue;
       }
       if (dir !== candidates[0]) {

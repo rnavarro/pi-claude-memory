@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as debugLogModule from "../src/debug-log.js";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
 import { buildMemoryInjection } from "../src/injector.js";
@@ -1539,5 +1540,32 @@ describe("a FIFO in the store never blocks prompt construction", () => {
     } finally {
       closeSync(wfd);
     }
+  });
+});
+
+describe("an ambiguous name is recorded, not reported as absent", () => {
+  it("names the colliding candidates in the debug log", () => {
+    // Two stems that slugify alike are unaddressable by any name. Refusing to
+    // guess is correct, but the caller only ever saw "Memory not found: ...",
+    // which is wrong and impossible to diagnose from the message.
+    const { withDebugLogContext } = debugLogModule;
+    writeFileSync(join(tmpDir, "Foo Bar.md"), "---\ndescription: a\ntype: reference\n---\na\n");
+    writeFileSync(join(tmpDir, "FOO  BAR.md"), "---\ndescription: b\ntype: reference\n---\nb\n");
+    const sid = `ambig-${process.pid}`;
+    const res = withDebugLogContext({ enabled: true, cwd: tmpDir, sessionId: sid }, () =>
+      readMemory(dir, "foo bar"),
+    );
+    expect(res.ok).toBe(false);
+    const logPath = join(
+      process.env.HOME ?? tmpDir,
+      ".pi",
+      "agent",
+      "pi-claude-memory",
+      "debug",
+      `${sid}.ndjson`,
+    );
+    const logged = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+    expect(logged).toContain("topic_ambiguous");
+    expect(logged).toContain("Foo Bar.md");
   });
 });

@@ -271,10 +271,13 @@ async function handleSessionShutdown(
       // If a periodic or compact-triggered review is still running, await it
       // under the shared deadline so a hung provider cannot block shutdown.
       if (autoLearnInFlight) {
+        // Capture the promise we are waiting on, so the clear below can tell
+        // "still the review I awaited" from "a review launched while I waited".
+        const awaited = autoLearnInFlight;
         debugLog("auto_learn.shutdown_await_inflight", {});
         let inflightSettled = true;
         try {
-          await raceTimeout(autoLearnInFlight, remainingMs());
+          await raceTimeout(awaited, remainingMs());
         } catch (err) {
           // Distinguish a hung review (our raceTimeout rejected) from a
           // review that errored and is done. A hung review is still running
@@ -308,10 +311,16 @@ async function handleSessionShutdown(
         // continuation can resume before the chained .finally in the same
         // microtask wave). Clear explicitly so the final launchAutoLearn
         // below does not bail on the stale non-null flag.
+        //
+        // Guarded on identity: if that .finally DID already run, it may have
+        // drained a queued compaction snapshot and launched a fresh review,
+        // and nulling unconditionally would forget that launch and start a
+        // second concurrent writer on the same store. Clearing only our own
+        // promise makes the single-writer property hold by construction
+        // instead of by the tick-counting below.
         // INVARIANT: nothing between here and the launchAutoLearn call may
-        // await — an await would let the settled review's .finally
-        // interleave, drain pendingCompact, and double-launch.
-        autoLearnInFlight = null;
+        // await.
+        if (autoLearnInFlight === awaited) autoLearnInFlight = null;
         // NOTE: a queued compact snapshot is NOT cleared here — its material
         // (pre-compaction) is merged into the final chunk below instead of
         // being dropped. Only the timeout branch above may discard it, since
@@ -485,23 +494,28 @@ function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): v
         debugLog("auto_learn.skip_inflight", { turnCount });
         return;
       }
-      // Reset the counter so we count the next N turns
-      turnCount = 0;
-
       // Build conversation text from the session branch — this gives us user
       // prompts, assistant text, and tool calls (tool results are truncated in
       // the branch, so we supplement with the toolResultChunk).
       const branchText = serializeBranch(ctx);
       const toolText = toolResultChunk;
-      toolResultChunk = "";
 
       // Combine: branch has the conversation flow, toolText has the full tool outputs
       const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
 
       if (!chunk.trim()) {
+        // Do NOT reset the counter or drop the tool-result chunk here. An
+        // empty chunk usually means the branch read failed, and forfeiting the
+        // accumulated turns (and the tool output collected with them)
+        // postpones the review a whole interval for a window that was in fact
+        // captured.
         debugLog("auto_learn.skip_empty_chunk", {});
         return;
       }
+
+      // Consumed only now that a review is definitely starting.
+      turnCount = 0;
+      toolResultChunk = "";
 
       // Truncate to configured max, keeping the RECENT end. Compaction is the
       // event meant to preserve recent raw material, so truncating from the
