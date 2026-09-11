@@ -14,7 +14,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildExistingIndexSummary, parseCandidates, snapshotMtimes } from "../src/auto-learn.js";
+import {
+  applyStemKeys,
+  buildExistingIndexSummary,
+  parseCandidates,
+  snapshotMtimes,
+} from "../src/auto-learn.js";
 import { withDebugLogContext } from "../src/debug-log.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
 import type { MemoryDir as MemoryDirType, ResolveResult } from "../src/types.js";
@@ -75,9 +80,11 @@ describe("buildExistingIndexSummary", () => {
     };
 
     const summary = buildExistingIndexSummary(resolved);
-    expect(summary).toContain("Global tier");
+    // Headers lead with the TIER id (what the candidate schema accepts) and
+    // keep the store label for context.
+    expect(summary).toContain("## global tier (Global)");
+    expect(summary).toContain("## project tier (test)");
     expect(summary).toContain("global_entry");
-    expect(summary).toContain("test tier");
     expect(summary).toContain("project_entry");
   });
 
@@ -457,5 +464,107 @@ describe("tier attribution survives a symlinked store root", () => {
     };
     const summary = buildExistingIndexSummary(resolved as never);
     expect(summary).toContain("[owner: global]");
+  });
+});
+
+describe("reviewer index summary is complete", () => {
+  it("lists every entry identity, not just the first fifty", () => {
+    // The real global index on this machine has 222 entries and writes append,
+    // so a 50-entry prefix meant the rest could never be matched for
+    // supersession no matter how many reviews ran — they accumulated as
+    // duplicates while the prompt advertised a supersession mechanism that did
+    // not apply to them.
+    const glob = join(tmpDir, ".claude", "memory");
+    mkdirSync(glob, { recursive: true });
+    const indexLines = ["# M"];
+    for (let i = 0; i < 60; i++) {
+      writeFileSync(join(glob, `e${i}.md`), `---\ndescription: d${i}\ntype: reference\n---\nx\n`);
+      indexLines.push(`- [E${i}](e${i}.md) — summary ${i}`);
+    }
+    writeFileSync(join(glob, "MEMORY.md"), `${indexLines.join("\n")}\n`);
+
+    const resolved = {
+      project: null,
+      global: {
+        tier: "global" as const,
+        dir: glob,
+        indexPath: join(glob, "MEMORY.md"),
+        label: "global",
+      },
+      warnings: [],
+    };
+    const summary = buildExistingIndexSummary(resolved as never);
+    expect(summary).toContain("e0");
+    expect(summary).toContain("e59"); // beyond the old cutoff
+  });
+
+  it("names the tier id in the header so the model echoes a valid tier", () => {
+    // The header rendered the store LABEL ("## my-app tier"), while the
+    // candidate schema accepts only project|global — so a model echoing the
+    // header produced an invalid tier that parseCandidates then dropped.
+    const glob = join(tmpDir, ".claude", "memory");
+    const proj = join(tmpDir, "work", "proj");
+    mkdirSync(glob, { recursive: true });
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(glob, "g.md"), "---\ndescription: g\ntype: reference\n---\nx\n");
+    writeFileSync(join(glob, "MEMORY.md"), "- [G](g.md) — g\n");
+    writeFileSync(join(proj, "p.md"), "---\ndescription: p\ntype: project\n---\nx\n");
+    writeFileSync(join(proj, "MEMORY.md"), "- [P](p.md) — p\n");
+
+    const summary = buildExistingIndexSummary({
+      project: { tier: "project", dir: proj, indexPath: join(proj, "MEMORY.md"), label: "proj" },
+      global: { tier: "global", dir: glob, indexPath: join(glob, "MEMORY.md"), label: "global" },
+      warnings: [],
+    } as never);
+    expect(summary).toContain("## global tier");
+    expect(summary).toContain("## project tier");
+  });
+});
+
+describe("snapshotMtimes alias keys never shadow a real stem", () => {
+  it("a real stem beats a slug alias in EITHER arrival order", () => {
+    // Whether the clobbering order arises depends on readdir order, which on
+    // this filesystem puts ASCII-uppercase slug-alikes first — so a directory
+    // fixture cannot exercise it. Drive the keying directly instead: the slug
+    // alias for "Foo Bar" is "foo-bar", the same key the real stem "foo-bar"
+    // owns. Under the old single-pass keying the winner was whoever arrived
+    // last, so the real stem's mtime was lost whenever it came first — and the
+    // overwrite guard then compared against the other file's mtime and logged
+    // skip_stale_overwrite, blaming a concurrent edit that never happened.
+    const realFirst = new Map<string, number>();
+    applyStemKeys(realFirst, "project", [
+      { stem: "foo-bar", mtime: 100 },
+      { stem: "Foo Bar", mtime: 200 },
+    ]);
+    expect(realFirst.get("project:foo-bar")).toBe(100); // the REAL stem's mtime
+    expect(realFirst.get("project:Foo Bar")).toBe(200);
+
+    const aliasFirst = new Map<string, number>();
+    applyStemKeys(aliasFirst, "project", [
+      { stem: "Foo Bar", mtime: 200 },
+      { stem: "foo-bar", mtime: 100 },
+    ]);
+    expect(aliasFirst.get("project:foo-bar")).toBe(100);
+    expect(aliasFirst.get("project:Foo Bar")).toBe(200);
+  });
+
+  it("still fills a slug alias when no real stem claims that key", () => {
+    // The fallback exists so a spaced/uppercase stem is reachable by slug.
+    const map = new Map<string, number>();
+    applyStemKeys(map, "project", [{ stem: "Foo Bar", mtime: 200 }]);
+    expect(map.get("project:Foo Bar")).toBe(200);
+    expect(map.get("project:foo-bar")).toBe(200);
+  });
+
+  it("keys a real directory into the map", () => {
+    const d = join(tmpDir, "store");
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, "topic.md"), "x");
+    writeFileSync(join(d, "MEMORY.md"), "# M\n");
+    const map = snapshotMtimes([
+      { tier: "project", dir: d, indexPath: join(d, "MEMORY.md"), label: "p" },
+    ]);
+    expect(map.has("project:topic")).toBe(true);
+    expect(map.has("project:MEMORY")).toBe(false); // never the index itself
   });
 });
