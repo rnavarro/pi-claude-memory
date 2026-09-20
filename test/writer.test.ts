@@ -28,6 +28,7 @@ import {
   atomicWriteFileNoClobber,
   buildFrontmatterYaml,
   createTempFile,
+  IndexPublishConflictError,
   readMemory,
   removeMemory,
   resolveWikilinks,
@@ -614,6 +615,28 @@ describe("index concurrency primitives", () => {
     const final = readFileSync(indexPath, "utf8");
     expect(final).toContain("COMPETITOR");
     expect(final).toContain("MINE");
+  });
+
+  it("withIndexRetry yields instead of overwriting a writer that keeps winning", () => {
+    const indexPath = join(dir.dir, "MEMORY.md");
+    writeFileSync(indexPath, "BASE\n");
+    let competitorWrites = 0;
+
+    // A competitor landing on EVERY attempt is the case the retry loop cannot
+    // win. The old behaviour published our content anyway on the final
+    // attempt, silently replacing their rows and reporting success.
+    expect(() =>
+      withIndexRetry(indexPath, (content) => {
+        competitorWrites += 1;
+        writeFileSync(indexPath, `${content}COMPETITOR${competitorWrites}\n`);
+        return `${content}MINE\n`;
+      }),
+    ).toThrow(IndexPublishConflictError);
+
+    const final = readFileSync(indexPath, "utf8");
+    expect(final).toContain("COMPETITOR3");
+    expect(final).not.toContain("MINE");
+    expect(competitorWrites).toBe(3);
   });
 
   it("withIndexRetry treats a null return as nothing-to-do and writes no file", () => {

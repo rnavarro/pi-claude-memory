@@ -1036,17 +1036,44 @@ export function atomicWriteFileNoClobber(filePath: string, content: string): boo
  * rebased-on-freshest-read anyway. */
 const INDEX_MERGE_ATTEMPTS = 3;
 
+/** Thrown when a concurrent writer replaced MEMORY.md before EVERY publish
+ * attempt. Deliberately a distinct type so a caller can tell "we yielded to
+ * another writer" from "this index is unsafe to write at all".
+ *
+ * Yielding is the respectful outcome on a shared store. Publishing here would
+ * write content derived from a stale read, replacing the concurrent writer's
+ * entries wholesale — a silent, unrecoverable loss that the post-write
+ * verification cannot detect, because it can only compare the index against
+ * our own proposal. Our entry instead stays on disk without an index line:
+ * reconcileIndex reports it and the caller returns a degraded result, so the
+ * loss is visible and repairable by writing this entry again. */
+export class IndexPublishConflictError extends Error {
+  constructor(
+    readonly indexPath: string,
+    readonly attempts: number,
+  ) {
+    super(
+      `MEMORY.md kept changing under us across ${attempts} attempts: ${indexPath}. ` +
+        "Another writer updating this index won; pi yielded rather than overwrite it. " +
+        "The topic file exists but has no index line yet.",
+    );
+    this.name = "IndexPublishConflictError";
+  }
+}
+
 /** Read-modify-write MEMORY.md with lost-update mitigation: after computing
  * the mutated content, re-read the index; if it changed since our read,
  * another writer landed first — recompute from THEIR content and retry.
  * Each attempt still publishes via atomic temp+rename.
  *
  * This narrows but does not close the lost-update window: no cross-process
- * lock exists (Claude Code is an independent writer), so a write can still
- * land in the gap between the final re-read and the rename. On retries
- * exhausted, publish the mutation rebased on the freshest read rather than
- * dropping it — a topic file with no index line is invisible to every
- * injector.
+ * lock exists (Claude Code is an independent writer that honours no lock of
+ * ours), so a write can still land between the final re-read and the rename.
+ * When the re-read keeps finding a newer version, this YIELDS — it throws
+ * IndexPublishConflictError rather than publishing stale content over the
+ * other writer's entries. The topic file is left on disk with no index line,
+ * which reconcileIndex reports; that is deliberate, because losing our own
+ * index line is recoverable while destroying another writer's entry is not.
  *
  * fn maps current index content to updated content, or null for "nothing
  * to do". Internal — exported for tests. */
@@ -1089,14 +1116,23 @@ export function withIndexRetry(
     const before = readFileSync(indexPath, "utf8");
     const next = fn(before);
     if (next === null || next === before) return;
-    if (attempt < INDEX_MERGE_ATTEMPTS) {
-      const after = readFileSync(indexPath, "utf8");
-      if (after !== before) {
+    // Re-read before publishing on EVERY attempt, the last one included. The
+    // last attempt used to skip this check and publish anyway, which is the
+    // worst case for a shared store: `next` is derived from a read that is
+    // already known to be raced, so publishing it discards whatever the other
+    // writer put there.
+    const after = readFileSync(indexPath, "utf8");
+    if (after !== before) {
+      if (attempt < INDEX_MERGE_ATTEMPTS) {
         debugLog("writer.index_retry", { attempt, indexPath });
         continue;
       }
-    } else {
-      debugLog("writer.index_retry_exhausted", { attempt, indexPath });
+      debugLog("writer.index_conflict_yield", {
+        attempt,
+        indexPath,
+        reason: "index changed before every publish attempt",
+      });
+      throw new IndexPublishConflictError(indexPath, attempt);
     }
     // Guard EVERY publication, not just the post-write re-apply. The retry
     // `continue` above is a second way to reach a publish: when contention is
@@ -1200,6 +1236,23 @@ export function verifyIndexPublish(
       );
     }
     atomicWriteFile(indexPath, reapplied);
+    // Verify the CORRECTIVE publish too. It is itself a read-modify-write with
+    // no retry, so a second concurrent writer landing in its rename->read gap
+    // would be overwritten without a trace — the same undetectable loss the
+    // main path's verification exists to catch. One read: if our merge did not
+    // land, that is a DETECTED divergence we cannot repair, so report it rather
+    // than claiming a clean write.
+    let corrective: string;
+    try {
+      corrective = readFileSync(indexPath, "utf8");
+    } catch {
+      debugLog("writer.index_reapply_vanished", { indexPath });
+      return;
+    }
+    if (corrective !== reapplied) {
+      debugLog("writer.index_reapply_conflict", { indexPath });
+      throw new IndexPublishConflictError(indexPath, 1);
+    }
     debugLog("writer.index_postwrite_reapply", { indexPath });
   }
 }
