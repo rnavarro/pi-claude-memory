@@ -203,7 +203,13 @@ describe.skipIf(!REAL_CORPUS)("injector", () => {
     const result = resolveMemoryDirs(UNKNOWN_CWD);
     const { text } = buildMemoryInjection(result.project, result.global);
     expect(text).toContain("Global");
-    expect(text).toContain("Prefer jq");
+    // Assert on the INDEX, not on a topic body. The old assertion looked for a
+    // body ("Prefer jq"), which stopped being injected as the global corpus
+    // grew: its entries compete for one shared body budget, and 20 pinned
+    // entries exhaust it before an unpinned body loads. That made this test a
+    // measure of budget luck rather than of the global tier being injected —
+    // it had been failing on main before this change for exactly that reason.
+    expect(text).toContain("User prefers jq");
   });
 });
 
