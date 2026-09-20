@@ -13,7 +13,7 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
-import { INDEX_MAX_BYTES } from "./types.js";
+import { INDEX_MAX_BYTES, INDEX_STARTUP_MAX_BYTES, INDEX_STARTUP_MAX_LINES } from "./types.js";
 
 // Match: - [title](href) — summary
 // The summary is OPTIONAL. Hand-authored and emoji-marked index lines
@@ -129,6 +129,141 @@ export function parseIndexFile(dir: MemoryDir): ParsedIndex | null {
   }
 }
 
+/** Why a store's MEMORY.md was refused. An absent index is NOT a rejection —
+ *  that is a store which has none yet. */
+export type IndexRejection = "symlink" | "not-regular-file" | "oversize" | "unreadable";
+
+/** The bounded startup excerpt of a store's MEMORY.md, or why it was refused. */
+export type BoundedIndex =
+  | {
+      ok: true;
+      /** Verbatim leading lines, within both startup limits. */
+      content: string;
+      /** Lines in the whole file, so a truncation notice can say what was cut. */
+      totalLines: number;
+      truncated: boolean;
+      /** Which limit bound, or null when the whole file fit. */
+      limitedBy: "lines" | "bytes" | null;
+    }
+  | { ok: false; reason: IndexRejection };
+
+/** Read the startup excerpt of a store's MEMORY.md: its first
+ *  INDEX_STARTUP_MAX_LINES lines, subject to INDEX_STARTUP_MAX_BYTES.
+ *
+ * This is the INJECTION view, and it is deliberately not the parser's
+ * contract. parseIndexFile must see every entry — the reviewer's
+ * existing-entry summary and the writer's replace/remove matching both depend
+ * on the whole index, and reporting a topic below the cut as "unindexed" would
+ * be false. Bounding the parse instead of the view would hide entries from
+ * deduplication and supersession.
+ *
+ * Excerpt semantics follow Claude Code: the limits apply to the SOURCE file, so
+ * headings, prose, and blank lines all consume them, and surviving lines keep
+ * source order. A pin below the cut is therefore not promoted — promoting it
+ * would mean reordering the file the model is shown.
+ *
+ * Returns null when no index file exists. Guard failures (symlinked,
+ * non-regular, past INDEX_MAX_BYTES, unreadable) are reported as ok:false so
+ * the caller can warn rather than silently inject nothing. */
+export function readBoundedIndex(dir: MemoryDir): BoundedIndex | null {
+  let st: import("node:fs").Stats;
+  try {
+    st = lstatSync(dir.indexPath);
+  } catch {
+    return null; // absent — a store with no index yet
+  }
+  if (st.isSymbolicLink()) return { ok: false, reason: "symlink" };
+  if (!st.isFile()) return { ok: false, reason: "not-regular-file" };
+  if (st.size > INDEX_MAX_BYTES) return { ok: false, reason: "oversize" };
+  let raw: string;
+  try {
+    raw = readFileSync(dir.indexPath, "utf8");
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
+  const all = raw.split("\n");
+  const kept: string[] = [];
+  let bytes = 0;
+  let limitedBy: "lines" | "bytes" | null = null;
+  for (const line of all) {
+    if (kept.length >= INDEX_STARTUP_MAX_LINES) {
+      limitedBy = "lines";
+      break;
+    }
+    // Byte counting is UTF-8 and includes the newline joining this line to the
+    // previous one, so the excerpt measures the same on disk and in the prompt.
+    // Whole lines are kept, so a multi-byte character is never split.
+    const lineBytes = Buffer.byteLength(line, "utf8") + (kept.length > 0 ? 1 : 0);
+    if (bytes + lineBytes > INDEX_STARTUP_MAX_BYTES) {
+      limitedBy = "bytes";
+      break;
+    }
+    bytes += lineBytes;
+    kept.push(line);
+  }
+  return {
+    ok: true,
+    content: kept.join("\n"),
+    totalLines: all.length,
+    truncated: limitedBy !== null,
+    limitedBy,
+  };
+}
+
+/** Count link lines in a store's MEMORY.md, or null when it has no readable
+ *  index. The global signpost needs a count but must not pay for a full parse
+ *  (or a per-entry stat) of a store it does not inject. */
+export function countIndexEntries(dir: MemoryDir): number | null {
+  try {
+    const st = lstatSync(dir.indexPath);
+    if (st.isSymbolicLink() || !st.isFile() || st.size > INDEX_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+  try {
+    let n = 0;
+    for (const line of readFileSync(dir.indexPath, "utf8").split("\n")) {
+      if (LINK_PATTERN.test(line)) n++;
+    }
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+/** Describe an index that has grown past the injected excerpt limit, or return
+ *  null while it still fits.
+ *
+ * This exists because writes APPEND: once MEMORY.md is past the cutoff, every
+ * new entry is added BELOW the injected excerpt, so the newest memories are
+ * exactly the ones the model never sees — the opposite of what the writer of
+ * that entry expects. The startup limit is the reader's contract, so the only
+ * place to make it actionable is the write that crosses it. */
+export function startupLimitWarning(dir: MemoryDir): string | null {
+  let raw: string;
+  try {
+    raw = readFileSync(dir.indexPath, "utf8");
+  } catch {
+    return null; // no index yet — the caller is about to create one
+  }
+  const lines = raw.split("\n").length;
+  const bytes = Buffer.byteLength(raw, "utf8");
+  if (lines <= INDEX_STARTUP_MAX_LINES && bytes <= INDEX_STARTUP_MAX_BYTES) return null;
+  const over: string[] = [];
+  if (lines > INDEX_STARTUP_MAX_LINES) {
+    over.push(`${lines} lines (limit ${INDEX_STARTUP_MAX_LINES})`);
+  }
+  if (bytes > INDEX_STARTUP_MAX_BYTES) {
+    over.push(`${bytes} bytes (limit ${INDEX_STARTUP_MAX_BYTES})`);
+  }
+  return (
+    `MEMORY.md is past the injected excerpt limit: ${over.join(", ")}. ` +
+    "Entries below the cutoff are not injected, and appends go to the end, so " +
+    "the newest entries are the ones being dropped. Read through the file with " +
+    "recall_memory, or consolidate the index."
+  );
+}
+
 /** Parse MEMORY.md content string (separated for testing). */
 export function parseIndexContent(content: string, baseDir: string): ParsedIndex {
   const lines: (IndexEntry | IndexLine)[] = [];
@@ -164,17 +299,16 @@ export function parseIndexContent(content: string, baseDir: string): ParsedIndex
  *
  * Both branches normalize through resolve(): an ABSOLUTE href used to be
  * returned verbatim, so `/home/x/.claude/memory//topic.md` or a path with
- * `/./` in it reached the injector as a different string than the
- * canonical path the loader keys its map on. The file was injected in full
- * while the index section still marked it ⟨index-only⟩ (inviting a wasted
- * recall_memory), and a pinned entry lost its large-file bypass.
+ * `/./` in it reaches the injector as a different STRING than the canonical
+ * path, and cross-tier ownership then compares two spellings of one file.
  *
- * When the target exists we ALSO canonicalize through realpathSync, because
- * the loader stores real paths: if any component of the store is itself a
- * symlink (a dotfiles-managed ~/.claude), a lexical path and the loader's
- * real path differ and every index line would render ⟨index-only⟩ despite
- * its body being injected. Missing files keep the lexical path — they are
- * reported as unindexed/missing by reconcileIndex and never loaded. */
+ * When the target exists we canonicalize through realpathSync, because
+ * owningTierOf compares against realpath'd store roots: if any component of
+ * the store is itself a symlink (a dotfiles-managed ~/.claude), a lexical
+ * path and the real path differ and the entry would be attributed to no store
+ * at all. reconcileIndex resolves the same way, so its missing/unindexed
+ * report agrees. Missing files keep the lexical path — they cannot be
+ * realpath'd, and reconcileIndex reports them as missing. */
 function resolveHref(href: string, baseDir: string): string {
   // Absolute path (cross-tier reference like /home/user/.claude/memory/file.md)
   const lexical = isAbsolute(href) ? resolve(href) : resolve(baseDir, href);

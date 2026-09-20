@@ -52,7 +52,7 @@ You return a JSON array of memory candidates. Each candidate has:
   section's tier silently duplicates the entry into the wrong store
 - pinned: boolean (true only for critical behavioral rules)
 - overwrite: boolean (true if this supersedes/replaces an existing entry — see SUPERSESSION below)
-- priority: optional integer 1-5 (5=highest). Omit to use type default (feedback=5, user=4, project=3, reference=2)
+- priority: optional integer 1-5 (5=highest). Stored as metadata; under the bounded-index contract it no longer affects injection order, because no bodies are preloaded.
 
 What to extract:
 - User preferences and conventions explicitly stated

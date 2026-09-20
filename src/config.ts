@@ -4,9 +4,12 @@
 //   "pi-claude-memory": {
 //     "debugLog": true,
 //     "autoLearn": true,
-//     "reviewIntervalTurns": 10,
-//     "injectTokenCap": 5000
+//     "reviewIntervalTurns": 10
 //   }
+//
+// "injectTokenCap" was removed with the bounded-index contract (see README):
+// bodies are no longer preloaded, so there is no token budget to configure. A
+// settings.json that still sets that key loads fine — the key is not read.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -19,8 +22,6 @@ export interface PiClaudeMemoryConfig {
   autoLearn: boolean;
   /** Run auto-learn review every N turns. */
   reviewIntervalTurns: number;
-  /** Token budget for full-text file body injection (shared across tiers). */
-  injectTokenCap: number;
   /** Auto-learn model. */
   reviewModel: { provider: string; id: string };
   /** Thinking level for auto-learn. "off" omits reasoning entirely. */
@@ -47,7 +48,6 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   debugLog: true,
   autoLearn: true,
   reviewIntervalTurns: 10,
-  injectTokenCap: 5000,
   reviewModel: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   reviewThinking: "off",
   reviewMaxOutputTokens: 2048,
@@ -113,17 +113,10 @@ export function loadConfig(): PiClaudeMemoryConfig {
             ),
           }
         : {}),
-      ...(n.injectTokenCap !== undefined
-        ? {
-            injectTokenCap: num(
-              n.injectTokenCap,
-              "injectTokenCap",
-              DEFAULT_CONFIG.injectTokenCap,
-              0,
-              1000000,
-            ),
-          }
-        : {}),
+      // injectTokenCap is deliberately NOT parsed. The bounded-index contract
+      // removed body preloading, so a budget for it would be a knob that does
+      // nothing; an unused knob in the interface is how a later reader
+      // concludes the budget still exists.
       ...(isModelObj(n.reviewModel) ? { reviewModel: n.reviewModel } : {}),
       ...(isThinkingLevel(n.reviewThinking) ? { reviewThinking: n.reviewThinking } : {}),
       ...(n.reviewMaxOutputTokens !== undefined

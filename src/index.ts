@@ -136,7 +136,6 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     debugLog: config.debugLog,
     autoLearn: config.autoLearn,
     reviewIntervalTurns: config.reviewIntervalTurns,
-    injectTokenCap: config.injectTokenCap,
     reviewModel: `${config.reviewModel.provider}/${config.reviewModel.id}`,
     reviewThinking: config.reviewThinking,
     reviewOnShutdown: config.reviewOnShutdown,
@@ -501,14 +500,11 @@ async function handleBeforeAgentStart(
 function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
   const resolved = resolveMemoryDirs(cwd);
 
-  let { text, warnings } = buildMemoryInjection(
-    resolved.project,
-    resolved.global,
-    config.injectTokenCap,
+  let { text, warnings } = buildMemoryInjection(resolved.project, resolved.global, {
     hasCtxSearch,
-    config.autoLearn,
-    config.reviewIntervalTurns,
-  );
+    autoLearn: config.autoLearn,
+    reviewIntervalTurns: config.reviewIntervalTurns,
+  });
 
   if (warnings.length > 0) {
     for (const w of warnings) {

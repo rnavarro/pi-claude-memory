@@ -143,7 +143,8 @@ const writeTool = defineTool({
     ),
     pinned: Type.Optional(
       Type.Boolean({
-        description: "If true, always injected in full regardless of size. Default: false.",
+        description:
+          "Pin marker kept in frontmatter and as a ⛔ in MEMORY.md. Metadata only: nothing is injected in full, and a pin does not reorder or extend the injected index. Default: false.",
       }),
     ),
     priority: Type.Optional(
@@ -151,7 +152,7 @@ const writeTool = defineTool({
         minimum: 1,
         maximum: 5,
         description:
-          "Priority 1-5 (5=highest). Controls injection order when budget is tight. Defaults to type: feedback=5, user=4, project=3, reference=2.",
+          "Priority 1-5 (5=highest). Metadata only under the bounded-index contract: with no preloaded bodies there is no injection order left to control. Defaults to type: feedback=5, user=4, project=3, reference=2.",
       }),
     ),
   }),
@@ -168,9 +169,9 @@ const writeTool = defineTool({
     // of truth is the fix, not a second copy that can drift again.
     "Use write_memory proactively only for explicit signals: user corrections, stated preferences, or verified fixes. Whether routine observations are captured automatically depends on configuration — follow the memory anchor in your context.",
     "Do NOT write memories for ephemeral state, TODOs, or debugging steps — those belong in session notes, not durable memory.",
-    "Pick the right type: feedback=behavioral rule (always inject), reference=lookup material (on-demand), project=project-specific fact, user=user preference.",
-    "Keep descriptions to one line — they appear in the MEMORY.md index that is injected every turn.",
-    "Prefer the global tier for cross-project facts (user preferences, tool conventions). Use project tier for project-specific facts.",
+    "Pick the right type: feedback=behavioral rule (highest priority), reference=lookup material (on-demand), project=project-specific fact, user=user preference.",
+    "Keep descriptions to one line — they appear in the MEMORY.md index that is injected every turn, bounded to its first 200 lines or 25KB.",
+    "The global tier holds cross-project facts but is NOT injected into context — it is recall-only, so a rule that must always apply belongs in CLAUDE.md or project rules instead. Use the project tier for facts needed while working in this project.",
   ],
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     debugLog("tool.write_memory", {
