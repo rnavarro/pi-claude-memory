@@ -1,15 +1,20 @@
-// Tests for what the injected index TELLS the model about its entries.
+// Tests for what the injected index tells the model, under the bounded-index
+// contract: the project index is injected, verbatim, cut at Claude Code's
+// 200-line / 25KB startup limit — and no topic body is read at all.
 //
-// The index is in every prompt, so a wrong marker costs a wasted tool call on
-// every turn it is wrong: ⟨index-only⟩ is an instruction to call recall_memory,
-// and an entry rendered under the wrong tier heading sends that call to the
-// wrong store.
+// Two failure modes matter here and they pull in opposite directions:
+//   - injecting an unbounded index (the bug this contract fixed: 1341 lines
+//     and ~74k tokens in one real store)
+//   - reading topic bodies at prompt-build time (which starved, and which
+//     made several older tests pass for the wrong reason — a body that is
+//     never read cannot leak, so "absent body" alone proves nothing)
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildMemoryInjection } from "../src/injector.js";
+import { INDEX_STARTUP_MAX_BYTES } from "../src/types.js";
 
 let tmpDir: string;
 
@@ -37,120 +42,205 @@ function mkStore(
 
 const doc = (body: string) => `---\ndescription: d\ntype: reference\n---\n${body}\n`;
 
-/** The rendered section for one tier.
- *
- * Assertions must be scoped to it: the routing anchor also spells out the
- * marker legend (⟨index-only⟩, ⟨missing⟩, [in global tier]), so whole-prompt
- * substring checks match the LEGEND rather than the index entry. */
+/** The rendered section for one tier, so an assertion cannot match the routing
+ *  anchor or another tier's block instead of the index it means to check. */
 function tierSection(text: string, label: string): string {
   const start = text.indexOf(`### Memory (${label})`);
   if (start === -1) return "";
-  const next = text.indexOf("### Memory (", start + 1);
+  // Search for a NEWLINE-prefixed heading: "### " alone also matches inside
+  // "#### Index", which truncated this helper's result to a single "#".
+  const next = text.indexOf("\n### ", start + 1);
   return next === -1 ? text.slice(start) : text.slice(start, next);
 }
 
-describe("injector index markers tell the truth", () => {
-  it("marks a missing entry as missing, not as fetchable", () => {
-    // reconcileIndex already knows the file is gone, so advertising it as
-    // ⟨index-only⟩ invited a recall_memory call that was certain to fail.
-    const proj = mkStore("p", "project", "proj", "# P\n- [Gone](gone.md) — g\n");
-    const { text } = buildMemoryInjection(proj, null, 20_000);
-    const section = tierSection(text, "proj");
-    expect(section).toContain("⟨missing⟩");
-    expect(section).not.toContain("⟨index-only⟩");
-  });
-
-  it("still marks a present-but-unloaded entry as index-only", () => {
-    // Regression guard: the missing marker must not swallow the normal case.
-    const long = doc(Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n"));
-    const proj = mkStore("p2", "project", "proj", "# P\n- [Big](big.md) — b\n", { "big.md": long });
-    const { text } = buildMemoryInjection(proj, null, 50);
-    const section = tierSection(text, "proj");
-    expect(section).toContain("⟨index-only⟩");
-    expect(section).not.toContain("⟨missing⟩");
-  });
-
-  it("annotates a cross-tier entry with the tier that owns it", () => {
-    const gRoot = join(tmpDir, "g");
-    const glob = mkStore("g", "global", "global", "# G\n- [Shared](shared.md) — s\n", {
-      "shared.md": doc("SHARED_BODY"),
+describe("bounded index injection", () => {
+  it("injects the index and no topic bodies", () => {
+    const proj = mkStore("p", "project", "proj", "# P\n- [Small](small.md) — s\n", {
+      "small.md": doc("SECRET_BODY"),
     });
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("[Small](small.md)");
+    expect(text).not.toContain("SECRET_BODY");
+    // No full-text section means no section heading advertising one either.
+    expect(text).not.toContain("Full Text");
+  });
+
+  it("never reads a topic body, even for an absolute href outside the store", () => {
+    // Guards the regression, rather than proving non-read: a body that is
+    // never opened cannot leak, so this passes trivially under the contract
+    // and fails the moment body loading is reintroduced.
+    const outside = join(tmpDir, "outside");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "evil.md"), doc("OUTSIDE_TOPIC_BODY"));
     const proj = mkStore(
-      "p3",
+      "p-out",
       "project",
       "proj",
-      `# P\n- [Shared](${join(gRoot, "shared.md")}) — s\n`,
+      `# P\n- [Evil](${join(outside, "evil.md")}) — e\n`,
     );
-    const { text } = buildMemoryInjection(proj, glob, 20_000);
-    // Rendering it under "Memory (proj)" with no note sends a model that
-    // believes that heading to recall_memory with the project tier, which
-    // answers "not found" for a file one tier away.
-    expect(tierSection(text, "proj")).toContain("[in global tier]");
+    const { text } = buildMemoryInjection(proj, null);
+    expect(text).toContain("[Evil]");
+    expect(text).not.toContain("OUTSIDE_TOPIC_BODY");
+  });
+});
+
+describe("the startup limit is on SOURCE lines, like Claude Code's", () => {
+  it("cuts at 200 lines and says exactly what was cut", () => {
+    const entries = Array.from({ length: 210 }, (_, i) => `- [E${i + 1}](e${i + 1}.md) — d`);
+    const proj = mkStore("p-lines", "project", "proj", `# P\n${entries.join("\n")}\n`);
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    // "# P" is line 1, so line 200 is E199 and E200 is the first dropped entry.
+    expect(section).toContain("[E199]");
+    expect(section).not.toContain("[E200]");
+    // Derived from the file rather than hardcoded: the exact total depends on
+    // the trailing newline, and the point is that the notice states the real
+    // count, not a specific number.
+    const totalLines = readFileSync(proj.indexPath, "utf8").split("\n").length;
+    expect(section).toContain(`200 of ${totalLines} lines`);
+    expect(section).toContain("cannot be recalled by name");
   });
 
-  it("does not annotate an entry that belongs to the tier it is listed under", () => {
-    const proj = mkStore("p4", "project", "proj", "# P\n- [Mine](mine.md) — m\n", {
+  it("counts prose and blank lines against the limit, not just entries", () => {
+    // Only two entries exist, so an entry-counting implementation would inject
+    // both. The limit is on the FILE, so the second is below the cut.
+    const filler = Array.from({ length: 199 }, () => "prose line");
+    const body = [...filler, "- [Last](last.md) — l", "- [Cut](cut.md) — c"].join("\n");
+    const proj = mkStore("p-prose", "project", "proj", `${body}\n`);
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("[Last](last.md)");
+    expect(section).not.toContain("[Cut](cut.md)");
+  });
+
+  it("cuts at the byte limit when that binds first", () => {
+    const entries = Array.from(
+      { length: 30 },
+      (_, i) => `- [B${i + 1}](b${i + 1}.md) — ${"x".repeat(900)}`,
+    );
+    const proj = mkStore("p-bytes", "project", "proj", `${entries.join("\n")}\n`);
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("[B1](b1.md)");
+    expect(section).not.toContain("[B30](b30.md)");
+    expect(section).toContain(`${INDEX_STARTUP_MAX_BYTES} bytes`);
+  });
+
+  it("does not promote a pinned entry from below the cut", () => {
+    // A pin means "important", not "reordered". Promoting it would change the
+    // order of the file the model is shown and make the excerpt unpredictable.
+    const filler = Array.from({ length: 200 }, (_, i) => `- [F${i}](f${i}.md) — f`);
+    const body = [...filler, "- ⛔ [Pinned](pinned.md) — p"].join("\n");
+    const proj = mkStore("p-pin", "project", "proj", `${body}\n`);
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("[F0](f0.md)");
+    expect(section).not.toContain("[Pinned](pinned.md)");
+  });
+
+  it("injects an index that fits without a truncation notice", () => {
+    const proj = mkStore("p-fit", "project", "proj", "# P\n- [One](one.md) — o\n");
+    const { text } = buildMemoryInjection(proj, null);
+    const section = tierSection(text, "proj");
+    expect(section).toContain("[One](one.md)");
+    expect(section).not.toContain("truncated");
+  });
+});
+
+describe("availability is no longer claimed at injection time", () => {
+  it("tells the model a link is not a guarantee, and to recall by filename", () => {
+    // The old contract marked ⟨missing⟩/⟨unavailable⟩ per entry. Nothing is
+    // inspected now, so the anchor must not imply every link resolves, and it
+    // must say FILENAME because the resolver does not accept a display title.
+    const proj = mkStore("p-gone", "project", "proj", "# P\n- [Gone](gone.md) — g\n");
+    const { text } = buildMemoryInjection(proj, null);
+    expect(text).toContain("does not guarantee its file is readable");
+    expect(text).toContain("passing its FILENAME");
+    expect(text).not.toContain("⟨index-only⟩");
+    expect(text).not.toContain("⟨missing⟩");
+  });
+
+  it("warns instead of injecting when MEMORY.md is a symlink", () => {
+    const outside = join(tmpDir, "outside-index");
+    mkdirSync(outside, { recursive: true });
+    // The sentinel is in the OUTSIDE INDEX, not a topic body. Asserting only
+    // that a body is absent would pass even if the outside index were injected,
+    // because no body is read under this contract.
+    writeFileSync(join(outside, "MEMORY.md"), "# OUTSIDE_INDEX_SENTINEL\n");
+    const proj = mkStore("p-link", "project", "proj", "# P\n");
+    rmSync(join(proj.dir, "MEMORY.md"));
+    symlinkSync(join(outside, "MEMORY.md"), join(proj.dir, "MEMORY.md"));
+
+    const { text, warnings } = buildMemoryInjection(proj, null);
+    expect(text).not.toContain("OUTSIDE_INDEX_SENTINEL");
+    expect(warnings.join(" ")).toContain("MEMORY.md not injected");
+    expect(warnings.join(" ")).toContain("symlink");
+  });
+});
+
+describe("cross-tier routing survives without per-entry tags", () => {
+  it("tells the model to pass tier: global for links into the global store", () => {
+    // recall_memory tries the project tier first, so an index link into the
+    // global store would silently return a same-named project entry. The old
+    // renderer tagged each such line "[in global tier]"; the guidance has to
+    // exist somewhere now that lines are injected verbatim.
+    const glob = mkStore("g", "global", "global", "# G\n- [Shared](shared.md) — s\n", {
+      "shared.md": doc("SHARED"),
+    });
+    const proj = mkStore(
+      "p-cross",
+      "project",
+      "proj",
+      `# P\n- [Shared](${join(glob.dir, "shared.md")}) — s\n`,
+    );
+    const { text } = buildMemoryInjection(proj, glob);
+    expect(tierSection(text, "proj")).toContain('tier: "global"');
+  });
+
+  it("adds no cross-tier note when every link belongs to the project", () => {
+    const glob = mkStore("g2", "global", "global", "# G\n- [Other](other.md) — o\n");
+    const proj = mkStore("p-mine", "project", "proj", "# P\n- [Mine](mine.md) — m\n", {
       "mine.md": doc("MINE"),
     });
-    const { text } = buildMemoryInjection(proj, null, 20_000);
-    const section = tierSection(text, "proj");
-    expect(section).not.toContain("[in project tier]");
-    expect(section).not.toContain("[in global tier]");
+    const { text } = buildMemoryInjection(proj, glob);
+    expect(tierSection(text, "proj")).not.toContain('tier: "global"');
+  });
+});
+
+describe("the global tier is named, never injected", () => {
+  it("signposts the global store without its entries", () => {
+    const glob = mkStore(
+      "g3",
+      "global",
+      "global",
+      "# G\n- [GOne](gone1.md) — a\n- [GTwo](gtwo.md) — b\n",
+    );
+    const proj = mkStore("p-sign", "project", "proj", "# P\n- [Mine](mine.md) — m\n");
+    const { text } = buildMemoryInjection(proj, glob);
+    expect(text).toContain("Cross-project memory (on demand)");
+    expect(text).toContain(glob.dir);
+    expect(text).toContain("2 cross-project entries");
+    // The entries themselves must not appear: injecting them is what cost
+    // ~35k tokens in every session of every project.
+    expect(text).not.toContain("GOne");
+    expect(text).not.toContain("GTwo");
   });
 
-  it("does not mark an entry index-only when a later tier injects its body", () => {
-    // The first tier renders against a loadedPaths set that cannot yet contain
-    // a body the second tier goes on to inject. Here the project index lists a
-    // large file unpinned (so the project pass skips it) while the global index
-    // pins the same file (so the global pass loads it). Rendering as we went
-    // advertised ⟨index-only⟩ for text that IS in the prompt.
-    const long = doc(Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n"));
-    const glob = mkStore("g2", "global", "global", `# G\n- ⛔ [Big](big.md) — b\n`, {
-      "big.md": long,
-    });
-    const proj = mkStore(
-      "p5",
-      "project",
-      "proj",
-      `# P\n- [Big](${join(tmpDir, "g2", "big.md")}) — b\n`,
-    );
-    const { text } = buildMemoryInjection(proj, glob, 20_000);
-    // Its body is in the prompt via the global (pinned) pass.
-    expect(text).toContain("line 199");
-    // The line is really rendered (guards against a vacuous assertion)...
-    expect(tierSection(text, "proj")).toContain("Big");
-    // ...and must not invite a fetch for a body that is already in the prompt.
-    expect(tierSection(text, "proj")).not.toContain("⟨index-only⟩");
+  it("signposts nothing when there is no global store", () => {
+    const proj = mkStore("p-noglob", "project", "proj", "# P\n- [Mine](mine.md) — m\n");
+    const { text } = buildMemoryInjection(proj, null);
+    expect(text).not.toContain("Cross-project memory");
   });
 });
 
 describe("anchor gating keeps the index guidance", () => {
   it("drops only the ctx_search clause, not the index sentence", () => {
-    const proj = mkStore("p6", "project", "proj", "# P\n- [Mine](mine.md) — m\n", {
-      "mine.md": doc("MINE"),
-    });
-    const { text } = buildMemoryInjection(proj, null, 20_000, /* hasCtxSearch */ false);
-    // The clause that explains what the injected index IS must survive the
-    // strip; previously it shared a line with the ctx_search clause and was
-    // deleted along with it.
+    const proj = mkStore("p6", "project", "proj", "# P\n- [Mine](mine.md) — m\n");
+    const { text } = buildMemoryInjection(proj, null, { hasCtxSearch: false });
+    // The clause explaining what the injected index IS must survive the strip;
+    // it once shared a line with the ctx_search clause and was deleted with it.
     expect(text).toContain("Durable facts across sessions");
     expect(text).not.toContain("ctx_search");
-  });
-});
-
-describe("injector marks unfetchable topics honestly", () => {
-  it("marks an oversize topic as unavailable, not as fetchable", () => {
-    // The file is present on disk but over TOPIC_FILE_MAX_BYTES, so
-    // loadTopicFiles skips it — and readMemory refuses it for the same reason.
-    // ⟨index-only⟩ is an instruction to call recall_memory, so marking it that
-    // way sent the model to a tool call that could not succeed: the same class
-    // the ⟨missing⟩ marker fixed, one branch short.
-    const proj = mkStore("p2", "project", "proj", "# P\n- [Big](big.md) — b\n", {
-      "big.md": doc("x".repeat(1_100_000)),
-    });
-    const { text } = buildMemoryInjection(proj, null, 20_000);
-    const section = tierSection(text, "proj");
-    expect(section).toContain("⟨unavailable⟩");
-    expect(section).not.toContain("⟨index-only⟩");
   });
 });

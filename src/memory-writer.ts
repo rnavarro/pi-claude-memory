@@ -24,7 +24,12 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
-import { lineTargetsAnyIdentity, lineTargetsFile, parseLinkLine } from "./index-parser.js";
+import {
+  lineTargetsAnyIdentity,
+  lineTargetsFile,
+  parseLinkLine,
+  startupLimitWarning,
+} from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import { INDEX_MAX_BYTES, TOPIC_FILE_MAX_BYTES } from "./types.js";
 
@@ -537,11 +542,21 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
     filePath,
   });
 
+  const base = indexError
+    ? `Wrote memory ${slug} to ${dir.label} tier, but the index update failed (${indexError}); the entry is not linked yet`
+    : `Wrote memory ${slug} to ${dir.label} tier`;
+  const limitNote = indexError ? null : startupLimitWarning(dir);
+  if (limitNote) {
+    debugLog("writer.index_past_startup_limit", {
+      slug,
+      filename,
+      tier: dir.tier,
+      label: dir.label,
+    });
+  }
   return {
     ok: true,
-    message: indexError
-      ? `Wrote memory ${slug} to ${dir.label} tier, but the index update failed (${indexError}); the entry is not linked yet`
-      : `Wrote memory ${slug} to ${dir.label} tier`,
+    message: limitNote ? `${base}. Warning: ${limitNote}` : base,
     filePath,
   };
 }
@@ -889,10 +904,11 @@ export function readMemory(
     return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
   }
 
-  // Size cap shared with the injector. Without it recall_memory is an
-  // uncapped read of any file in the store, and the routing anchor actively
-  // tells the model to call it for ⟨index-only⟩ entries — exactly the entries
-  // the injector declined to read in full.
+  // Size cap shared with the injector's read side. Without it recall_memory is
+  // an uncapped read of any file in the store, and the routing anchor directs
+  // the model to recall entries by name on demand — so a topic over this cap
+  // would be advertised by the injected index while being unreadable through
+  // the only interface that can read it.
   try {
     const st = statSync(filePath);
     if (st.size > TOPIC_FILE_MAX_BYTES) {

@@ -19,6 +19,17 @@ export const TOPIC_FILE_MAX_BYTES = 1_000_000;
  */
 export const INDEX_MAX_BYTES = 1_000_000;
 
+/** Claude Code's documented startup excerpt limit for MEMORY.md: the first 200
+ * lines or the first 25KB, whichever binds first.
+ *
+ * Distinct from INDEX_MAX_BYTES above, and the distinction matters. That cap is
+ * a write-side safety bound on the whole index; this one is how much of the
+ * index reaches a prompt. Substituting one for the other in either direction
+ * either truncates a store the writer considers perfectly healthy, or lets a
+ * single oversized store flood the context window. */
+export const INDEX_STARTUP_MAX_LINES = 200;
+export const INDEX_STARTUP_MAX_BYTES = 25_000;
+
 /** Memory tier: project-specific or global (cross-project). */
 export type MemoryTier = "project" | "global";
 
@@ -53,7 +64,14 @@ export interface ParsedFrontmatter {
   priority: number | null;
   /** ISO timestamp of last modification. Falls back to file mtime. */
   modified: string;
-  /** Whether this entry is pinned (always injected in full). */
+  /** Whether this entry carries a pin marker.
+   *
+   * METADATA ONLY under the bounded-index contract. Nothing is injected in
+   * full any more, so a pin does not bypass a size limit, does not affect
+   * admission order, and is not promoted out of the startup cutoff. Claude
+   * Code ignores the flag entirely (it injects no pinned memories in the
+   * observed configuration). It is preserved for round-trip fidelity and for
+   * the ⛔ marker in MEMORY.md. */
   pinned: boolean;
   /** The raw frontmatter object for round-trip preservation. */
   raw: Record<string, unknown>;

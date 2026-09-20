@@ -3,7 +3,7 @@
 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
@@ -186,91 +186,54 @@ describe("index-parser", () => {
   });
 });
 
-describe.skipIf(!REAL_CORPUS)("injector", () => {
-  it("builds injection for my-app", () => {
+describe.skipIf(!REAL_CORPUS)("injector (real corpus, bounded index)", () => {
+  it("injects a bounded index and no full text for my-app", () => {
     const result = resolveMemoryDirs(APP_CWD);
     const { text } = buildMemoryInjection(result.project, result.global);
     expect(text).toContain("## Memory");
     expect(text).toContain("APP");
-    expect(text).toContain("Prefer jq");
-    // Should have the index section
     expect(text).toContain("#### Index");
-    // Should have some full-text files loaded
-    expect(text).toContain("#### Full Text");
+    // This assertion used to be the opposite: "#### Full Text" plus a loaded
+    // body. Bodies are not loaded at prompt-build time under this contract.
+    expect(text).not.toContain("#### Full Text");
   });
 
-  it("builds injection for global-only project", () => {
+  it("signposts the global store instead of injecting it", () => {
     const result = resolveMemoryDirs(UNKNOWN_CWD);
+    expect(result.project).toBeNull();
+    if (!result.global) throw new Error("expected a global store on this machine");
     const { text } = buildMemoryInjection(result.project, result.global);
-    expect(text).toContain("Global");
-    // Assert on the INDEX, not on a topic body. The old assertion looked for a
-    // body ("Prefer jq"), which stopped being injected as the global corpus
-    // grew: its entries compete for one shared body budget, and 20 pinned
-    // entries exhaust it before an unpinned body loads. That made this test a
-    // measure of budget luck rather than of the global tier being injected —
-    // it had been failing on main before this change for exactly that reason.
-    expect(text).toContain("User prefers jq");
-  });
-});
-
-// Synthetic injector test — pure (temp dirs + hand-built MemoryDir), always
-// runs regardless of corpus availability. Exercises the large-file bypass:
-// an index-pinned (⛔) entry over 60 lines must be fully injected even
-// though its frontmatter has no pinned flag (finding #16), while an
-// unpinned large file stays index-only.
-describe("injector (synthetic, index-pin bypass)", () => {
-  it("fully injects an index-pinned large file; leaves unpinned large files index-only", () => {
-    const dir = join(tmpdir(), `pcm-pinbypass-${process.pid}`);
-    mkdirSync(dir, { recursive: true });
-    // 80-line body — well over the 60-line threshold
-    const bigBody = Array.from({ length: 80 }, (_, i) => `line ${i}`).join("\n");
-    writeFileSync(
-      join(dir, "MEMORY.md"),
-      `- ⛔ [Pinned big](pinned_big.md) — always in\n- [Unpinned big](unpinned_big.md) — index only\n`,
-    );
-    const mkFile = (name: string) =>
-      writeFileSync(
-        join(dir, name),
-        `---\ndescription: ${name}\ntype: reference\n---\n${bigBody}\n`,
-      );
-    // pinned_big.md deliberately has NO pinned frontmatter — the pin lives
-    // only in the index (⛔ marker), like entries written by other agents.
-    mkFile("pinned_big.md");
-    mkFile("unpinned_big.md");
-
-    const memDir = {
-      tier: "global" as const,
-      dir,
-      indexPath: join(dir, "MEMORY.md"),
-      label: "Test",
-    };
-    const { text } = buildMemoryInjection(null, memDir, 20000);
-
-    expect(text).toContain("#### Full Text");
-    // The index-pinned big file must be fully loaded...
-    expect(text).toContain("line 79");
-    // ...while the unpinned big file stays index-only.
-    const fullText = text.slice(text.indexOf("#### Full Text"));
-    expect(fullText).not.toContain("unpinned_big");
-
-    rmSync(dir, { recursive: true, force: true });
+    // Three contracts have been asserted at this spot. First a topic BODY
+    // ("Prefer jq"), which corpus growth made flaky. Then the global INDEX
+    // line, while that tier was still injected. Now the SIGNPOST, because the
+    // global index is deliberately not injected at all: it cost ~35k tokens in
+    // every session of every project.
+    expect(text).toContain("Cross-project memory (on demand)");
+    expect(text).toContain(result.global.dir);
+    expect(text).not.toContain("User prefers jq");
+    // The signpost counts as content, so the full anchor (not the empty-store
+    // variant) is the correct one here.
+    expect(text).toContain("Durable facts across sessions");
   });
 });
 
 describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
-  it("resolves the index at the root but the topic base to memory/", () => {
-    // This LOCKS the current behavior rather than "fixing" hrefs to be
+  it("resolves the index at the root and the topic base to memory/", () => {
+    // This LOCKS the resolver behaviour rather than "fixing" hrefs to be
     // relative to the index file. A real store on this machine has exactly
     // this shape: a root MEMORY.md whose lines are bare (`user_location.md`)
     // with the topics in the sibling memory/. The read base is memory/, so
-    // those bare hrefs resolve correctly and the bodies load. Emitting
-    // index-relative links instead (memory/foo.md) would resolve to
-    // memory/memory/foo.md and MISS — the would-be fix breaks the real store.
+    // those bare hrefs resolve for recall. Emitting index-relative links
+    // instead (memory/foo.md) would resolve to memory/memory/foo.md and MISS.
+    //
+    // The assertion used to be that the topic BODY was injected, which proved
+    // href resolution end to end. Injection no longer reads bodies, so this
+    // now asserts the two paths the resolver picked; href resolution itself is
+    // covered by the writer/recall tests, which still read topics.
     const home = mkdtempSync(join(tmpdir(), "pcm-l2-"));
     const origHome = process.env.HOME;
     process.env.HOME = home;
     try {
-      // Unique cwd: the resolver caches by cwd.
       const cwd = `/home/user/workspace/pcm-l2-${process.pid}-${Date.now()}`;
       const proj = join(home, ".claude", "projects", encodePath(cwd));
       const mem = join(proj, "memory");
@@ -285,9 +248,9 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
       expect(resolved.project?.indexPath).toBe(join(proj, "MEMORY.md"));
       expect(resolved.project?.dir).toBe(mem);
 
-      const { text } = buildMemoryInjection(resolved.project, resolved.global, 20000);
-      // The bare href resolved against memory/, so the body is injected.
-      expect(text).toContain("TOPIC_BODY_SENTINEL");
+      const { text } = buildMemoryInjection(resolved.project, resolved.global);
+      expect(text).toContain("[User location](user_location.md)");
+      expect(text).not.toContain("TOPIC_BODY_SENTINEL");
     } finally {
       if (origHome === undefined) Reflect.deleteProperty(process.env, "HOME");
       else process.env.HOME = origHome;
@@ -296,134 +259,7 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
   });
 });
 
-describe("cross-tier injection does not duplicate a shared topic", () => {
-  // A project index may link an absolute href into the global store, and the
-  // global index lists the same file relatively. Each tier built its OWN
-  // loadedPaths set, so the body was emitted twice and charged twice against
-  // the shared budget — confirmed live: a real project index on this machine
-  // has two such absolute cross-tier hrefs.
-  const mkStore = (root: string, indexLines: string, files: Record<string, string>) => {
-    mkdirSync(root, { recursive: true });
-    writeFileSync(join(root, "MEMORY.md"), indexLines);
-    for (const [name, body] of Object.entries(files)) {
-      writeFileSync(join(root, name), `---\ndescription: ${name}\ntype: reference\n---\n${body}\n`);
-    }
-    return { tier: "global" as const, dir: root, indexPath: join(root, "MEMORY.md"), label: root };
-  };
-
-  it("emits a cross-tier-linked body exactly once", () => {
-    const base = mkdtempSync(join(tmpdir(), "pcm-xtier-"));
-    const globalRoot = join(base, "global");
-    const projectRoot = join(base, "project");
-    const globalDir = mkStore(globalRoot, "- [Shared](shared.md) — the shared topic\n", {
-      "shared.md": "SHARED_BODY_SENTINEL",
-    });
-    // The project index reaches the SAME global file by absolute href.
-    const projectDir = {
-      ...mkStore(
-        projectRoot,
-        `- [Shared](${join(globalRoot, "shared.md")}) — cross-tier link\n`,
-        {},
-      ),
-      tier: "project" as const,
-      label: "project",
-    };
-
-    const { text } = buildMemoryInjection(projectDir, globalDir, 20000);
-    const occurrences = text.split("SHARED_BODY_SENTINEL").length - 1;
-    expect(occurrences).toBe(1);
-
-    rmSync(base, { recursive: true, force: true });
-  });
-});
-
-describe("injector read-side containment", () => {
-  // Synthetic dirs (no real corpus needed)
-  const mkDir = (root: string, tier: "project" | "global"): MemoryDirType => ({
-    tier,
-    dir: root,
-    indexPath: join(root, "MEMORY.md"),
-    label: tier,
-  });
-
-  it("skips index hrefs pointing outside the memory stores", () => {
-    const projRoot = mkdtempSync(join(tmpdir(), "pcm-contain-p-"));
-    const globalRoot = mkdtempSync(join(tmpdir(), "pcm-contain-g-"));
-    mkdirSync(projRoot, { recursive: true });
-    mkdirSync(globalRoot, { recursive: true });
-
-    // Legitimate topic
-    writeFileSync(
-      join(projRoot, "inside.md"),
-      "---\ndescription: d\ntype: project\n---\ninside body\n",
-    );
-    // Outside absolute href
-    const outsideDir = mkdtempSync(join(tmpdir(), "pcm-outside-"));
-    const outsidePath = join(outsideDir, "victim.md");
-    writeFileSync(outsidePath, "---\ndescription: d\ntype: project\n---\nsecret outside body\n");
-    // Symlinked "topic" inside the store pointing outside
-    symlinkSync(outsidePath, join(projRoot, "sneaky.md"));
-
-    // Traversal href (../ relative escapes projRoot)
-    writeFileSync(
-      join(outsideDir, "traversal.md"),
-      "---\ndescription: d\ntype: project\n---\ntraversal body\n",
-    );
-
-    writeFileSync(
-      join(projRoot, "MEMORY.md"),
-      `- [Inside](inside.md) — in\n` +
-        `- [Victim](${outsidePath}) — out\n` +
-        `- [Sneaky](sneaky.md) — sneaky\n` +
-        `- [Traversal](../../${basename(outsideDir)}/traversal.md) — trav\n`,
-    );
-
-    const { text, warnings } = buildMemoryInjection(
-      mkDir(projRoot, "project"),
-      mkDir(globalRoot, "global"),
-      5000,
-      true,
-    );
-    expect(text).toContain("inside body");
-    expect(text).not.toContain("secret outside body");
-    expect(text).not.toContain("traversal body");
-    // Inside-body link present in index regardless of full-text load
-    expect(warnings.join("\n")).not.toContain("secret");
-
-    rmSync(projRoot, { recursive: true, force: true });
-    rmSync(globalRoot, { recursive: true, force: true });
-    rmSync(outsideDir, { recursive: true, force: true });
-  });
-
-  it("still loads legitimate cross-tier absolute hrefs", () => {
-    const projRoot = mkdtempSync(join(tmpdir(), "pcm-cross-p-"));
-    const globalRoot = mkdtempSync(join(tmpdir(), "pcm-cross-g-"));
-    mkdirSync(projRoot, { recursive: true });
-    mkdirSync(globalRoot, { recursive: true });
-
-    writeFileSync(
-      join(globalRoot, "shared.md"),
-      "---\ndescription: d\ntype: reference\n---\ncross-tier body\n",
-    );
-    writeFileSync(
-      join(projRoot, "MEMORY.md"),
-      `- [Shared](${join(globalRoot, "shared.md")}) — cross-tier\n`,
-    );
-
-    const { text } = buildMemoryInjection(
-      mkDir(projRoot, "project"),
-      mkDir(globalRoot, "global"),
-      5000,
-      true,
-    );
-    expect(text).toContain("cross-tier body");
-
-    rmSync(projRoot, { recursive: true, force: true });
-    rmSync(globalRoot, { recursive: true, force: true });
-  });
-});
-
-describe("injector containment: symlinked ancestors and roots", () => {
+describe("injector reads the index and nothing else", () => {
   const mk = (root: string, tier: "project" | "global"): MemoryDirType => ({
     tier,
     dir: root,
@@ -432,69 +268,42 @@ describe("injector containment: symlinked ancestors and roots", () => {
   });
   const FM = "---\ndescription: d\ntype: project\n---\n";
 
-  it("rejects a topic reached through a symlinked DIRECTORY inside the store", () => {
-    const proj = mkdtempSync(join(tmpdir(), "pcm-anc-p-"));
-    const glob = mkdtempSync(join(tmpdir(), "pcm-anc-g-"));
-    const outside = mkdtempSync(join(tmpdir(), "pcm-anc-o-"));
-    writeFileSync(join(outside, "secret.md"), `${FM}ANCESTOR_LINK_SECRET\n`);
-    // A symlinked directory INSIDE the store: lexical containment passes,
-    // so this is only closed by canonicalizing the path.
-    symlinkSync(outside, join(proj, "bridge"));
-    writeFileSync(join(proj, "MEMORY.md"), "- [S](bridge/secret.md) — bridged\n");
+  it("rejects a symlinked index by its INDEX content, not by a body", () => {
+    // The old form of this test put the sentinel in an outside TOPIC and
+    // asserted that body was absent. Under zero preloading that assertion
+    // passes even if the outside INDEX is injected, because no body is ever
+    // read — a vacuous pass that would have hidden the regression. The
+    // sentinel therefore lives in the outside index itself.
+    const proj = mkdtempSync(join(tmpdir(), "pcm-idx-p-"));
+    const outside = mkdtempSync(join(tmpdir(), "pcm-idx-o-"));
+    writeFileSync(join(outside, "MEMORY.md"), "# OUTSIDE_INDEX_SENTINEL\n");
+    writeFileSync(join(outside, "evil.md"), `${FM}OUTSIDE_BODY_SENTINEL\n`);
+    symlinkSync(join(outside, "MEMORY.md"), join(proj, "MEMORY.md"));
 
-    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
-    expect(text).not.toContain("ANCESTOR_LINK_SECRET");
+    const { text, warnings } = buildMemoryInjection(mk(proj, "project"), null);
+    expect(text).not.toContain("OUTSIDE_INDEX_SENTINEL");
+    expect(text).not.toContain("OUTSIDE_BODY_SENTINEL");
+    expect(warnings.join(" ")).toContain("symlink");
 
-    for (const d of [proj, glob, outside]) rmSync(d, { recursive: true, force: true });
+    for (const d of [proj, outside]) rmSync(d, { recursive: true, force: true });
   });
 
-  it("still loads a store whose own path is behind a symlink", () => {
+  it("still injects the index of a store whose own path is behind a symlink", () => {
+    // A dotfiles-managed ~/.claude is the real case: rejecting it would drop
+    // every entry. The path is read THROUGH the symlinked directory, so the
+    // lstat on the index itself still sees a regular file.
     const real = mkdtempSync(join(tmpdir(), "pcm-link-real-"));
     const linkParent = mkdtempSync(join(tmpdir(), "pcm-link-p-"));
-    const glob = mkdtempSync(join(tmpdir(), "pcm-link-g-"));
+    writeFileSync(join(real, "MEMORY.md"), "# M\n- [T](t.md) — x\n");
     writeFileSync(join(real, "t.md"), `${FM}VIA_LINKED_ROOT\n`);
-    writeFileSync(join(real, "MEMORY.md"), "- [T](t.md) — x\n");
     const linked = join(linkParent, "store");
     symlinkSync(real, linked);
 
-    const { text } = buildMemoryInjection(mk(linked, "project"), mk(glob, "global"), 5000, true);
-    expect(text).toContain("VIA_LINKED_ROOT");
-    // The body is in the prompt, so the index line must NOT claim otherwise.
-    // (Match on the link line, not the anchor, which mentions the phrase.)
-    expect(text).not.toContain("(t.md) — x ⟨index-only⟩");
+    const { text } = buildMemoryInjection(mk(linked, "project"), null);
+    expect(text).toContain("[T](t.md)");
+    expect(text).not.toContain("VIA_LINKED_ROOT");
 
-    for (const d of [real, linkParent, glob]) rmSync(d, { recursive: true, force: true });
-  });
-
-  it("loads a topic referenced by a non-canonical absolute href", () => {
-    const proj = mkdtempSync(join(tmpdir(), "pcm-nc-p-"));
-    const glob = mkdtempSync(join(tmpdir(), "pcm-nc-g-"));
-    writeFileSync(join(proj, "ok.md"), `${FM}NONCANON_BODY\n`);
-    // Doubled separator in an absolute href: previously reached the injector
-    // as a different string than the loader's key, so the entry was injected
-    // AND marked index-only.
-    writeFileSync(join(proj, "MEMORY.md"), `- [Ok](${join(proj, "//ok.md")}) — x\n`);
-
-    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
-    expect(text).toContain("NONCANON_BODY");
-    expect(text).not.toContain("//ok.md) — x ⟨index-only⟩");
-
-    for (const d of [proj, glob]) rmSync(d, { recursive: true, force: true });
-  });
-
-  it("ignores an index whose path is a directory or symlink", () => {
-    const proj = mkdtempSync(join(tmpdir(), "pcm-idx-p-"));
-    const glob = mkdtempSync(join(tmpdir(), "pcm-idx-g-"));
-    const outside = mkdtempSync(join(tmpdir(), "pcm-idx-o-"));
-    writeFileSync(join(outside, "MEMORY.md"), `- [Evil](${join(outside, "evil.md")}) — x\n`);
-    writeFileSync(join(outside, "evil.md"), `${FM}SYMLINKED_INDEX_PAYLOAD\n`);
-    // MEMORY.md itself as a symlink to an outside index.
-    symlinkSync(join(outside, "MEMORY.md"), join(proj, "MEMORY.md"));
-
-    const { text } = buildMemoryInjection(mk(proj, "project"), mk(glob, "global"), 5000, true);
-    expect(text).not.toContain("SYMLINKED_INDEX_PAYLOAD");
-
-    for (const d of [proj, glob, outside]) rmSync(d, { recursive: true, force: true });
+    for (const d of [real, linkParent]) rmSync(d, { recursive: true, force: true });
   });
 });
 
@@ -520,7 +329,7 @@ describe("routing anchor tells the truth about the reviewer", () => {
     expect(MEMORY_ROUTING_ANCHOR).toContain("{{REVIEWER}}");
     const root = mkdtempSync(join(tmpdir(), "pcm-anchor-"));
     mkdirSync(root, { recursive: true });
-    writeFileSync(join(root, "MEMORY.md"), "# M\n- [X](x.md) \u2014 s\n");
+    writeFileSync(join(root, "MEMORY.md"), "# M\n- [X](x.md) — s\n");
     writeFileSync(join(root, "x.md"), "---\ndescription: d\ntype: project\n---\nbody\n");
     const proj: MemoryDirType = {
       tier: "project",
@@ -528,46 +337,13 @@ describe("routing anchor tells the truth about the reviewer", () => {
       indexPath: join(root, "MEMORY.md"),
       label: "project",
     };
-    const { text } = buildMemoryInjection(proj, null, 5000, true, false, 10);
+    const { text } = buildMemoryInjection(proj, null, {
+      hasCtxSearch: true,
+      autoLearn: false,
+      reviewIntervalTurns: 10,
+    });
     expect(text).not.toContain("{{REVIEWER}}");
     expect(text).toContain("only way a fact survives");
-    rmSync(root, { recursive: true, force: true });
-  });
-});
-
-describe("pinned entry demotion is never silent", () => {
-  const mkdir2 = (root: string, tier: "project" | "global"): MemoryDirType => ({
-    tier,
-    dir: root,
-    indexPath: join(root, "MEMORY.md"),
-    label: tier,
-  });
-
-  it("warns when a pinned entry exceeds the remaining budget", () => {
-    const root = mkdtempSync(join(tmpdir(), "pcm-pin-"));
-    const body = "p".repeat(40000); // far beyond a tiny cap
-    writeFileSync(
-      join(root, "big-pinned.md"),
-      `---\ndescription: d\ntype: project\n---\n${body}\n`,
-    );
-    writeFileSync(join(root, "MEMORY.md"), "# M\n- ⛔ [Big pinned](big-pinned.md) — d\n");
-    const dir = mkdir2(root, "project");
-    // Tiny cap so the pinned body cannot fit.
-    const { warnings } = buildMemoryInjection(dir, null, 50);
-    expect(warnings.some((w) => w.includes("pinned entry") && w.includes("index-only"))).toBe(true);
-    rmSync(root, { recursive: true, force: true });
-  });
-
-  it("does not warn for a pinned entry that fits", () => {
-    const root = mkdtempSync(join(tmpdir(), "pcm-pin-ok-"));
-    writeFileSync(
-      join(root, "small-pinned.md"),
-      "---\ndescription: d\ntype: project\n---\nsmall\n",
-    );
-    writeFileSync(join(root, "MEMORY.md"), "# M\n- ⛔ [Small pinned](small-pinned.md) — d\n");
-    const dir = mkdir2(root, "project");
-    const { warnings } = buildMemoryInjection(dir, null, 20000);
-    expect(warnings.some((w) => w.includes("pinned entry"))).toBe(false);
     rmSync(root, { recursive: true, force: true });
   });
 });

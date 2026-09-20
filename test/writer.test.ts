@@ -617,6 +617,42 @@ describe("index concurrency primitives", () => {
     expect(final).toContain("MINE");
   });
 
+  it("warns when a write pushes MEMORY.md past the injected excerpt limit", () => {
+    // Writes APPEND, so an index past the cutoff means the entry just written
+    // sits below the cut and is never injected: the failure this warning makes
+    // visible. It is the write-side half of the bounded-index contract, since
+    // the reader can only report the truncation, not prevent it.
+    const indexPath = join(dir.dir, "MEMORY.md");
+    const filler = Array.from({ length: 205 }, (_, i) => `- [F${i}](f${i}.md) — f`).join("\n");
+    writeFileSync(indexPath, `${filler}\n`);
+    const result = writeMemory(dir, {
+      name: "past-the-cut",
+      description: "d",
+      type: "reference",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+      tier: "project",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("past the injected excerpt limit");
+  });
+
+  it("does not warn while the index still fits the excerpt", () => {
+    writeFileSync(join(dir.dir, "MEMORY.md"), "# M\n- [One](one.md) — o\n");
+    const result = writeMemory(dir, {
+      name: "fits",
+      description: "d",
+      type: "reference",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+      tier: "project",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.message).not.toContain("excerpt limit");
+  });
+
   it("withIndexRetry yields instead of overwriting a writer that keeps winning", () => {
     const indexPath = join(dir.dir, "MEMORY.md");
     writeFileSync(indexPath, "BASE\n");
@@ -1543,17 +1579,19 @@ describe("the index correction path is guarded like the main path", () => {
 });
 
 describe("a FIFO in the store never blocks prompt construction", () => {
-  it("is rejected as a non-regular file rather than read", () => {
+  it("is never opened at all", () => {
     // A FIFO named *.md and linked from the index used to hang prompt
-    // construction: openSync(path, "r") on a FIFO BLOCKS until a writer appears,
-    // so the regular-file check was never reached. The loader now opens with
-    // O_NONBLOCK so the check runs.
+    // construction: openSync(path, "r") on a FIFO BLOCKS until a writer
+    // appears, so the regular-file check behind it never ran. The loader fixed
+    // that with O_NONBLOCK; the bounded-index contract then removed the read
+    // entirely, so no topic is opened at injection time and the hang is
+    // structurally impossible rather than merely guarded.
     //
-    // This test keeps a writer open, which means it exercises the non-regular
-    // rejection safely. The no-writer blocking case cannot be asserted in-process
-    // (a regression would hang the runner instead of failing it); it was
-    // verified out-of-band by reverting O_NONBLOCK and watching the probe die on
-    // a 30s timeout (exit 124) versus passing in ~0.3s with the fix.
+    // The FIFO is kept as a guard against reintroducing a body read, not as a
+    // test of non-regular rejection: that check now lives on the recall path
+    // (resolveTopicFile lstats and refuses a non-regular topic before its
+    // read). A writer is held open so this test cannot hang even if a body read
+    // returns.
     const d = join(tmpDir, "fifo-store");
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, "MEMORY.md"), "# F\n- [Blocked](blocked.md) — b\n");
@@ -1567,10 +1605,9 @@ describe("a FIFO in the store never blocks prompt construction", () => {
       const res = buildMemoryInjection(
         { tier: "project", dir: d, indexPath: join(d, "MEMORY.md"), label: "fifo" },
         null,
-        5000,
       );
-      // Completing at all is the assertion; the FIFO is rejected as a
-      // non-regular file, so its entry renders index-only (no body loaded).
+      // Completing is the assertion. The index line is injected verbatim, so
+      // "Blocked" appears from the INDEX, not from reading the FIFO.
       expect(res.text).toContain("Blocked");
     } finally {
       closeSync(wfd);
