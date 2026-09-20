@@ -1,30 +1,44 @@
 // Resolver: cwd → Claude Code memory directories
 //
 // Claude Code stores project memory at:
-//   ~/.claude/projects/<encoded-cwd>/memory/MEMORY.md
+//   ~/.claude/projects/<encoded-project-root>/memory/MEMORY.md
 // and global memory at:
 //   ~/.claude/memory/MEMORY.md
 //
 // Encoding: replace "/" with "-" in the absolute path.
 // e.g. /home/user/workspace/my-app → -home-user-workspace-my-app
+//
+// The path that gets encoded is not the cwd — it is the project IDENTITY ROOT
+// (projectIdentityRoot below). Claude Code keys the store on the repository, so
+// every subdirectory and every linked worktree of one repo shares a single
+// store. Encoding the raw cwd instead sends a subdir or worktree launch to a
+// different, usually empty store, so pi would read and write files Claude Code
+// never touches for that project.
 
-import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
-/** Root of Claude Code's per-project memory stores. Computed lazily (not at
- * module load) so tests that override process.env.HOME after importing the
- * resolver see the temp home instead of the real one. */
+/** Claude Code's config tree (~/.claude), which CLAUDE_CONFIG_DIR relocates.
+ * Computed lazily (not at module load) so tests that override process.env.HOME
+ * after importing the resolver see the temp home instead of the real one. */
+function claudeConfigDir(): string {
+  const override = process.env.CLAUDE_CONFIG_DIR?.trim();
+  if (override) return isAbsolute(override) ? override : resolve(override);
+  return `${homedir()}/.claude`;
+}
+
+/** Root of Claude Code's per-project memory stores. */
 function claudeProjectsDir(): string {
-  return `${homedir()}/.claude/projects`;
+  return `${claudeConfigDir()}/projects`;
 }
 
 /** Claude Code's global (cross-project) memory store. Lazily computed — see
- * claudeProjectsDir(). */
+ * claudeConfigDir(). */
 function claudeGlobalDir(): string {
-  return `${homedir()}/.claude/memory`;
+  return `${claudeConfigDir()}/memory`;
 }
 
 /** Encode a path the way Claude Code does: "/" → "-". */
@@ -33,9 +47,99 @@ export function encodePath(path: string): string {
   return abs.replace(/\//g, "-");
 }
 
-/** Get the project directory for an encoded cwd. */
+/** Device names Claude Code refuses to use as a project directory name. */
+const RESERVED_PROJECT_NAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
+]);
+
+/** The encoded directory name for a project. CLAUDE_CODE_PROJECT_DIR_NAME
+ * overrides it, but only when CLAUDE_CONFIG_DIR is set — that pairing is
+ * Claude Code's own precondition, so honouring the name alone would invent a
+ * store Claude Code never reads. */
+function projectDirName(identityRoot: string): string {
+  if (process.env.CLAUDE_CONFIG_DIR?.trim()) {
+    const raw = process.env.CLAUDE_CODE_PROJECT_DIR_NAME?.trim();
+    if (
+      raw &&
+      /^[A-Za-z0-9_-]{1,64}$/.test(raw) &&
+      !RESERVED_PROJECT_NAMES.has(raw.toLowerCase())
+    ) {
+      return raw;
+    }
+  }
+  return encodePath(identityRoot);
+}
+
+/** Get the project directory for an encoded project name. */
 function projectDir(encoded: string): string {
   return `${claudeProjectsDir()}/${encoded}`;
+}
+
+/**
+ * Canonical project-identity root — the directory Claude Code keys a memory
+ * store on.
+ *
+ * Inside a git repository this is the repository root, so every subdirectory
+ * and every linked worktree of one repo resolves to the same store. Outside a
+ * repository (including when the cwd does not exist) it is the cwd itself.
+ */
+export function projectIdentityRoot(cwd: string): string {
+  const abs = isAbsolute(cwd) ? cwd : resolve(cwd);
+  let dir = abs;
+  for (;;) {
+    const dotGit = join(dir, ".git");
+    if (existsSync(dotGit)) {
+      let isDir = true;
+      try {
+        isDir = statSync(dotGit).isDirectory();
+      } catch {
+        // Unreadable .git entry: treat it as a repository root rather than
+        // walking further up and adopting an unrelated parent repo.
+      }
+      if (isDir) return dir;
+      return resolveLinkedWorktreeRoot(dir, dotGit) ?? dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return abs;
+    dir = parent;
+  }
+}
+
+/**
+ * Follow a `.git` file (a linked-worktree or submodule pointer) to the main
+ * repository root, or return null to fall back to the directory holding it.
+ *
+ * Two consistency checks mirror Claude Code's own: the linked gitdir must live
+ * under <common>/worktrees/, and its backlink must point at this worktree's
+ * .git. Without them a hand-edited or submodule `.git` file could claim an
+ * unrelated repository's memory store.
+ */
+function resolveLinkedWorktreeRoot(worktreeDir: string, dotGitFile: string): string | null {
+  try {
+    const firstLine = readFileSync(dotGitFile, "utf8").split("\n")[0] ?? "";
+    const match = /^gitdir:\s*(.+?)\s*$/.exec(firstLine);
+    if (!match) return null;
+    const gitdir = resolve(worktreeDir, match[1]);
+
+    const commonRaw = readFileSync(join(gitdir, "commondir"), "utf8").trim();
+    if (!commonRaw) return null;
+    const common = resolve(gitdir, commonRaw);
+
+    if (!gitdir.startsWith(`${common}/worktrees/`)) return null;
+
+    const backRaw = readFileSync(join(gitdir, "gitdir"), "utf8").trim();
+    if (!backRaw) return null;
+    if (resolve(gitdir, backRaw) !== resolve(worktreeDir, ".git")) return null;
+
+    return basename(common) === ".git" ? dirname(common) : common;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -57,7 +161,8 @@ function projectDir(encoded: string): string {
 export function resolveMemoryDirs(cwd: string): ResolveResult {
   const warnings: string[] = [];
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
-  const encoded = encodePath(absCwd);
+  const identityRoot = projectIdentityRoot(absCwd);
+  const encoded = projectDirName(identityRoot);
 
   // Resolve project tier
   let project: MemoryDir | null = null;
@@ -74,7 +179,7 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
   // "-control"), so adoption must be a deliberate user action.
   let orphanStores: string[] = [];
   if (!project) {
-    const cwdBasename = absCwd.split(sep).pop() ?? absCwd;
+    const cwdBasename = identityRoot.split(sep).pop() ?? identityRoot;
     if (cwdBasename) {
       orphanStores = findProjectCandidates(cwdBasename);
       if (orphanStores.length > 0) {
@@ -104,6 +209,7 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
 
   debugLog("resolver.resolve", {
     cwd: absCwd,
+    identityRoot,
     encoded,
     projectDir: project?.dir ?? null,
     projectLabel: project?.label ?? null,
@@ -122,7 +228,7 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
  */
 export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
-  const encoded = encodePath(absCwd);
+  const encoded = projectDirName(projectIdentityRoot(absCwd));
   const projectDir = `${claudeProjectsDir()}/${encoded}`;
   const memorySubdir = `${projectDir}/memory`;
 
@@ -218,7 +324,7 @@ function resolveProjectMemory(
  */
 export function orphanSignpost(cwd: string, orphans: string[]): string {
   const abs = isAbsolute(cwd) ? cwd : resolve(cwd);
-  const encoded = encodePath(abs);
+  const encoded = projectDirName(projectIdentityRoot(abs));
   return (
     `[pi-claude-memory] No memory store exists for this project yet, but ${orphans.length} ` +
     `store(s) from same-basename paths exist: ${orphans.join(", ")}. If one belongs to this ` +
