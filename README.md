@@ -32,18 +32,20 @@ uses.
 | Tier | Location | Scope |
 | --- | --- | --- |
 | project | `~/.claude/projects/<encoded-cwd>/memory/` | this project only |
-| global | `~/.claude/memory/` | every project |
+| global | `~/.claude/memory/` | every project — stored, recall-only, NOT injected |
 
 A read that misses in the requested tier falls back to the other one. A write
 or removal targets an exactly matching project store, so a mutation never lands
-in another project's memory by accident. Project entries win the shared
-injection budget, so a local correction outranks a global default.
+in another project's memory by accident.
 
-**Injection.** Every turn the injector assembles a routing anchor, the index,
-and as many full entry bodies as fit in the token budget. Entries whose bodies
-did not fit are marked `⟨index-only⟩` so the model knows to fetch them; entries
-whose file is gone are marked `⟨missing⟩` so it does not try. Cross-tier entries
-are tagged with the tier that owns them.
+**Injection.** Every turn the injector assembles a routing anchor and the
+project's `MEMORY.md`, cut at its first 200 lines or 25 KB — whichever binds
+first, the same limit Claude Code applies to its own auto memory — with an
+explicit notice when it truncates. Topic bodies are never injected: the model
+reads one on demand with `recall_memory`, passing the entry's filename. The
+global store is named in a signpost rather than injected, because its index
+alone cost tens of thousands of tokens in every session of every project; it
+stays fully reachable via `recall_memory` with `tier: "global"`.
 
 **Auto-learning.** After a configurable number of turns Pi runs a background
 review of the recent conversation, using a model of your choosing, and writes
@@ -64,8 +66,7 @@ Every field is optional.
 {
   "pi-claude-memory": {
     "autoLearn": false,
-    "reviewIntervalTurns": 20,
-    "injectTokenCap": 8000
+    "reviewIntervalTurns": 20
   }
 }
 ```
@@ -75,7 +76,7 @@ Every field is optional.
 | `debugLog` | `true` | Write structured NDJSON to `~/.pi/agent/pi-claude-memory/debug/<sessionId>.ndjson` (rotated at 10 MB) |
 | `autoLearn` | `true` | Run the background reviewer at all |
 | `reviewIntervalTurns` | `10` | Turns between periodic reviews |
-| `injectTokenCap` | `5000` | Token budget shared by both tiers each turn |
+| `injectTokenCap` | — | **Removed.** The bounded-index contract dropped body preloading, so there is no budget left to configure; the key is ignored if still present. |
 | `reviewModel` | `neuralwatt/deepseek-v4-flash` | Model used for reviews, as `{ "provider": ..., "id": ... }` |
 | `reviewThinking` | `off` | Reasoning effort for the reviewer |
 | `reviewMaxOutputTokens` | `2048` | Reviewer output cap |
