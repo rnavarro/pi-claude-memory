@@ -11,12 +11,27 @@ import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache, withToolLogContext } from "./index.js";
 import type { MemoryOpResult } from "./memory-writer.js";
 import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
-import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
-import type { MemoryDir, ResolveResult } from "./types.js";
+import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
+import type { MemoryDir } from "./types.js";
 
-/** Pick a tier dir from a resolve result. */
-function pickTier(resolved: ResolveResult, tier: "project" | "global") {
-  return tier === "global" ? resolved.global : resolved.project;
+/** Refuse a request that still names a memory tier, and say why.
+ *
+ * The global tier is gone, so `tier: "global"` has no destination. Quietly
+a * treating it as the project store would silently retarget a write or a
+ * removal — worse than failing. A model can carry the habit for a while (the
+ * injected anchor taught it this parameter for months), and an explanatory
+ * refusal is how it learns otherwise.
+ *
+ * `tier: "project"` is accepted and ignored so a harmless echo keeps working. */
+function tierRefusal(params: unknown): string | null {
+  if (typeof params !== "object" || params === null) return null;
+  const tier = (params as { tier?: unknown }).tier;
+  if (tier === undefined || tier === "project") return null;
+  return (
+    `No "${String(tier)}" memory tier: pi-claude-memory is project-scoped, matching Claude Code, ` +
+    `which has no cross-project memory store. Nothing was written or removed. Retry without the ` +
+    `tier parameter; a rule that must apply in every project belongs in AGENTS.md or CLAUDE.md.`
+  );
 }
 
 const recallTool = defineTool({
@@ -32,77 +47,45 @@ const recallTool = defineTool({
       description:
         "Memory entry name or filename. Matches the filename itself, or any spelling that slugifies to the same value as the file's stem. Give the FULL stem for underscore-named entries: 'feedback_never_push_master', not 'never-push-master'.",
     }),
-    tier: Type.Optional(
-      Type.Union([Type.Literal("project"), Type.Literal("global")], {
-        description: "Memory tier. Default: project (falls back to global if not found).",
-      }),
-    ),
   }),
   promptSnippet:
     "recall_memory - Read a Claude Code memory entry by name with [[wikilink]] resolution.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-    debugLog("tool.recall_memory", { name: params.name, tier: params.tier ?? "project" });
-    const resolved = resolveMemoryDirs(ctx.cwd);
-    const defaultTier = params.tier === undefined;
-    const tier = params.tier ?? "project";
-    const otherTier = tier === "project" ? "global" : "project";
-
-    // Candidate order: the requested tier first, then the other tier ONLY
-    // when the caller did not name one. An explicitly named tier is honored
-    // strictly, so a same-slug entry in the other store is never substituted.
-    //
-    // The other tier must be a candidate even when the requested tier has NO
-    // directory at all: with no project store for this cwd, a global entry
-    // must still be reachable. Resolving the dir first and only falling back
-    // after a failed READ dropped that case entirely, so recall_memory
-    // answered "No memory directory available (tier=project)" while a global
-    // store full of memories sat one call away.
-    const ordered: Array<"project" | "global"> = defaultTier ? [tier, otherTier] : [tier];
-    const candidates: MemoryDir[] = [];
-    for (const t of ordered) {
-      const d = pickTier(resolved, t);
-      if (d && !candidates.includes(d)) candidates.push(d);
+    const refusal = tierRefusal(params);
+    if (refusal) {
+      return { content: [{ type: "text", text: refusal }], details: undefined as unknown };
     }
-
-    if (candidates.length === 0) {
+    debugLog("tool.recall_memory", { name: params.name });
+    const dir = resolveMemoryDirs(ctx.cwd).project;
+    if (!dir) {
       return {
-        content: [{ type: "text", text: `No memory directory available (tier=${tier}).` }],
+        content: [
+          {
+            type: "text",
+            text: `No memory store for this project yet (${ctx.cwd}) — nothing has been written here.`,
+          },
+        ],
         details: undefined as unknown,
       };
     }
 
-    let miss: string | null = null;
-    // "not found" is the least informative failure there is. `miss ??=` kept the
-    // FIRST one, so with an entry absent from the first tier but present and
-    // unreadable (oversize, unreadable file) in the second, the caller was told
-    // the memory does not exist — and a model told that may simply write it
-    // again, creating a duplicate of a file that is sitting right there.
-    const isNotFound = (m: string) => /not found/i.test(m);
-    for (const dir of candidates) {
-      const result = readMemory(dir, params.name);
-      if (!result.ok) {
-        if (miss === null || (isNotFound(miss) && !isNotFound(result.message))) {
-          miss = result.message;
-        }
-        continue;
-      }
-      if (dir !== candidates[0]) {
-        debugLog("tool.recall_memory.fallback", { name: params.name, tier: dir.tier });
-      }
-      const header = `**${dir.label} tier** \u2014 \u0060${result.filePath}\u0060\n\n`;
+    // Resolution inside readMemory is exact, so a name that is not in this
+    // store fails instead of being answered by a same-named entry elsewhere.
+    const result = readMemory(dir, params.name);
+    if (!result.ok) {
       return {
-        content: [{ type: "text", text: header + result.content }],
-        details: {
-          tier: dir.tier,
-          filePath: result.filePath,
-          name: result.frontmatter.name,
-        } as unknown,
+        content: [{ type: "text", text: result.message }],
+        details: undefined as unknown,
       };
     }
-
+    const header = `**${dir.label}** \u2014 \u0060${result.filePath}\u0060\n\n`;
     return {
-      content: [{ type: "text", text: miss ?? `Memory not found: ${params.name}` }],
-      details: undefined as unknown,
+      content: [{ type: "text", text: header + result.content }],
+      details: {
+        tier: dir.tier,
+        filePath: result.filePath,
+        name: result.frontmatter.name,
+      } as unknown,
     };
   },
 });
@@ -136,11 +119,6 @@ const writeTool = defineTool({
       },
     ),
     body: Type.String({ description: "Markdown body of the memory entry." }),
-    tier: Type.Optional(
-      Type.Union([Type.Literal("project"), Type.Literal("global")], {
-        description: "Memory tier. Default: project.",
-      }),
-    ),
     pinned: Type.Optional(
       Type.Boolean({
         description:
@@ -171,34 +149,29 @@ const writeTool = defineTool({
     "Do NOT write memories for ephemeral state, TODOs, or debugging steps — those belong in session notes, not durable memory.",
     "Pick the right type: feedback=behavioral rule (highest priority), reference=lookup material (on-demand), project=project-specific fact, user=user preference.",
     "Keep descriptions to one line — they appear in the MEMORY.md index that is injected every turn, bounded to its first 200 lines or 25KB.",
-    "The global tier holds cross-project facts but is NOT injected into context — it is recall-only, so a rule that must always apply belongs in CLAUDE.md or project rules instead. Use the project tier for facts needed while working in this project.",
+    "The project store is the only store: a rule that must apply in every project belongs in AGENTS.md or CLAUDE.md, not in memory. Use memory for facts needed while working in this project.",
   ],
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    const refusal = tierRefusal(params);
+    if (refusal) {
+      return { content: [{ type: "text", text: refusal }], details: undefined as unknown };
+    }
     debugLog("tool.write_memory", {
       name: params.name,
       type: params.type,
-      tier: params.tier ?? "project",
       pinned: params.pinned ?? false,
       priority: params.priority ?? null,
       bodyChars: params.body.length,
     });
-    const tier = params.tier ?? "project";
     // Resolution is exact for every operation; a same-basename store is never
     // adopted implicitly, so a write cannot land in another project's store.
-    const resolved = resolveMemoryDirs(ctx.cwd);
-    let dir = pickTier(resolved, tier);
-    // Create the dir if it doesn't exist yet (fresh installations have no
-    // store — reads stay side-effect-free, writes create on demand).
-    if (!dir && tier === "project") {
-      dir = createProjectMemoryDir(ctx.cwd);
-    } else if (!dir && tier === "global") {
-      dir = createGlobalMemoryDir();
-    }
+    let dir: MemoryDir | null = resolveMemoryDirs(ctx.cwd).project;
+    // Create the store if it doesn't exist yet (fresh installations have none —
+    // reads stay side-effect-free, writes create on demand).
+    if (!dir) dir = createProjectMemoryDir(ctx.cwd);
     if (!dir) {
       return {
-        content: [
-          { type: "text", text: `No ${tier} memory directory available for cwd ${ctx.cwd}.` },
-        ],
+        content: [{ type: "text", text: `Could not create a memory store for cwd ${ctx.cwd}.` }],
         details: undefined as unknown,
       };
     }
@@ -216,12 +189,11 @@ const writeTool = defineTool({
         type: params.type,
         body: params.body,
         pinned: params.pinned ?? false,
-        tier,
         priority: params.priority ?? null,
         allowOverwrite: true, // tool is user-initiated, overwrite is expected
       });
     } catch (err) {
-      debugLog("tool.write_memory_error", { name: params.name, tier, error: String(err) });
+      debugLog("tool.write_memory_error", { name: params.name, error: String(err) });
       result = { ok: false, message: `Failed to write memory ${params.name}: ${String(err)}` };
     } finally {
       // Invalidate the resolver cache so the next before_agent_start picks up
@@ -246,106 +218,28 @@ const removeTool = defineTool({
     "Never hard-deletes. Use to retire stale or incorrect memories.",
   parameters: Type.Object({
     name: Type.String({ description: "Entry name (slug) or filename to remove." }),
-    tier: Type.Optional(
-      Type.Union([Type.Literal("project"), Type.Literal("global")], {
-        description: "Memory tier. Default: project.",
-      }),
-    ),
   }),
   promptSnippet:
     "remove_memory - Move a memory entry to .trash/ and remove its MEMORY.md link. Recoverable, never hard-deletes.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-    debugLog("tool.remove_memory", { name: params.name, tier: params.tier ?? "project" });
-    const explicitTier = params.tier !== undefined;
-    const tier = params.tier ?? "project";
-    const otherTier = tier === "project" ? "global" : "project";
-    // Resolution is exact for every operation (see write_memory), so a
-    // removal can only name an entry in this project's own store — or the
-    // global tier, which is one fixed directory.
-    const resolved = resolveMemoryDirs(ctx.cwd);
-
-    // Candidate order mirrors recall_memory: the requested tier first, then the
-    // other tier ONLY when the caller did not name one. An explicitly named tier
-    // is honored strictly, so a same-named entry in another store is never
-    // removed by accident.
-    //
-    // The fallback has to be ENTRY-level, not directory-level. Falling back only
-    // when the requested tier had no directory at all meant that with a project
-    // store present, `remove_memory feedback_prefer_jq` (a real global entry)
-    // resolved the project dir, answered "not found", and never consulted
-    // global — while recall_memory, which the anchor tells the model to use
-    // when a memory is wrong, found the same entry without trouble.
-    const ordered: Array<"project" | "global"> = explicitTier ? [tier] : [tier, otherTier];
-    const candidates: MemoryDir[] = [];
-    for (const t of ordered) {
-      const d = pickTier(resolved, t);
-      if (d && !candidates.some((c) => c.dir === d.dir)) candidates.push(d);
+    const refusal = tierRefusal(params);
+    if (refusal) {
+      return { content: [{ type: "text", text: refusal }], details: undefined as unknown };
     }
-
-    // Indexes that may hold a reference to the removed topic, INDEPENDENT of
-    // `explicitTier`. Naming a tier constrains which store the entry is removed
-    // FROM; it must not constrain which indexes get their dangling reference
-    // cleaned. Deriving this from `candidates` made it empty on the explicit
-    // path, so `remove_memory({name, tier: "global"})` trashed the global topic
-    // and left the project index advertising it — the exact dangling link this
-    // argument exists to prevent, on the invocation the injected anchor teaches
-    // the model to use when it tags an entry "[in global tier]".
-    const allDirs: MemoryDir[] = [];
-    for (const t of ["project", "global"] as const) {
-      const d = pickTier(resolved, t);
-      if (d && !allDirs.some((c) => c.dir === d.dir)) allDirs.push(d);
-    }
-
-    if (candidates.length === 0) {
+    debugLog("tool.remove_memory", { name: params.name });
+    const dir = resolveMemoryDirs(ctx.cwd).project;
+    if (!dir) {
       return {
-        content: [{ type: "text", text: `No ${tier} memory directory available.` }],
+        content: [{ type: "text", text: `No memory store for this project yet (${ctx.cwd}).` }],
         details: undefined as unknown,
       };
     }
 
-    // Try each candidate until one actually holds the entry. A "not found" in
-    // the first tier is not an answer while another tier is untried. Any OTHER
-    // failure IS an answer about that tier, so it is reported instead of being
-    // retried against a store the caller did not name.
-    let result: MemoryOpResult | null = null;
-    let dir: MemoryDir = candidates[0];
-    let firstMiss: string | null = null;
-    const isNotFound = (m: string) => /not found/i.test(m);
+    let result: MemoryOpResult;
     try {
-      for (const candidate of candidates) {
-        const attempt = removeMemory(candidate, {
-          name: params.name,
-          tier: candidate.tier,
-          // Every resolved store, so the other one's dangling cross-tier
-          // reference is stripped in the same operation.
-          alsoUnlink: allDirs.filter((c) => c.dir !== candidate.dir),
-        });
-        if (!attempt.ok) {
-          if (attempt.reason === "not_found") {
-            // Keep the most specific absence, mirroring recall_memory: the first
-            // tier answering "not found" must not mask a second tier's "too
-            // large to read", which tells the caller the memory does exist.
-            if (firstMiss === null || (isNotFound(firstMiss) && !isNotFound(attempt.message))) {
-              firstMiss = attempt.message;
-            }
-            continue;
-          }
-          // A refusal — a safety check declining, or an I/O failure — is an
-          // ANSWER about this tier, not an invitation to try the other store.
-          // Falling through here trashed an entry the caller never named: with
-          // `.trash` in the project tier present as a plain file, remove_memory
-          // refused the project removal and then deleted the GLOBAL copy while
-          // reporting success.
-          result = attempt;
-          dir = candidate;
-          break;
-        }
-        result = attempt;
-        dir = candidate;
-        break;
-      }
+      result = removeMemory(dir, { name: params.name });
     } catch (err) {
-      debugLog("tool.remove_memory_error", { name: params.name, tier, error: String(err) });
+      debugLog("tool.remove_memory_error", { name: params.name, error: String(err) });
       result = { ok: false, message: `Failed to remove memory ${params.name}: ${String(err)}` };
     } finally {
       // Invalidate the resolver cache so the next before_agent_start reflects
@@ -353,13 +247,9 @@ const removeTool = defineTool({
       invalidateResolveCache();
     }
 
-    const finalResult: MemoryOpResult = result ?? {
-      ok: false,
-      message: firstMiss ?? `Memory not found: ${params.name}`,
-    };
     return {
-      content: [{ type: "text", text: finalResult.message }],
-      details: { ok: finalResult.ok, tier: dir.tier, trashPath: finalResult.filePath } as unknown,
+      content: [{ type: "text", text: result.message }],
+      details: { ok: result.ok, tier: dir.tier, trashPath: result.filePath } as unknown,
     };
   },
 });

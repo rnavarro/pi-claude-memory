@@ -17,7 +17,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { debugLog } from "./debug-log.js";
 import { parseIndexFile } from "./index-parser.js";
 import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
-import { createGlobalMemoryDir, createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
+import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
 /** Configuration for auto-learning. */
@@ -46,10 +46,6 @@ You return a JSON array of memory candidates. Each candidate has:
 - description: one-line summary
 - type: one of "feedback" (behavioral rule), "reference" (lookup material), "project" (project-specific fact), "user" (user preference)
 - body: markdown body, 1-10 lines
-- tier: the store the entry should live in. An entry in the existing-index
-  summary tagged [owner: X] belongs in store X regardless of which section
-  listed it, so a candidate overwriting it must carry tier X — echoing the
-  section's tier silently duplicates the entry into the wrong store
 - pinned: boolean (true only for critical behavioral rules)
 - overwrite: boolean (true if this supersedes/replaces an existing entry — see SUPERSESSION below)
 - priority: optional integer 1-5 (5=highest). Stored as metadata; under the bounded-index contract it no longer affects injection order, because no bodies are preloaded.
@@ -84,7 +80,6 @@ interface MemoryCandidate {
   description: string;
   type: "feedback" | "reference" | "project" | "user";
   body: string;
-  tier: "project" | "global";
   pinned: boolean;
   /** If true, overwrite an existing entry with the same slug (supersession).
    * The LLM sets this when a candidate contradicts/replaces an existing entry. */
@@ -143,7 +138,7 @@ export async function runAutoLearn(
   // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
   // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
   // silently clobbering a newer edit with a stale review decision.
-  const mtimes = snapshotMtimes([resolved.global, resolved.project]);
+  const mtimes = snapshotMtimes([resolved.project]);
 
   const userText = `EXISTING MEMORY INDEX (avoid duplicates):
 ${existingIndex || "(empty — no existing memories)"}
@@ -243,23 +238,20 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
       debugLog("auto_learn.skip_writes_aborted", { remaining: candidates.length - written });
       break;
     }
-    let dir: MemoryDir | null = c.tier === "global" ? resolved.global : resolved.project;
-    if (!dir && c.tier === "project") {
-      dir = createProjectMemoryDir(cwd);
-    } else if (!dir && c.tier === "global") {
-      dir = createGlobalMemoryDir();
-    }
+    // One store. A missing store is created on first write (a fresh install
+    // has none); if that fails, skip this candidate rather than dropping the
+    // rest of the batch.
+    let dir: MemoryDir | null = resolved.project;
+    if (!dir) dir = createProjectMemoryDir(cwd);
     if (!dir) {
-      // Requested tier unavailable — skip silently. The model will learn from
-      // the absence in the next cycle's index.
+      debugLog("auto_learn.no_store", { cwd });
       continue;
     }
     // Stale-overwrite guard: an overwrite candidate is only safe when the
     // target file existed at snapshot time and is unchanged since. Anything
     // else (created mid-review, edited mid-review, deleted mid-review) is a
     // concurrent mutation the stale review must not clobber or resurrect.
-    // The snapshot is keyed by `${tier}:${slug}` so a same-slug entry in the
-    // other tier can never stand in for this target's mtime.
+    // The snapshot is keyed by `${tier}:${slug}`, matching snapshotMtimes.
     if (c.overwrite === true) {
       // Resolve the same target writeMemory is about to write: the EXISTING
       // file for this name, whatever its stem. Keying on slugify(c.name) alone
@@ -302,14 +294,13 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
         type: c.type,
         body: c.body,
         pinned: c.pinned,
-        tier: c.tier,
         priority: c.priority ?? null,
         // Auto-learn overwrites only when the LLM signals supersession
         allowOverwrite: c.overwrite === true,
       });
       if (result.ok) written++;
     } catch (err) {
-      debugLog("auto_learn.write_error", { name: c.name, tier: c.tier, error: String(err) });
+      debugLog("auto_learn.write_error", { name: c.name, tier: dir.tier, error: String(err) });
     }
   }
 
@@ -377,7 +368,11 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
       c.type === "project" ||
       c.type === "user") &&
     typeof c.body === "string" &&
-    (c.tier === "project" || c.tier === "global") &&
+    // A tier is no longer accepted. The reviewer used to choose one; there is
+    // now a single store, and a candidate that still carries "global" is
+    // rejected rather than quietly re-homed into the project store — a silent
+    // relocation would put a fact somewhere the model did not choose.
+    (c.tier === undefined || c.tier === "project") &&
     typeof c.pinned === "boolean" &&
     // overwrite is optional (defaults to false)
     (c.overwrite === undefined || typeof c.overwrite === "boolean") &&
@@ -392,12 +387,11 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
   );
 }
 
-/** Snapshot mtimes of existing topic files, keyed by `${tier}:${slug}`, so
+/** Snapshot mtimes of existing topic files, keyed `${dir.tier}:${stem}`, so
  * overwrite candidates can be skipped if the target changed during the LLM
- * call. Captured BEFORE the call; compared AFTER. Tier-keyed because a
- * same-slug file in the other tier must not stand in for the target's
- * mtime (project iterated after global would otherwise overwrite the
- * global key and phantom-mismatch every global overwrite). */
+ * call. Captured BEFORE the call; compared AFTER. The write loop builds the
+ * same key from `resolveWriteTarget`, so a non-slug-normal stem ("Foo Bar.md")
+ * is matched through its raw-stem alias as well as through its slug. */
 export function snapshotMtimes(dirs: (MemoryDir | null)[]): Map<string, number> {
   const map = new Map<string, number>();
   for (const dir of dirs) {
@@ -474,25 +468,19 @@ const SUMMARY_BUDGET_CHARS = 6000;
  * LLM cannot tell what an existing entry covers and creates near-duplicate
  * slugs instead of recognizing the same topic.
  *
- * Falls back to readdir filenames only if MEMORY.md is unparseable. */
+ * Falls back to readdir filenames only if MEMORY.md is unparseable.
+ *
+ * Only this store's own topics are listed. An index line whose href resolves
+ * outside the store names another store's topic: it is not addressable by name
+ * here, so advertising it would invite overwriting an unrelated local file whose
+ * stem happens to match. */
 export function buildExistingIndexSummary(resolved: ResolveResult): string {
   const lines: string[] = [];
-  // Each entry must be advertised under the tier that OWNS it, not under the
-  // tier whose index happens to link it. A project index can link to a global
-  // topic (cross-tier absolute hrefs are supported), and the summary used to
-  // group such an entry under "project" while reducing the href to a bare
-  // basename — so the model saw global contents described as a project slug
-  // and could return a project-tier overwrite for a topic it had only ever
-  // seen in global. The write loop picks its directory from the candidate's
-  // tier, so that overwrite would land on an unrelated same-named project file.
-  //
-  // Both sides are canonicalized: entry.filePath comes from resolveHref, which
-  // realpath's the target, while MemoryDir.dir is built lexically from
-  // homedir(). If any component of the store is a symlink (a dotfiles-managed
-  // ~/.claude), every canonical entry path fails a lexical prefix test and
-  // attribution silently falls back to the LINKING tier — reintroducing the
-  // exact misattribution this function exists to prevent. The injector
-  // canonicalizes both sides for the same reason.
+  // Both sides of the ownership test are canonicalized: entry.filePath comes
+  // from resolveHref, which realpath's the target, while MemoryDir.dir is built
+  // lexically from homedir(). With a symlinked store component (a
+  // dotfiles-managed ~/.claude) a lexical prefix test fails on every entry and
+  // every external entry would look local — the opposite of the intent.
   const canonicalRoots = new Map<MemoryDir, string>();
   const canonicalDir = (dir: MemoryDir): string => {
     const cached = canonicalRoots.get(dir);
@@ -506,65 +494,68 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
     canonicalRoots.set(dir, root);
     return root;
   };
-  const ownerOf = (filePath: string, fallback: MemoryDir): MemoryDir => {
+  /** Is this entry's target a topic in THIS store?
+   *
+   * An href that resolves outside it names another store's topic. Such an entry
+   * is not addressable by name here, so it is skipped rather than advertised as
+   * a supersession target: the write loop resolves a candidate's name inside
+   * this store, so advertising an external stem would invite overwriting an
+   * unrelated local file whose stem matches. */
+  const isOwnedBy = (filePath: string, dir: MemoryDir): boolean => {
     let canonicalPath = filePath;
     try {
       canonicalPath = realpathSync(filePath);
     } catch {
       // Missing target keeps the lexical path (resolveHref does the same).
     }
-    for (const d of [resolved.project, resolved.global]) {
-      if (!d) continue;
-      const root = canonicalDir(d);
-      if (canonicalPath === root || canonicalPath.startsWith(`${root}/`)) return d;
-    }
-    return fallback;
+    const root = canonicalDir(dir);
+    return canonicalPath === root || canonicalPath.startsWith(`${root}/`);
   };
 
-  // Project first, mirroring the injector's presentation order. The summary
-  // budget is PER TIER (summaryChars is reset at the top of this loop), so no
-  // ordering choice can starve either tier's summaries; what this decides is
-  // the order sections appear in the reviewer prompt, and the conversation
-  // under review is likelier to be about the project tier.
-  for (const dir of [resolved.project, resolved.global]) {
-    if (!dir) continue;
+  const dir = resolved.project;
+  if (dir) {
     const headerIndex = lines.length;
-    // Name the TIER in the header, not just the label. A project store's label
-    // is the cwd basename ("## my-app tier"), while the candidate schema
-    // accepts only "project" or "global", so a model echoing the header
-    // produced an invalid tier that parseCandidates then dropped in silence.
-    // The label stays for context; the valid token comes first.
-    lines.push(`## ${dir.tier} tier (${dir.label})`);
+    // The header is the store's label (the project basename), stated for
+    // context only; the candidate schema carries no tier token any more.
+    lines.push(`## ${dir.label}`);
     const before = lines.length;
     try {
       const parsed = parseIndexFile(dir);
       if (parsed && parsed.entries.length > 0) {
-        // EVERY entry is listed by identity. The previous slice(0, 50) hid the
-        // rest from the reviewer permanently: this machine's real global index
-        // has 222 entries and writes append, so anything past the cutoff could
-        // never be matched for supersession no matter how many reviews ran.
-        // The advertised "match the existing identifier" mechanism simply did
-        // not apply to them, and they accumulated as duplicates. Identities are
-        // what supersession keys on, so they are never dropped; only the
-        // SUMMARIES are budgeted, which bounds prompt size without losing
-        // matchability.
+        // EVERY local entry is listed by identity. The previous slice(0, 50)
+        // hid the rest from the reviewer permanently on a large store (this
+        // machine's cross-project index had 222 entries) and writes append, so
+        // anything past the cutoff could never be matched for supersession no
+        // matter how many reviews ran. The advertised "match the existing
+        // identifier" mechanism simply did not apply to them, and they
+        // accumulated as duplicates. Identities are what supersession keys on,
+        // so they are never dropped; only the SUMMARIES are budgeted, which
+        // bounds prompt size without losing matchability.
         let summaryChars = 0;
         let trimmed = 0;
+        let external = 0;
         for (const entry of parsed.entries) {
+          if (!isOwnedBy(entry.filePath, dir)) {
+            external++;
+            continue;
+          }
           // The stem is the stable identifier: the writer keys overwrite
           // targets on slugify(candidate.name), so the model must return THIS
-          // slug to supersede. The owning tier is stated explicitly because a
-          // slug alone is ambiguous across stores.
+          // slug to supersede.
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
-          const owner = ownerOf(entry.filePath, dir);
-          const tierNote = owner.tier === dir.tier ? "" : ` [owner: ${owner.tier}]`;
           if (summaryChars + entry.summary.length <= SUMMARY_BUDGET_CHARS) {
-            lines.push(`- ${stem}: ${entry.summary}${tierNote}`);
+            lines.push(`- ${stem}: ${entry.summary}`);
             summaryChars += entry.summary.length;
           } else {
-            lines.push(`- ${stem}${tierNote}`);
+            lines.push(`- ${stem}`);
             trimmed++;
           }
+        }
+        if (external > 0) {
+          lines.push(
+            `(${external} index entr${external === 1 ? "y" : "ies"} point outside this store and are ` +
+              "not listed: they are not addressable by name here)",
+          );
         }
         if (trimmed > 0) {
           lines.push(
@@ -590,8 +581,8 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
     } catch {
       lines.push("(unreadable)");
     }
-    // Drop a section that carries a header but no entries we could attribute
-    // to this tier, so the model is not handed a header implying ownership.
+    // Drop a header with no entries under it, so the model is not handed a
+    // section implying ownership of something we could not list.
     if (lines.length === before && headerIndex < lines.length) {
       lines.length = headerIndex;
     }

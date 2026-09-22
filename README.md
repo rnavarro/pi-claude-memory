@@ -27,25 +27,26 @@ uses.
 
 ## How it works
 
-**Two tiers.** Memory resolves per working directory:
+**One store, per project.** Memory lives at
+`~/.claude/projects/<project-root>/memory/` and covers that project only.
 
-| Tier | Location | Scope |
-| --- | --- | --- |
-| project | `~/.claude/projects/<encoded-cwd>/memory/` | this project only |
-| global | `~/.claude/memory/` | every project — stored, recall-only, NOT injected |
+That is the store Claude Code reads and writes, and it is the only one. Claude
+Code's auto memory is per-repository by design; its cross-project mechanism is
+user-scope instructions (`~/.claude/CLAUDE.md`, `~/.claude/rules/`), not a
+memory store. An earlier version of this extension kept its own cross-project
+tier at `~/.claude/memory/`; nothing else read it, and it is gone. Knowledge
+that must apply in every project belongs in an instruction file, not in memory.
 
-A read that misses in the requested tier falls back to the other one. A write
-or removal targets an exactly matching project store, so a mutation never lands
-in another project's memory by accident.
+A write or removal targets an exactly matching project store, so a mutation
+never lands in another project's memory by accident. A request that still names
+the removed `tier` parameter is refused with an explanation rather than being
+silently retargeted at the project store.
 
 **Injection.** Every turn the injector assembles a routing anchor and the
 project's `MEMORY.md`, cut at its first 200 lines or 25 KB — whichever binds
 first, the same limit Claude Code applies to its own auto memory — with an
 explicit notice when it truncates. Topic bodies are never injected: the model
-reads one on demand with `recall_memory`, passing the entry's filename. The
-global store is named in a signpost rather than injected, because its index
-alone cost tens of thousands of tokens in every session of every project; it
-stays fully reachable via `recall_memory` with `tier: "global"`.
+reads one on demand with `recall_memory`, passing the entry's filename.
 
 **Auto-learning.** After a configurable number of turns Pi runs a background
 review of the recent conversation, using a model of your choosing, and writes

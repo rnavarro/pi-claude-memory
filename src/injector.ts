@@ -5,27 +5,22 @@
 // 2. Inject the project's MEMORY.md, bounded to its first 200 lines or 25KB,
 //    whichever binds first — the same startup excerpt Claude Code sends
 // 3. Topic bodies are NEVER loaded here. recall_memory reads on demand.
-// 4. The global store is NOT injected; a signpost names it so the model can
-//    read its index or recall from it explicitly.
+//
+// One store only. Claude Code has no cross-project auto-memory (its
+// cross-project mechanism is user-scope instructions), so neither does this
+// plugin: the second tier and the signpost that named it are gone.
 //
 // What this replaced, and why: the injector used to render EVERY index line
 // and then greedily load topic bodies under a 5000-token budget. The budget was
 // a rounding error next to the index it competed with — big-project's 1341-line
-// index alone cost ~74k tokens per turn, and the global tier's 734 lines cost
-// ~35k tokens in every session of every project. Bounding the index is the
-// substance of the fix; dropping body preloading follows from it, because
-// bodies are what the bounded index tells the model to fetch on demand.
+// index alone cost ~74k tokens per turn, and the since-removed cross-project
+// tier's 734 lines cost ~35k tokens in every session of every project. Bounding
+// the index is the substance of the fix; dropping body preloading follows from
+// it, because bodies are what the bounded index tells the model to fetch on
+// demand.
 
-import { realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
 import { debugLog } from "./debug-log.js";
-import {
-  countIndexEntries,
-  parseIndexContent,
-  parseIndexFile,
-  readBoundedIndex,
-  reconcileIndex,
-} from "./index-parser.js";
+import { parseIndexFile, readBoundedIndex, reconcileIndex } from "./index-parser.js";
 import type { MemoryDir } from "./types.js";
 import { INDEX_STARTUP_MAX_BYTES, INDEX_STARTUP_MAX_LINES } from "./types.js";
 
@@ -50,7 +45,7 @@ import { INDEX_STARTUP_MAX_BYTES, INDEX_STARTUP_MAX_LINES } from "./types.js";
  */
 export const MEMORY_ROUTING_ANCHOR = `pi-claude-memory active. Only the bounded project index is below — topic bodies are NOT in context.
 Read an entry with recall_memory, passing its FILENAME; a link does not guarantee its file is readable.
-A link whose path is outside this project's store lives in the global store — pass tier: "global" for it.
+recall_memory resolves this project's own topics — a link pointing outside this store is not a local name.
 User correction, stated preference, or verified fix → write_memory this turn.{{REVIEWER}}
 Memory that is now wrong → remove_memory (never leave it to rot).
 Durable facts across sessions → the index below.
@@ -100,18 +95,14 @@ export interface InjectionOptions {
  */
 export function buildMemoryInjection(
   project: MemoryDir | null,
-  global: MemoryDir | null,
   options: InjectionOptions = {},
 ): { text: string; warnings: string[] } {
   const { hasCtxSearch = true, autoLearn = true, reviewIntervalTurns = 10 } = options;
   const warnings: string[] = [];
   const blocks: string[] = [];
 
-  const projectBlock = project ? buildProjectIndexBlock(project, global, warnings) : null;
+  const projectBlock = project ? buildProjectIndexBlock(project, warnings) : null;
   if (projectBlock) blocks.push(projectBlock);
-
-  const globalBlock = global ? globalSignpost(global) : null;
-  if (globalBlock) blocks.push(globalBlock);
 
   const hasAnyEntries = blocks.length > 0;
 
@@ -134,7 +125,6 @@ export function buildMemoryInjection(
 
   debugLog("injector.build", {
     hasProject: project !== null,
-    hasGlobal: global !== null,
     hasAnyEntries,
     hasCtxSearch,
     warningCount: warnings.length,
@@ -149,11 +139,7 @@ export function buildMemoryInjection(
 
 /** Build the project tier block: the bounded index excerpt plus the routing
  *  guidance that only makes sense for the entries actually shown. */
-function buildProjectIndexBlock(
-  project: MemoryDir,
-  global: MemoryDir | null,
-  warnings: string[],
-): string | null {
+function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string | null {
   // Reconcile against the FULL index, never the bounded excerpt: a topic whose
   // link sits below the 200-line cut is still indexed, so reporting it as
   // unindexed would be a lie. This is also the only signal that a topic file
@@ -215,80 +201,5 @@ function buildProjectIndexBlock(
     );
   }
 
-  // Per-entry ownership tags are gone with the re-rendering they depended on,
-  // but the ROUTING problem they solved did not: recall_memory tries the
-  // project tier first, so an index link into the global store would silently
-  // return a same-named project entry instead. State the rule once, for the
-  // entries actually shown.
-  if (global && bounded.content.trim()) {
-    const entries = parseIndexContent(bounded.content, project.dir).entries;
-    const knownDirs = [project, global];
-    const owned = entries.filter(
-      (e) => owningTierOf(e.filePath, knownDirs, project, sep) !== null,
-    ).length;
-    if (owned > 0) {
-      parts.push(
-        `${owned} link(s) above resolve into the global store — pass tier: "global" to recall_memory for those.`,
-      );
-    }
-  }
-
   return parts.join("\n\n");
-}
-
-/** Name the global store without injecting any of it.
- *
- * The global tier is a pi invention: Claude Code has no cross-project
- * auto-memory, and its index is not injected here because rendering it cost
- * ~35k tokens in every session of every project. The files stay, recall_memory
- * with tier: "global" still reaches them, and the signpost is what makes them
- * discoverable — without it the store would be unreachable by name, since
- * nothing else tells the model which entries exist.
- *
- * Returns null when the store has no readable index, so a machine without a
- * global store gets no dangling pointer. */
-function globalSignpost(global: MemoryDir): string | null {
-  const count = countIndexEntries(global);
-  if (count === null) return null;
-  return [
-    "### Cross-project memory (on demand)",
-    `${count} cross-project ${count === 1 ? "entry is" : "entries are"} stored at ${global.dir} and deliberately NOT in context.`,
-    `Read ${global.indexPath} when a task may have cross-project context, then recall_memory with tier: "global".`,
-  ].join("\n");
-}
-
-/** Canonicalize a path for containment comparison (realpath, lexical fallback). */
-function canonicalizePath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return resolve(p);
-  }
-}
-
-/** Which resolved store owns this topic, or null if it belongs to none of
- * them.
- *
- * Both sides are canonicalized: entry paths come from resolveHref, which
- * realpath's the target, while MemoryDir.dir is built lexically from homedir().
- * Comparing a canonical path against a lexical root silently fails whenever a
- * store component is a symlink, which would drop every annotation. */
-function owningTierOf(
-  filePath: string,
-  knownDirs: MemoryDir[],
-  linkingDir: MemoryDir,
-  separator: string,
-): MemoryDir | null {
-  const target = canonicalizePath(filePath);
-  let owner: MemoryDir | null = null;
-  for (const d of knownDirs) {
-    const root = canonicalizePath(d.dir);
-    if (target === root || target.startsWith(`${root}${separator}`)) {
-      owner = d;
-      break;
-    }
-  }
-  if (!owner) return null;
-  // Only worth annotating when it is NOT the tier this index belongs to.
-  return canonicalizePath(owner.dir) === canonicalizePath(linkingDir.dir) ? null : owner;
 }

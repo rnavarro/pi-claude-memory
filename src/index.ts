@@ -1,8 +1,11 @@
 // pi-claude-memory — shared Claude Code memory store for Pi
 //
 // Reads and writes the same memory files Claude Code uses:
-//   ~/.claude/projects/<path-hash>/memory/  (project tier)
-//   ~/.claude/memory/                        (global tier)
+//   ~/.claude/projects/<path-hash>/memory/
+//
+// One store per project. Claude Code has no cross-project auto-memory (its
+// cross-project mechanism is user-scope instructions), so this plugin keeps
+// none either: the second tier it used to maintain is gone.
 //
 // Phase 1: read-only harness — injection only, no writes.
 // Phase 2: tools — recall_memory, write_memory, remove_memory.
@@ -481,7 +484,6 @@ async function handleBeforeAgentStart(
           cwd,
           textLength: frozen.text.length,
           hasProject: !!frozen.resolved.project,
-          hasGlobal: !!frozen.resolved.global,
         });
       }
 
@@ -500,7 +502,7 @@ async function handleBeforeAgentStart(
 function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
   const resolved = resolveMemoryDirs(cwd);
 
-  let { text, warnings } = buildMemoryInjection(resolved.project, resolved.global, {
+  let { text, warnings } = buildMemoryInjection(resolved.project, {
     hasCtxSearch,
     autoLearn: config.autoLearn,
     reviewIntervalTurns: config.reviewIntervalTurns,

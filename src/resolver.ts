@@ -2,9 +2,12 @@
 //
 // Claude Code stores project memory at:
 //   ~/.claude/projects/<encoded-project-root>/memory/MEMORY.md
-// and global memory at:
-//   ~/.claude/memory/MEMORY.md
 //
+// There is no second store. Claude Code's auto memory is per-repository by
+// design, and its cross-project mechanism is user-scope INSTRUCTIONS
+// (~/.claude/CLAUDE.md and ~/.claude/rules/), not a memory store. This plugin
+// used to keep its own cross-project tier at ~/.claude/memory; that was a pi
+// invention Claude Code never read, so it is gone.
 // Encoding: replace "/" with "-" in the absolute path.
 // e.g. /home/user/workspace/my-app → -home-user-workspace-my-app
 //
@@ -33,12 +36,6 @@ function claudeConfigDir(): string {
 /** Root of Claude Code's per-project memory stores. */
 function claudeProjectsDir(): string {
   return `${claudeConfigDir()}/projects`;
-}
-
-/** Claude Code's global (cross-project) memory store. Lazily computed — see
- * claudeConfigDir(). */
-function claudeGlobalDir(): string {
-  return `${claudeConfigDir()}/memory`;
 }
 
 /** Encode a path the way Claude Code does: "/" → "-". */
@@ -192,39 +189,24 @@ export function resolveMemoryDirs(cwd: string): ResolveResult {
     }
   }
 
-  // Resolve global tier
-  let global: MemoryDir | null = null;
-  const globalDir = claudeGlobalDir();
-  if (existsSync(globalDir)) {
-    const globalIndexPath = `${globalDir}/MEMORY.md`;
-    // Return the global dir even if MEMORY.md doesn't exist yet —
-    // write_memory needs the dir to create it on first write.
-    global = {
-      tier: "global",
-      dir: globalDir,
-      indexPath: globalIndexPath,
-      label: "Global",
-    };
-  }
-
   debugLog("resolver.resolve", {
     cwd: absCwd,
     identityRoot,
     encoded,
     projectDir: project?.dir ?? null,
     projectLabel: project?.label ?? null,
-    globalDir: global?.dir ?? null,
     warningCount: warnings.length,
     warnings,
   });
 
-  return { project, global, warnings, orphanStores };
+  return { project, warnings, orphanStores };
 }
 
 /**
  * Create the project memory directory structure for a cwd that has no existing
  * memory. Creates ~/.claude/projects/<encoded-cwd>/memory/ and returns the
- * resolved MemoryDir. Used by write_memory when the project tier is null.
+ * resolved MemoryDir. Used by write_memory and auto-learn when no store exists
+ * yet, since reads stay side-effect-free.
  */
 export function createProjectMemoryDir(cwd: string): MemoryDir | null {
   const absCwd = isAbsolute(cwd) ? cwd : resolve(cwd);
@@ -249,28 +231,6 @@ export function createProjectMemoryDir(cwd: string): MemoryDir | null {
     const errorMsg = String(err);
     debugLog("resolver.create_project_dir_error", { cwd: absCwd, encoded, error: errorMsg });
     console.error(`[pi-claude-memory] failed to create project memory dir: ${errorMsg}`);
-    return null;
-  }
-}
-
-/** Create the global memory dir on first global write (fresh installations
- * have no ~/.claude/memory). Reads stay side-effect-free — this is called
- * only from write paths when the global tier is null. */
-export function createGlobalMemoryDir(): MemoryDir | null {
-  const globalDir = claudeGlobalDir();
-  try {
-    mkdirSync(globalDir, { recursive: true });
-    debugLog("resolver.create_global_dir", { globalDir });
-    return {
-      tier: "global",
-      dir: globalDir,
-      indexPath: `${globalDir}/MEMORY.md`,
-      label: "global",
-    };
-  } catch (err) {
-    const errorMsg = String(err);
-    debugLog("resolver.create_global_dir_error", { globalDir, error: errorMsg });
-    console.error(`[pi-claude-memory] failed to create global memory dir: ${errorMsg}`);
     return null;
   }
 }
