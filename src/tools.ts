@@ -144,7 +144,7 @@ const writeTool = defineTool({
     pinned: Type.Optional(
       Type.Boolean({
         description:
-          "Pin marker kept in frontmatter and as a ⛔ in MEMORY.md. Metadata only: nothing is injected in full, and a pin does not reorder or extend the injected index. Default: false.",
+          "Pin marker written into the MEMORY.md line as ⛔ and kept in frontmatter. The LINE is what makes a pin visible: no reader parses a topic's frontmatter, so setting that field alone changes nothing about what gets injected. A pin bypasses no size limit (nothing is injected in full now) and does not escape the 200-line/25KB index cutoff. An overwrite that omits this clears an existing pin; the field defaults to false.",
       }),
     ),
     priority: Type.Optional(

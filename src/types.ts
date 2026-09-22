@@ -66,12 +66,15 @@ export interface ParsedFrontmatter {
   modified: string;
   /** Whether this entry carries a pin marker.
    *
-   * METADATA ONLY under the bounded-index contract. Nothing is injected in
-   * full any more, so a pin does not bypass a size limit, does not affect
-   * admission order, and is not promoted out of the startup cutoff. Claude
-   * Code ignores the flag entirely (it injects no pinned memories in the
-   * observed configuration). It is preserved for round-trip fidelity and for
-   * the ⛔ marker in MEMORY.md. */
+   * The pin is a property of the MEMORY.md LINE, not of this frontmatter. No
+   * reader opens a topic file to look for a pin, so the only pin that can be
+   * seen is the ⛔ (or [pin]) written into the index line, and that line is
+   * injected verbatim only up to the 200-line/25KB cutoff. A pin on an entry
+   * below the cutoff is not shown and is not promoted out of it. Nothing is
+   * injected in full any more, so a pin bypasses no size limit. Claude Code
+   * ignores the flag entirely (it injected no pinned memories in any observed
+   * session). This field is kept for round-trip fidelity: a hand edit here
+   * alone changes nothing about what gets injected. */
   pinned: boolean;
   /** The raw frontmatter object for round-trip preservation. */
   raw: Record<string, unknown>;
