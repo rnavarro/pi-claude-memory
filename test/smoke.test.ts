@@ -347,3 +347,49 @@ describe("routing anchor tells the truth about the reviewer", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("pins live in the index line, not in the topic", () => {
+  it("marks an entry pinned only when the LINE carries the marker", () => {
+    // The honesty half of item 4. Nothing reads a topic's frontmatter looking
+    // for a pin any more (bodies are never opened), so the index line is the
+    // only place a pin can be expressed. This locks that: a plain line stays
+    // unpinned no matter what the topic file says, and the parser cannot even
+    // see a topic file's frontmatter from here.
+    const dir = mkdtempSync(join(tmpdir(), "pcm-pin-line-"));
+    const content = [
+      "- [Plain](plain.md) — no marker on this line",
+      "- ⛔ [Marked](marked.md) — carries the marker",
+      "- [Also plain](also.md) — [pin] spelled out in the summary",
+    ].join("\n");
+    const parsed = parseIndexContent(content, dir);
+    const pinnedByTitle = new Map(parsed.entries.map((e) => [e.title, e.pinned]));
+    expect(pinnedByTitle.get("Plain")).toBe(false);
+    expect(pinnedByTitle.get("Marked")).toBe(true);
+    // [pin] in the remainder counts too, which is the documented second shape.
+    expect(pinnedByTitle.get("Also plain")).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("does not promote a pinned line that falls below the index cutoff", () => {
+    // A pin cannot rescue an entry the cutoff dropped: the excerpt is a prefix
+    // of the file, so a marker below it is simply not in the injected text.
+    const dir = mkdtempSync(join(tmpdir(), "pcm-pin-cut-"));
+    const filler = Array.from({ length: 210 }, (_, i) => `- [F${i}](f${i}.md) — filler`);
+    const content = [...filler, "- ⛔ [Buried](buried.md) — pinned but below the cut"].join("\n");
+    writeFileSync(join(dir, "MEMORY.md"), `${content}\n`);
+    const dirs = {
+      tier: "project" as const,
+      dir,
+      indexPath: join(dir, "MEMORY.md"),
+      label: "project",
+    };
+    const { text } = buildMemoryInjection(dirs, null, {
+      hasCtxSearch: true,
+      autoLearn: false,
+      reviewIntervalTurns: 10,
+    });
+    expect(text).toContain("Index truncated at 200 lines");
+    expect(text).not.toContain("Buried");
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
