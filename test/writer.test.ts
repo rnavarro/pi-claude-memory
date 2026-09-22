@@ -90,7 +90,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Always use `jq` for parsing JSON in shell scripts.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(result.ok).toBe(true);
@@ -111,7 +110,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Always use worktrees.",
       pinned: true,
-      tier: "project",
       allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
@@ -125,7 +123,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "First body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     writeMemory(dir, {
@@ -134,7 +131,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Updated body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
@@ -152,7 +148,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const idx = readFileSync(dir.indexPath, "utf8");
@@ -168,7 +163,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "x",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(result.ok).toBe(false);
@@ -181,7 +175,6 @@ describe("writeMemory", () => {
       type: "reference",
       body: "Some reference content.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const content = readFileSync(join(tmpDir, "round-trip-test.md"), "utf8");
@@ -200,7 +193,6 @@ describe("writeMemory", () => {
       type: "project",
       body: "Body.",
       pinned: false,
-      tier: "project",
       priority: 4,
       allowOverwrite: true,
     });
@@ -218,7 +210,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Body.",
       pinned: true,
-      tier: "project",
       allowOverwrite: true,
     });
     let content = readFileSync(join(tmpDir, "pin-toggle.md"), "utf8");
@@ -231,7 +222,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     content = readFileSync(join(tmpDir, "pin-toggle.md"), "utf8");
@@ -252,7 +242,6 @@ describe("writeMemory", () => {
       type: "project",
       body: "Body.",
       pinned: false,
-      tier: "project",
       priority: 5,
       allowOverwrite: true,
     });
@@ -265,7 +254,6 @@ describe("writeMemory", () => {
       type: "project",
       body: "Body.",
       pinned: false,
-      tier: "project",
       priority: null,
       allowOverwrite: true,
     });
@@ -283,7 +271,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Original body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const originalContent = readFileSync(join(tmpDir, "existing-entry.md"), "utf8");
@@ -295,7 +282,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "New body that should NOT be written.",
       pinned: false,
-      tier: "project",
       allowOverwrite: false,
     });
     expect(result.ok).toBe(false);
@@ -329,7 +315,6 @@ describe("writeMemory", () => {
       type: "feedback",
       body: "Updated body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(result.ok).toBe(true);
@@ -350,10 +335,9 @@ describe("removeMemory", () => {
       type: "feedback",
       body: "Body.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
-    const result = removeMemory(dir, { name: "to-remove", tier: "project" });
+    const result = removeMemory(dir, { name: "to-remove" });
     expect(result.ok).toBe(true);
     expect(existsSync(join(tmpDir, "to-remove.md"))).toBe(false);
     expect(existsSync(join(tmpDir, ".trash"))).toBe(true);
@@ -362,13 +346,13 @@ describe("removeMemory", () => {
   });
 
   it("fails gracefully for unknown names", () => {
-    const result = removeMemory(dir, { name: "nonexistent", tier: "project" });
+    const result = removeMemory(dir, { name: "nonexistent" });
     expect(result.ok).toBe(false);
   });
 
   it("refuses to remove the index file (MEMORY.md)", () => {
     writeFileSync(dir.indexPath, "# Index\n\n- [x](x.md) — s\n", "utf8");
-    const result = removeMemory(dir, { name: "MEMORY.md", tier: "project" });
+    const result = removeMemory(dir, { name: "MEMORY.md" });
     expect(result.ok).toBe(false);
     expect(existsSync(dir.indexPath)).toBe(true);
   });
@@ -388,7 +372,7 @@ describe("removeMemory", () => {
     const victim = join(nestedRoot, "victim.md");
     writeFileSync(victim, "secret", "utf8");
 
-    const result = removeMemory(nestedDir, { name: "../victim", tier: "project" });
+    const result = removeMemory(nestedDir, { name: "../victim" });
     expect(result.ok).toBe(false);
     expect(existsSync(victim)).toBe(true); // untouched
     expect(readFileSync(victim, "utf8")).toBe("secret");
@@ -403,7 +387,6 @@ describe("readMemory", () => {
       type: "feedback",
       body: "Content here.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const result = readMemory(dir, "findable");
@@ -443,7 +426,6 @@ describe("resolveWikilinks", () => {
       type: "reference",
       body: "Target content.",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const body = "See [[target]] for details.";
@@ -468,7 +450,6 @@ describe("resolveWikilinks", () => {
       type: "reference",
       body: "x",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     const body = "See [[piped-target|the target]] for more.";
@@ -487,7 +468,6 @@ describe("end-to-end: write then read then parse index", () => {
       type: "feedback",
       body: "Alpha content. See [[beta]].",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     writeMemory(dir, {
@@ -496,7 +476,6 @@ describe("end-to-end: write then read then parse index", () => {
       type: "reference",
       body: "Beta content.",
       pinned: true,
-      tier: "project",
       allowOverwrite: true,
     });
 
@@ -522,7 +501,6 @@ describe("mutation guards", () => {
       type: "reference",
       body: "nope",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(result.ok).toBe(false);
@@ -536,7 +514,6 @@ describe("mutation guards", () => {
       type: "reference",
       body: "nope",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(upper.ok).toBe(false);
@@ -550,13 +527,13 @@ describe("mutation guards", () => {
       "---\ndescription: d\ntype: reference\n---\nbody\n",
     );
 
-    const removed = removeMemory(dir, { name: "sub/nested.md", tier: "project" });
+    const removed = removeMemory(dir, { name: "sub/nested.md" });
     expect(removed.ok).toBe(false);
     expect(existsSync(join(dir.dir, "sub", "nested.md"))).toBe(true);
 
     // A nested binary lookalike ("..") is neutralized by slugify but must
     // never resolve via the raw fallback either.
-    const traversal = removeMemory(dir, { name: "../outer.md", tier: "project" });
+    const traversal = removeMemory(dir, { name: "../outer.md" });
     expect(traversal.ok).toBe(false);
     expect(existsSync(join(dir.dir, "outer.md"))).toBe(true);
   });
@@ -575,7 +552,7 @@ describe("mutation guards", () => {
     expect(read.ok).toBe(false);
     if (!read.ok) expect(read.message).toContain("not found");
 
-    const removed = removeMemory(dir, { name: "innocent.md", tier: "project" });
+    const removed = removeMemory(dir, { name: "innocent.md" });
     expect(removed.ok).toBe(false);
     // The outside victim was not touched, and the link still exists
     expect(existsSync(outside)).toBe(true);
@@ -632,7 +609,6 @@ describe("index concurrency primitives", () => {
       body: "body",
       pinned: false,
       allowOverwrite: false,
-      tier: "project",
     });
     expect(result.ok).toBe(true);
     expect(result.message).toContain("past the injected excerpt limit");
@@ -647,7 +623,6 @@ describe("index concurrency primitives", () => {
       body: "body",
       pinned: false,
       allowOverwrite: false,
-      tier: "project",
     });
     expect(result.ok).toBe(true);
     expect(result.message).not.toContain("excerpt limit");
@@ -692,7 +667,7 @@ describe("name policy and index lines", () => {
     writeFileSync(join(dir.dir, "outer.md"), "---\ndescription: d\ntype: reference\n---\nbody\n");
     // slugify("../outer") === "outer" — the old candidate order would remove
     // outer.md through a name the caller never legitimately addressed.
-    const r = removeMemory(dir, { name: "../outer", tier: "project" });
+    const r = removeMemory(dir, { name: "../outer" });
     expect(r.ok).toBe(false);
     expect(existsSync(join(dir.dir, "outer.md"))).toBe(true);
   });
@@ -703,7 +678,7 @@ describe("name policy and index lines", () => {
       "---\ndescription: d\ntype: reference\n---\nbody\n",
     );
     // slugify("sub/nested") === "subnested" — must not reach it.
-    const r = removeMemory(dir, { name: "sub/nested", tier: "project" });
+    const r = removeMemory(dir, { name: "sub/nested" });
     expect(r.ok).toBe(false);
     expect(existsSync(join(dir.dir, "subnested.md"))).toBe(true);
   });
@@ -754,7 +729,6 @@ describe("name policy and index lines", () => {
       type: "reference",
       body: "new body",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(w.ok).toBe(true);
@@ -763,7 +737,7 @@ describe("name policy and index lines", () => {
     expect(idx).toContain("new summary");
 
     // Removal strips the line entirely — no orphan link to a trashed file
-    const r = removeMemory(dir, { name: "foo", tier: "project" });
+    const r = removeMemory(dir, { name: "foo" });
     expect(r.ok).toBe(true);
     expect(readFileSync(dir.indexPath, "utf8")).not.toContain("foo.md");
   });
@@ -777,7 +751,6 @@ describe("index-line integrity", () => {
       name: "a]b",
       description: "bracketed",
       type: "project",
-      tier: "project",
       body: "body",
       pinned: false,
       allowOverwrite: true,
@@ -792,7 +765,6 @@ describe("index-line integrity", () => {
       name: "a]b",
       description: "updated",
       type: "project",
-      tier: "project",
       body: "body2",
       pinned: false,
       allowOverwrite: true,
@@ -808,7 +780,6 @@ describe("index-line integrity", () => {
       name: "first entry",
       description: "first",
       type: "project",
-      tier: "project",
       body: "body",
       pinned: false,
       allowOverwrite: false,
@@ -825,7 +796,6 @@ describe("index-line integrity", () => {
       name: "orphan",
       description: "orphan",
       type: "project",
-      tier: "project",
       body: "orphan body",
       pinned: false,
       allowOverwrite: false,
@@ -963,23 +933,21 @@ describe("trash recoverability", () => {
         name: "versioned",
         description: "v1",
         type: "project",
-        tier: "project",
         body: "first version",
         pinned: false,
         allowOverwrite: false,
       });
-      removeMemory(dir, { name: "versioned", tier: "project" });
+      removeMemory(dir, { name: "versioned" });
 
       writeMemory(dir, {
         name: "versioned",
         description: "v2",
         type: "project",
-        tier: "project",
         body: "second version",
         pinned: false,
         allowOverwrite: false,
       });
-      removeMemory(dir, { name: "versioned", tier: "project" });
+      removeMemory(dir, { name: "versioned" });
 
       // Two distinct backups, both intact.
       const trashDir = join(dir.dir, ".trash");
@@ -1000,7 +968,6 @@ describe("trash recoverability", () => {
       name: "through-link",
       description: "d",
       type: "project",
-      tier: "project",
       body: "body",
       pinned: false,
       allowOverwrite: false,
@@ -1008,7 +975,7 @@ describe("trash recoverability", () => {
     const outside = mkdtempSync(join(tmpdir(), "pcm-trash-out-"));
     // .trash as a symlink to an outside directory.
     symlinkSync(outside, join(dir.dir, ".trash"));
-    const res = removeMemory(dir, { name: "through-link", tier: "project" });
+    const res = removeMemory(dir, { name: "through-link" });
     expect(res.ok).toBe(false);
     // The topic is untouched and nothing landed outside the store.
     expect(existsSync(join(dir.dir, "through-link.md"))).toBe(true);
@@ -1045,7 +1012,6 @@ describe("index lines matched by resolved target, not href spelling", () => {
       type: "project",
       body: `body ${name}`,
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
 
@@ -1062,7 +1028,7 @@ describe("index lines matched by resolved target, not href spelling", () => {
   it("removes a line written with an absolute href and reports it as removed", () => {
     writeFileSync(join(tmpDir, "beta.md"), "---\ntype: project\n---\nold\n");
     writeFileSync(join(tmpDir, "MEMORY.md"), `${absoluteHref("beta")}\n- [Other](other.md) — o\n`);
-    const result = removeMemory(dir, { name: "beta", tier: "project" });
+    const result = removeMemory(dir, { name: "beta" });
     expect(result.ok).toBe(true);
     const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
     // The link does NOT survive pointing at a file that is now in .trash/
@@ -1079,7 +1045,7 @@ describe("index lines matched by resolved target, not href spelling", () => {
     expect(index.split("\n").filter((l) => l.includes("gamma.md"))).toHaveLength(1);
 
     writeFileSync(join(tmpDir, "MEMORY.md"), `- [G](sub/../gamma.md) — traversal\n`);
-    const res = removeMemory(dir, { name: "gamma", tier: "project" });
+    const res = removeMemory(dir, { name: "gamma" });
     expect(res.ok).toBe(true);
     expect(readFileSync(join(tmpDir, "MEMORY.md"), "utf8")).not.toContain("gamma.md");
   });
@@ -1088,7 +1054,7 @@ describe("index lines matched by resolved target, not href spelling", () => {
     writeFileSync(join(tmpDir, "delta.md"), "---\ntype: project\n---\nold\n");
     writeFileSync(join(tmpDir, "epsilon.md"), "---\ntype: project\n---\nold\n");
     writeFileSync(join(tmpDir, "MEMORY.md"), `- [D](delta.md) — d\n- [E](epsilon.md) — e\n`);
-    removeMemory(dir, { name: "delta", tier: "project" });
+    removeMemory(dir, { name: "delta" });
     const index = readFileSync(join(tmpDir, "MEMORY.md"), "utf8");
     expect(index).not.toContain("delta.md");
     expect(index).toContain("(epsilon.md)");
@@ -1097,7 +1063,7 @@ describe("index lines matched by resolved target, not href spelling", () => {
   it("reports honestly when no line matched", () => {
     writeFileSync(join(tmpDir, "orphan.md"), "---\ntype: project\n---\nold\n");
     writeFileSync(join(tmpDir, "MEMORY.md"), `- [Other](other.md) — o\n`);
-    const res = removeMemory(dir, { name: "orphan", tier: "project" });
+    const res = removeMemory(dir, { name: "orphan" });
     expect(res.ok).toBe(true);
     expect(res.message).toContain("no matching MEMORY.md line");
   });
@@ -1157,7 +1123,6 @@ describe("non-slug-normal stems are addressable and supersedable", () => {
       type: "project",
       body: "new body",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(res.ok).toBe(true);
@@ -1174,7 +1139,6 @@ describe("non-slug-normal stems are addressable and supersedable", () => {
       type: "project",
       body: "b",
       pinned: false,
-      tier: "project",
       allowOverwrite: false,
     });
     expect(res.ok).toBe(false);
@@ -1187,7 +1151,7 @@ describe("non-slug-normal stems are addressable and supersedable", () => {
     expect(read.ok).toBe(true);
     if (read.ok) expect(read.content).toContain("old body");
 
-    const rem = removeMemory(dir, { name: "foo-bar", tier: "project" });
+    const rem = removeMemory(dir, { name: "foo-bar" });
     expect(rem.ok).toBe(true);
     expect(existsSync(join(tmpDir, "Foo Bar.md"))).toBe(false);
   });
@@ -1216,7 +1180,6 @@ describe("writer index reads are guarded like the parser's", () => {
       type: "project",
       body: `body ${name}`,
       pinned: false,
-      tier: "project",
       allowOverwrite: false,
     });
 
@@ -1270,7 +1233,6 @@ describe("writer index reads are guarded like the parser's", () => {
       type: "project",
       body: "our body",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(res.ok).toBe(true);
@@ -1293,7 +1255,6 @@ describe("writer index reads are guarded like the parser's", () => {
       type: "project",
       body: "new body",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(res.ok).toBe(true);
@@ -1319,7 +1280,6 @@ describe("write-time size validation", () => {
       type: "project",
       body,
       pinned: false,
-      tier: "project",
       allowOverwrite: false,
     });
 
@@ -1359,51 +1319,6 @@ describe("write-time size validation", () => {
   });
 });
 
-describe("cross-tier removal survives a symlinked store root", () => {
-  it("strips an absolute cross-tier link whose topic was reached through a symlink", () => {
-    // /alias -> realGlobal. The owning store is addressed through the alias,
-    // but the other tier's index holds the REAL absolute path. After the move
-    // both realpath calls fail (the leaf is gone), so a target rebuilt from the
-    // filename after the move — or resolved lexically — no longer matches and
-    // the line survives. Pinning the canonical identity BEFORE the move is what
-    // makes the alias spelling and the real path meet.
-    const realGlobal = join(tmpDir, "real-global");
-    mkdirSync(realGlobal, { recursive: true });
-    writeFileSync(join(realGlobal, "topic.md"), "---\ndescription: t\ntype: reference\n---\nt\n");
-    writeFileSync(join(realGlobal, "MEMORY.md"), "# G\n- [Topic](topic.md) — t\n");
-    const alias = join(tmpDir, "alias-global");
-    symlinkSync(realGlobal, alias);
-
-    const proj = join(tmpDir, "proj");
-    mkdirSync(proj, { recursive: true });
-    const projIndex = join(proj, "MEMORY.md");
-    // Absolute href to the CANONICAL path, as the parser stores it.
-    writeFileSync(projIndex, `# P\n- [Topic](${join(realGlobal, "topic.md")}) — t\n`);
-
-    const aliasDir = {
-      tier: "global" as const,
-      dir: alias,
-      indexPath: join(alias, "MEMORY.md"),
-      label: "global",
-    };
-    const projDir = {
-      tier: "project" as const,
-      dir: proj,
-      indexPath: projIndex,
-      label: "proj",
-    };
-
-    const res = removeMemory(aliasDir, {
-      name: "topic",
-      tier: "global",
-      alsoUnlink: [projDir],
-    });
-
-    expect(res.ok).toBe(true);
-    expect(readFileSync(projIndex, "utf8")).not.toContain("topic.md");
-  });
-});
-
 describe("entry identity for underscore-named entries", () => {
   const writeJq = (over = {}) =>
     writeMemory(dir, {
@@ -1412,7 +1327,6 @@ describe("entry identity for underscore-named entries", () => {
       type: "feedback",
       body: "new body",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
       ...over,
     });
@@ -1602,10 +1516,12 @@ describe("a FIFO in the store never blocks prompt construction", () => {
     // keeps this test non-hanging either way.
     const wfd = openSync(join(d, "blocked.md"), constants.O_RDWR | constants.O_NONBLOCK);
     try {
-      const res = buildMemoryInjection(
-        { tier: "project", dir: d, indexPath: join(d, "MEMORY.md"), label: "fifo" },
-        null,
-      );
+      const res = buildMemoryInjection({
+        tier: "project",
+        dir: d,
+        indexPath: join(d, "MEMORY.md"),
+        label: "fifo",
+      });
       // Completing is the assertion. The index line is injected verbatim, so
       // "Blocked" appears from the INDEX, not from reading the FIFO.
       expect(res.text).toContain("Blocked");
@@ -1642,59 +1558,6 @@ describe("an ambiguous name is recorded, not reported as absent", () => {
   });
 });
 
-describe("cross-tier unlink matches the topic, not a same-named file", () => {
-  it("leaves the other tier's own entry alone when both stores share a basename", () => {
-    // The real layout on this machine: ~/.claude/memory/user_location.md and
-    // the other-project project store both hold user_location.md, each
-    // linked by a bare basename in its OWN index. A cross-tier match built from
-    // the target's basename therefore hit the other tier's own file, stripped a
-    // live unrelated entry's line, and reported it as a cross-tier cleanup.
-    const proj = join(tmpDir, "proj");
-    mkdirSync(proj, { recursive: true });
-    writeFileSync(join(proj, "user_location.md"), "---\ndescription: p\ntype: reference\n---\nP\n");
-    writeFileSync(
-      join(proj, "MEMORY.md"),
-      "# P\n- [User location](user_location.md) — project copy\n",
-    );
-
-    const glob = join(tmpDir, "glob");
-    mkdirSync(glob, { recursive: true });
-    writeFileSync(join(glob, "user_location.md"), "---\ndescription: g\ntype: reference\n---\nG\n");
-    writeFileSync(
-      join(glob, "MEMORY.md"),
-      "# G\n- [User location](user_location.md) — global copy\n",
-    );
-
-    const projDir = {
-      tier: "project" as const,
-      dir: proj,
-      indexPath: join(proj, "MEMORY.md"),
-      label: "proj",
-    };
-    const globDir = {
-      tier: "global" as const,
-      dir: glob,
-      indexPath: join(glob, "MEMORY.md"),
-      label: "global",
-    };
-
-    const res = removeMemory(projDir, {
-      name: "user_location",
-      tier: "project",
-      alsoUnlink: [globDir],
-    });
-
-    expect(res.ok).toBe(true);
-    // The project entry's own link goes...
-    expect(readFileSync(join(proj, "MEMORY.md"), "utf8")).not.toContain("user_location.md");
-    // ...and the global entry is untouched, file and line alike. The global
-    // line was never a reference to the project topic; it names global's own
-    // file, which is still on disk and still indexed.
-    expect(existsSync(join(glob, "user_location.md"))).toBe(true);
-    expect(readFileSync(join(glob, "MEMORY.md"), "utf8")).toContain("(user_location.md)");
-  });
-});
-
 describe("an exact name resolves to the exact file", () => {
   it("prefers the caller's exact stem over a slug-alike when both exist", () => {
     // Two different topics whose stems differ only by the characters slugify
@@ -1718,7 +1581,7 @@ describe("an exact name resolves to the exact file", () => {
 
     // The destructive path follows the same identity: the exact file goes and
     // the slug-alike survives.
-    const res = removeMemory(dir, { name: "Foo Bar", tier: "project" });
+    const res = removeMemory(dir, { name: "Foo Bar" });
     expect(res.ok).toBe(true);
     expect(existsSync(join(tmpDir, "Foo Bar.md"))).toBe(false);
     expect(existsSync(join(tmpDir, "foo-bar.md"))).toBe(true);
@@ -1750,7 +1613,6 @@ describe("write-path fidelity", () => {
       type: "feedback",
       body: "small now",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
 
@@ -1777,7 +1639,6 @@ describe("write-path fidelity", () => {
       type: "reference",
       body: "BODY2",
       pinned: false,
-      tier: "project",
       allowOverwrite: true,
     });
     expect(res.ok).toBe(true);

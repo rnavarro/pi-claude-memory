@@ -30,9 +30,6 @@ export const INDEX_MAX_BYTES = 1_000_000;
 export const INDEX_STARTUP_MAX_LINES = 200;
 export const INDEX_STARTUP_MAX_BYTES = 25_000;
 
-/** Memory tier: project-specific or global (cross-project). */
-export type MemoryTier = "project" | "global";
-
 /** The 3 known frontmatter type values. null = untyped/no frontmatter. */
 export type MemoryType = "feedback" | "reference" | "project" | "user" | null;
 
@@ -43,12 +40,15 @@ export type MemoryType = "feedback" | "reference" | "project" | "user" | null;
  * or under a memory/ subdirectory — Claude Code uses both layouts).
  */
 export interface MemoryDir {
-  tier: MemoryTier;
+  /** Store kind. Always "project": the plugin resolves one store per project
+   *  and has no cross-project tier. Stated as a field because debug logs and
+   *  the reviewer's section headers name it. */
+  tier: "project";
   /** Directory containing the topic .md files. */
   dir: string;
   /** Path to MEMORY.md index file. */
   indexPath: string;
-  /** Human-readable label for this tier (project name or "Global"). */
+  /** Human-readable label for this store (the project's basename). */
   label: string;
 }
 
@@ -134,8 +134,6 @@ export interface MemoryFile {
 export interface ResolveResult {
   /** Project memory dir, or null if no project memory exists. */
   project: MemoryDir | null;
-  /** Global memory dir (always exists if ~/.claude/memory/ does). */
-  global: MemoryDir | null;
   /** Warnings encountered during resolution. */
   warnings: string[];
   /**

@@ -43,12 +43,6 @@ describe.skipIf(!REAL_CORPUS)("resolver", () => {
     expect(result.project && existsSync(result.project.indexPath)).toBe(true);
   });
 
-  it("resolves global memory", () => {
-    const result = resolveMemoryDirs(APP_CWD);
-    expect(result.global).not.toBeNull();
-    expect(result.global?.dir).toContain(".claude/memory");
-  });
-
   it("returns null project for unknown cwd", () => {
     const result = resolveMemoryDirs(UNKNOWN_CWD);
     expect(result.project).toBeNull();
@@ -189,31 +183,13 @@ describe("index-parser", () => {
 describe.skipIf(!REAL_CORPUS)("injector (real corpus, bounded index)", () => {
   it("injects a bounded index and no full text for my-app", () => {
     const result = resolveMemoryDirs(APP_CWD);
-    const { text } = buildMemoryInjection(result.project, result.global);
+    const { text } = buildMemoryInjection(result.project);
     expect(text).toContain("## Memory");
     expect(text).toContain("APP");
     expect(text).toContain("#### Index");
     // This assertion used to be the opposite: "#### Full Text" plus a loaded
     // body. Bodies are not loaded at prompt-build time under this contract.
     expect(text).not.toContain("#### Full Text");
-  });
-
-  it("signposts the global store instead of injecting it", () => {
-    const result = resolveMemoryDirs(UNKNOWN_CWD);
-    expect(result.project).toBeNull();
-    if (!result.global) throw new Error("expected a global store on this machine");
-    const { text } = buildMemoryInjection(result.project, result.global);
-    // Three contracts have been asserted at this spot. First a topic BODY
-    // ("Prefer jq"), which corpus growth made flaky. Then the global INDEX
-    // line, while that tier was still injected. Now the SIGNPOST, because the
-    // global index is deliberately not injected at all: it cost ~35k tokens in
-    // every session of every project.
-    expect(text).toContain("Cross-project memory (on demand)");
-    expect(text).toContain(result.global.dir);
-    expect(text).not.toContain("User prefers jq");
-    // The signpost counts as content, so the full anchor (not the empty-store
-    // variant) is the correct one here.
-    expect(text).toContain("Durable facts across sessions");
   });
 });
 
@@ -248,7 +224,7 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
       expect(resolved.project?.indexPath).toBe(join(proj, "MEMORY.md"));
       expect(resolved.project?.dir).toBe(mem);
 
-      const { text } = buildMemoryInjection(resolved.project, resolved.global);
+      const { text } = buildMemoryInjection(resolved.project);
       expect(text).toContain("[User location](user_location.md)");
       expect(text).not.toContain("TOPIC_BODY_SENTINEL");
     } finally {
@@ -260,11 +236,11 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
 });
 
 describe("injector reads the index and nothing else", () => {
-  const mk = (root: string, tier: "project" | "global"): MemoryDirType => ({
-    tier,
+  const mk = (root: string): MemoryDirType => ({
+    tier: "project",
     dir: root,
     indexPath: join(root, "MEMORY.md"),
-    label: tier,
+    label: "project",
   });
   const FM = "---\ndescription: d\ntype: project\n---\n";
 
@@ -280,7 +256,7 @@ describe("injector reads the index and nothing else", () => {
     writeFileSync(join(outside, "evil.md"), `${FM}OUTSIDE_BODY_SENTINEL\n`);
     symlinkSync(join(outside, "MEMORY.md"), join(proj, "MEMORY.md"));
 
-    const { text, warnings } = buildMemoryInjection(mk(proj, "project"), null);
+    const { text, warnings } = buildMemoryInjection(mk(proj));
     expect(text).not.toContain("OUTSIDE_INDEX_SENTINEL");
     expect(text).not.toContain("OUTSIDE_BODY_SENTINEL");
     expect(warnings.join(" ")).toContain("symlink");
@@ -299,7 +275,7 @@ describe("injector reads the index and nothing else", () => {
     const linked = join(linkParent, "store");
     symlinkSync(real, linked);
 
-    const { text } = buildMemoryInjection(mk(linked, "project"), null);
+    const { text } = buildMemoryInjection(mk(linked));
     expect(text).toContain("[T](t.md)");
     expect(text).not.toContain("VIA_LINKED_ROOT");
 
@@ -337,7 +313,7 @@ describe("routing anchor tells the truth about the reviewer", () => {
       indexPath: join(root, "MEMORY.md"),
       label: "project",
     };
-    const { text } = buildMemoryInjection(proj, null, {
+    const { text } = buildMemoryInjection(proj, {
       hasCtxSearch: true,
       autoLearn: false,
       reviewIntervalTurns: 10,
@@ -383,7 +359,7 @@ describe("pins live in the index line, not in the topic", () => {
       indexPath: join(dir, "MEMORY.md"),
       label: "project",
     };
-    const { text } = buildMemoryInjection(dirs, null, {
+    const { text } = buildMemoryInjection(dirs, {
       hasCtxSearch: true,
       autoLearn: false,
       reviewIntervalTurns: 10,

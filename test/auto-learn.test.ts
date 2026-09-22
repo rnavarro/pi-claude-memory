@@ -2,7 +2,7 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +36,7 @@ afterEach(() => {
 });
 
 describe("buildExistingIndexSummary", () => {
-  it("lists memory files in the resolved dirs", () => {
+  it("lists the store's own entries", () => {
     // Create a fake claude memory dir
     const claudeDir = join(tmpDir, ".claude", "memory");
     const projectHash = "-home-user-workspace-test";
@@ -55,12 +55,6 @@ describe("buildExistingIndexSummary", () => {
     writeFileSync(join(projectDir, "MEMORY.md"), "# Project Memory\n");
 
     const resolved: ResolveResult = {
-      global: {
-        tier: "global",
-        dir: claudeDir,
-        indexPath: join(claudeDir, "MEMORY.md"),
-        label: "Global",
-      },
       project: {
         tier: "project",
         dir: projectDir,
@@ -70,33 +64,22 @@ describe("buildExistingIndexSummary", () => {
       warnings: [],
     };
 
+    // One store: the header is the store's own label, and only the entries that
+    // live in it are listed.
     const summary = buildExistingIndexSummary(resolved);
-    // Headers lead with the TIER id (what the candidate schema accepts) and
-    // keep the store label for context.
-    expect(summary).toContain("## global tier (Global)");
-    expect(summary).toContain("## project tier (test)");
-    expect(summary).toContain("global_entry");
+    expect(summary).toContain("## test");
     expect(summary).toContain("project_entry");
   });
 
-  it("handles empty dirs gracefully", () => {
-    const claudeDir = join(tmpDir, "empty-global");
-
-    mkdirSync(claudeDir, { recursive: true });
-
+  it("returns nothing when this project has no store", () => {
     const resolved: ResolveResult = {
-      global: {
-        tier: "global",
-        dir: claudeDir,
-        indexPath: join(claudeDir, "MEMORY.md"),
-        label: "Global",
-      },
       project: null,
       warnings: [],
     };
 
+    // Nothing to advertise. This used to emit a section for the global tier.
     const summary = buildExistingIndexSummary(resolved);
-    expect(summary).toContain("(no entries)");
+    expect(summary).toBe("");
   });
 
   it("emits slug: description from parsed MEMORY.md entries (not titles)", () => {
@@ -110,13 +93,12 @@ describe("buildExistingIndexSummary", () => {
     );
 
     const resolved: ResolveResult = {
-      global: {
-        tier: "global",
+      project: {
+        tier: "project",
         dir: claudeDir,
         indexPath: join(claudeDir, "MEMORY.md"),
-        label: "Global",
+        label: "test",
       },
-      project: null,
       warnings: [],
     };
 
@@ -180,10 +162,20 @@ describe("parseCandidates", () => {
 
   it("strips code fences", () => {
     const reply =
-      '```json\n[{"name":"x","description":"d","type":"reference","body":"b","tier":"global","pinned":false}]\n```';
+      '```json\n[{"name":"x","description":"d","type":"reference","body":"b","pinned":false}]\n```';
     const cands = parseCandidates(reply);
     expect(cands).toHaveLength(1);
-    expect(cands[0].tier).toBe("global");
+    expect(cands[0].name).toBe("x");
+  });
+
+  it("rejects a candidate that still names a tier the schema does not accept", () => {
+    // The reviewer no longer chooses a store. A candidate carrying "global" is
+    // rejected rather than quietly re-homed into the project store: a silent
+    // relocation would file a fact somewhere the model did not choose.
+    const reply = JSON.stringify([
+      { name: "g", description: "d", type: "reference", body: "b", tier: "global", pinned: false },
+    ]);
+    expect(parseCandidates(reply)).toEqual([]);
   });
 
   it("tolerates leading prose before the array", () => {
@@ -348,191 +340,58 @@ describe("snapshotMtimes keys", () => {
   });
 });
 
-describe("buildExistingIndexSummary tier attribution", () => {
-  it("marks an entry linked by another tier's index with its OWNING tier", () => {
-    // A project index may link to a global topic via an absolute href. The
-    // summary must not present that entry as a project slug: the write loop
-    // picks its directory from the candidate's tier, so a mis-attributed
-    // entry lets the model overwrite an unrelated same-named project file
-    // using contents it only ever saw in global.
-    const proj = join(tmpDir, "work", "proj");
-    const glob = join(tmpDir, ".claude", "memory");
-    mkdirSync(proj, { recursive: true });
-    mkdirSync(glob, { recursive: true });
-    // Global owns shared-slug.md …
-    writeFileSync(
-      join(glob, "shared-slug.md"),
-      "---\ndescription: GLOBAL OWNER\ntype: reference\n---\ng\n",
-    );
-    // … and the project index links to it cross-tier.
-    writeFileSync(
-      join(proj, "MEMORY.md"),
-      `# P\n- [Shared](/${glob}/shared-slug.md) — global-owned entry\n`,
-    );
-    const resolved = {
-      project: {
-        tier: "project" as const,
-        dir: proj,
-        indexPath: join(proj, "MEMORY.md"),
-        label: "project",
-      },
-      global: {
-        tier: "global" as const,
-        dir: glob,
-        indexPath: join(glob, "MEMORY.md"),
-        label: "global",
-      },
-      warnings: [],
-    };
-    const summary = buildExistingIndexSummary(resolved as never);
-    // The entry is attributed to global, not silently to project.
-    expect(summary).toContain("[owner: global]");
-  });
-});
-
-describe("tier attribution survives a symlinked store root", () => {
-  it("still attributes cross-tier entries to the owning tier", () => {
-    // entry.filePath is realpath'd by resolveHref, while MemoryDir.dir was
-    // built lexically from homedir(). With any store component behind a
-    // symlink (a dotfiles-managed ~/.claude), a lexical prefix test fails for
-    // EVERY entry and ownerOf silently falls back to the linking tier —
-    // reintroducing the misattribution the round-5 fix removed.
-    const realGlobal = join(tmpDir, "real-claude", "memory");
-    mkdirSync(realGlobal, { recursive: true });
-    writeFileSync(
-      join(realGlobal, "shared-slug.md"),
-      "---\ndescription: GLOBAL OWNER\ntype: reference\n---\ng\n",
-    );
-    // The store is reached through a symlink, which is how dir would look if
-    // ~/.claude itself were a symlink.
-    const linkGlobal = join(tmpDir, "link-claude-memory");
-    symlinkSync(realGlobal, linkGlobal);
-
-    const proj = join(tmpDir, "work", "proj");
-    mkdirSync(proj, { recursive: true });
-    // The project index links the CANONICAL path (as resolveHref produces).
-    writeFileSync(
-      join(proj, "MEMORY.md"),
-      `# P\n- [Shared](${join(realGlobal, "shared-slug.md")}) — global-owned entry\n`,
-    );
-
-    const resolved = {
-      project: {
-        tier: "project" as const,
-        dir: proj,
-        indexPath: join(proj, "MEMORY.md"),
-        label: "project",
-      },
-      global: {
-        tier: "global" as const,
-        dir: linkGlobal, // lexical path through the symlink
-        indexPath: join(linkGlobal, "MEMORY.md"),
-        label: "global",
-      },
-      warnings: [],
-    };
-    const summary = buildExistingIndexSummary(resolved as never);
-    expect(summary).toContain("[owner: global]");
-  });
-});
-
 describe("reviewer index summary is complete", () => {
   it("lists every entry identity, not just the first fifty", () => {
-    // The real global index on this machine has 222 entries and writes append,
-    // so a 50-entry prefix meant the rest could never be matched for
-    // supersession no matter how many reviews ran — they accumulated as
-    // duplicates while the prompt advertised a supersession mechanism that did
-    // not apply to them.
-    const glob = join(tmpDir, ".claude", "memory");
-    mkdirSync(glob, { recursive: true });
-    const indexLines = ["# M"];
+    // A slice(0, 50) hid the rest of the index from the reviewer permanently on
+    // a large store (this machine's cross-project index had 222 entries), and
+    // writes append, so anything past the cutoff could never be matched for
+    // supersession. Identities are never dropped; only summaries are budgeted.
+    const proj = join(tmpDir, "work", "proj");
+    mkdirSync(proj, { recursive: true });
+    const idx = ["# P"];
     for (let i = 0; i < 60; i++) {
-      writeFileSync(join(glob, `e${i}.md`), `---\ndescription: d${i}\ntype: reference\n---\nx\n`);
-      indexLines.push(`- [E${i}](e${i}.md) — summary ${i}`);
+      writeFileSync(join(proj, `e${i}.md`), "---\ndescription: d\ntype: reference\n---\nx\n");
+      idx.push(`- [E${i}](e${i}.md) — ${"boilerplate advice repeated here. ".repeat(6)}`);
     }
-    writeFileSync(join(glob, "MEMORY.md"), `${indexLines.join("\n")}\n`);
+    writeFileSync(join(proj, "MEMORY.md"), `${idx.join("\n")}\n`);
 
-    const resolved = {
-      project: null,
-      global: {
-        tier: "global" as const,
-        dir: glob,
-        indexPath: join(glob, "MEMORY.md"),
-        label: "global",
-      },
+    const summary = buildExistingIndexSummary({
+      project: { tier: "project", dir: proj, indexPath: join(proj, "MEMORY.md"), label: "proj" },
       warnings: [],
-    };
-    const summary = buildExistingIndexSummary(resolved as never);
+    } as never);
+    expect(summary).toContain("## proj");
     expect(summary).toContain("e0");
     expect(summary).toContain("e59"); // beyond the old cutoff
   });
 
-  it("names the tier id in the header so the model echoes a valid tier", () => {
-    // The header rendered the store LABEL ("## my-app tier"), while the
-    // candidate schema accepts only project|global — so a model echoing the
-    // header produced an invalid tier that parseCandidates then dropped.
-    const glob = join(tmpDir, ".claude", "memory");
-    const proj = join(tmpDir, "work", "proj");
-    mkdirSync(glob, { recursive: true });
+  it("does not offer an entry that points outside the store", () => {
+    // An index line with an absolute href into another store names a topic this
+    // store cannot address by name. Advertising it would invite the reviewer to
+    // supersede it, and the write loop would then overwrite an unrelated local
+    // file whose stem matches.
+    const proj = join(tmpDir, "work", "proj2");
+    const other = join(tmpDir, ".claude", "memory");
     mkdirSync(proj, { recursive: true });
-    writeFileSync(join(glob, "g.md"), "---\ndescription: g\ntype: reference\n---\nx\n");
-    writeFileSync(join(glob, "MEMORY.md"), "- [G](g.md) — g\n");
-    writeFileSync(join(proj, "p.md"), "---\ndescription: p\ntype: project\n---\nx\n");
-    writeFileSync(join(proj, "MEMORY.md"), "- [P](p.md) — p\n");
+    mkdirSync(other, { recursive: true });
+    writeFileSync(
+      join(other, "shared-slug.md"),
+      "---\ndescription: other\ntype: reference\n---\nx\n",
+    );
+    writeFileSync(join(proj, "local.md"), "---\ndescription: local\ntype: project\n---\nx\n");
+    writeFileSync(
+      join(proj, "MEMORY.md"),
+      `# P\n- [Local](local.md) — local entry\n- [Shared](/${other}/shared-slug.md) — other store\n`,
+    );
 
     const summary = buildExistingIndexSummary({
       project: { tier: "project", dir: proj, indexPath: join(proj, "MEMORY.md"), label: "proj" },
-      global: { tier: "global", dir: glob, indexPath: join(glob, "MEMORY.md"), label: "global" },
       warnings: [],
     } as never);
-    expect(summary).toContain("## global tier");
-    expect(summary).toContain("## project tier");
-  });
-
-  it("lists the project tier's section before the global tier's", () => {
-    // Corrects an overclaim in the previous commit's test: the summary budget
-    // is PER TIER (summaryChars resets at the top of the dir loop), so no
-    // ordering can starve either tier's summaries — my first test asserted
-    // summary presence, which holds under BOTH orderings, and passed against
-    // the reverted source. What the iteration order actually decides is the
-    // order sections appear in the reviewer prompt. Pin THAT, and also assert
-    // a global index large enough to saturate its own per-tier budget still
-    // keeps both tiers' summaries intact (so the test covers truncation too).
-    const glob = join(tmpDir, ".claude", "memory");
-    const proj = join(tmpDir, "work", "proj");
-    mkdirSync(glob, { recursive: true });
-    mkdirSync(proj, { recursive: true });
-    // A global index whose summaries alone exceed the budget...
-    const gLines = ["# G"];
-    for (let i = 0; i < 40; i++) {
-      writeFileSync(join(glob, `g${i}.md`), "---\ndescription: g\ntype: reference\n---\nx\n");
-      gLines.push(`- [G${i}](g${i}.md) — ${"global boilerplate advice repeated here. ".repeat(6)}`);
-    }
-    writeFileSync(join(glob, "MEMORY.md"), `${gLines.join("\n")}\n`);
-    // ...and a project index whose summaries then get starved.
-    writeFileSync(join(proj, "p.md"), "---\ndescription: p\ntype: project\n---\nx\n");
-    writeFileSync(join(proj, "MEMORY.md"), "- [P](p.md) — project-local detail that matters\n");
-
-    const summary = buildExistingIndexSummary({
-      project: { tier: "project", dir: proj, indexPath: join(proj, "MEMORY.md"), label: "proj" },
-      global: { tier: "global", dir: glob, indexPath: join(glob, "MEMORY.md"), label: "global" },
-      warnings: [],
-    } as never);
-    const pLine = summary.split("\n").find((l) => l.startsWith("- p:"));
-    expect(pLine).toBeDefined();
-    expect(pLine).toContain("project-local detail that matters");
-
-    // The teeth this test previously lacked: the project section itself must
-    // come first in the reviewer prompt. Under global-first iteration the
-    // global header sits ahead of the project header and this fails.
-    const projHeader = summary.indexOf("## project tier");
-    const globHeader = summary.indexOf("## global tier");
-    expect(projHeader).toBeGreaterThan(-1);
-    expect(globHeader).toBeGreaterThan(-1);
-    expect(projHeader).toBeLessThan(globHeader);
+    expect(summary).toContain("local");
+    expect(summary).not.toContain("shared-slug");
+    expect(summary).toContain("point outside this store");
   });
 });
-
 describe("snapshotMtimes alias keys never shadow a real stem", () => {
   it("a real stem beats a slug alias in EITHER arrival order", () => {
     // Whether the clobbering order arises depends on readdir order, which on

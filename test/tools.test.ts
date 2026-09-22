@@ -1,5 +1,10 @@
-// Tool-level tests: entry-level recall fallback, strict explicit tier, and
-// global store creation on fresh installations.
+// Tool-level tests: project-scoped recall, write and remove, plus the
+// fail-closed refusal of a request that still names a memory tier.
+//
+// There is one store per project. Claude Code has no cross-project auto-memory
+// (its cross-project mechanism is user-scope instructions), so this plugin keeps
+// none either: the second tier, its cross-tier fallback, the cross-store index
+// sweep, and the `tier` parameter are all gone.
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +23,21 @@ let origHome: string | undefined;
 
 const makeCtx = (cwd: string) => ({ cwd }) as never;
 
+/** The retired cross-project store. Nothing may read or write it any more. */
+const retiredGlobalDir = () => join(tmpHome, ".claude", "memory");
+
+/** Create the project store for a cwd and return its paths. */
+function makeStore(cwd: string, index = "# P\n", files: Record<string, string> = {}) {
+  const dir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "MEMORY.md"), index);
+  for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+  return { dir, indexPath: join(dir, "MEMORY.md") };
+}
+
+const textOf = (res: { content: { type: string; text?: string }[] }) =>
+  (res.content[0] as { type: string; text: string }).text;
+
 beforeEach(() => {
   origHome = process.env.HOME;
   tmpHome = mkdtempSync(join(tmpdir(), "pcm-tools-"));
@@ -30,138 +50,235 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
-describe("recall_memory tier fallback", () => {
-  let cwd: string;
+describe("recall_memory against the project store", () => {
+  it("finds an entry that is in the store", async () => {
+    const cwd = join(tmpHome, "work", "proj");
+    makeStore(cwd, "# P\n- [Bar](bar.md) — b\n", {
+      "bar.md": "---\ndescription: b\ntype: project\n---\nbar body\n",
+    });
 
-  beforeEach(() => {
-    // Project store exists (with only bar.md); global store has foo.md.
-    cwd = join(tmpHome, "work", "proj");
-    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
-    mkdirSync(projDir, { recursive: true });
-    writeFileSync(join(projDir, "MEMORY.md"), "# Proj\n- [Bar](bar.md) — b\n");
-    writeFileSync(join(projDir, "bar.md"), "---\ndescription: b\ntype: project\n---\nbar body\n");
-
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(globalDir, { recursive: true });
-    writeFileSync(join(globalDir, "MEMORY.md"), "# Global\n- [Foo](foo.md) — f\n");
-    writeFileSync(
-      join(globalDir, "foo.md"),
-      "---\ndescription: f\ntype: reference\n---\nfoo global body\n",
-    );
-  });
-
-  it("falls back to the other tier when the ENTRY is missing from the requested one", async () => {
     const res = await recallMemoryTool.execute(
       "t1",
-      { name: "foo" },
-      undefined as never,
-      undefined as never,
-      makeCtx(cwd),
-    );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("foo global body");
-    expect(text).toContain("Global tier");
-    expect((res.details as { tier: string }).tier).toBe("global");
-  });
-
-  it("honors an explicitly named tier strictly (no cross-tier confusion)", async () => {
-    const res = await recallMemoryTool.execute(
-      "t2",
-      { name: "foo", tier: "project" },
-      undefined as never,
-      undefined as never,
-      makeCtx(cwd),
-    );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("not found");
-  });
-
-  it("still finds an entry present in the requested tier", async () => {
-    const res = await recallMemoryTool.execute(
-      "t3",
       { name: "bar" },
       undefined as never,
       undefined as never,
       makeCtx(cwd),
     );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("bar body");
+    expect(textOf(res)).toContain("bar body");
+    expect((res.details as { tier: string }).tier).toBe("project");
+  });
+
+  it("reports a miss without consulting anything outside this project", async () => {
+    const cwd = join(tmpHome, "work", "proj");
+    makeStore(cwd);
+    // A decoy of the same name in the retired store, to prove it is not a
+    // fallback: with one store, a miss is a miss.
+    const globalDir = retiredGlobalDir();
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "foo.md"), "---\ndescription: f\n---\nfoo global body\n");
+
+    const res = await recallMemoryTool.execute(
+      "t2",
+      { name: "foo" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    const text = textOf(res);
+    expect(text).toMatch(/not found/i);
+    expect(text).not.toContain("foo global body");
+  });
+
+  it("says so when this project has no store yet", async () => {
+    const cwd = join(tmpHome, "work", "never-created");
+    const res = await recallMemoryTool.execute(
+      "t3",
+      { name: "anything" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain("No memory store for this project yet");
+  });
+
+  it("reports 'too large' rather than 'not found' for an entry it cannot read", async () => {
+    // "not found" is the least informative failure there is, and a model told
+    // that may simply write the memory again, duplicating a file that is
+    // sitting right there.
+    const cwd = join(tmpHome, "work", "oversize");
+    makeStore(cwd, "# P\n- [Huge](huge.md) — h\n", {
+      "huge.md": `---\ndescription: h\ntype: reference\n---\n${"x".repeat(1_100_000)}`,
+    });
+
+    const res = await recallMemoryTool.execute(
+      "t4",
+      { name: "huge" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    const text = textOf(res);
+    expect(text).toContain("too large");
+    expect(text).not.toMatch(/not found/i);
   });
 });
 
-describe("write_memory global store creation", () => {
-  it("creates the global memory dir on first global write (fresh install)", async () => {
+describe("write_memory creates the project store on first write", () => {
+  it("creates the store and never the retired cross-project one", async () => {
     const cwd = join(tmpHome, "fresh", "project");
-    // No ~/.claude/memory yet.
     const res = await writeMemoryTool.execute(
-      "t4",
+      "t5",
       {
-        name: "fresh-global-entry",
-        description: "written before any global store exists",
+        name: "fresh-entry",
+        description: "written on a fresh installation",
         type: "feedback",
-        body: "A durable preference learned on a fresh installation.",
-        tier: "global",
+        body: "A durable preference learned before any store existed.",
         pinned: false,
       },
       undefined as never,
       undefined as never,
       makeCtx(cwd),
     );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).not.toContain("No global memory directory");
+    expect((res.details as { ok: boolean }).ok).toBe(true);
 
-    const globalDir = join(tmpHome, ".claude", "memory");
-    expect(existsSync(join(globalDir, "fresh-global-entry.md"))).toBe(true);
-    const idx = readFileSync(join(globalDir, "MEMORY.md"), "utf8");
-    expect(idx).toContain("fresh-global-entry.md");
+    const dir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
+    expect(existsSync(join(dir, "fresh-entry.md"))).toBe(true);
+    expect(readFileSync(join(dir, "MEMORY.md"), "utf8")).toContain("fresh-entry.md");
+    // The retired tier is not created, not written, not consulted.
+    expect(existsSync(retiredGlobalDir())).toBe(false);
   });
 });
 
-describe("recall_memory with an absent project store", () => {
-  // Regression: resolving the requested directory first and only falling
-  // back after a failed READ meant that when NO project store existed for
-  // the cwd, recall_memory answered "No memory directory available
-  // (tier=project)" while a global store full of memories sat unread.
-  it("falls back to the global store when there is no project directory", async () => {
-    const cwd = join(tmpHome, "work", "never-created");
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(globalDir, { recursive: true });
-    writeFileSync(
-      join(globalDir, "global-only.md"),
-      "---\ndescription: g\ntype: reference\n---\nglobal only body\n",
-    );
+describe("remove_memory", () => {
+  it("trashes the entry and drops its index line", async () => {
+    const cwd = join(tmpHome, "work", "proj");
+    const store = makeStore(cwd, "# P\n- [Foo](foo.md) — f\n", {
+      "foo.md": "---\ndescription: f\ntype: project\n---\nbody\n",
+    });
 
-    const res = await recallMemoryTool.execute(
-      "t-absent",
-      { name: "global-only" },
+    const res = await removeMemoryTool.execute(
+      "t6",
+      { name: "foo" },
       undefined as never,
       undefined as never,
       makeCtx(cwd),
     );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("global only body");
-    expect(text).not.toContain("No memory directory available");
-    expect((res.details as { tier: string }).tier).toBe("global");
+    expect((res.details as { ok: boolean }).ok).toBe(true);
+    expect(existsSync(join(store.dir, "foo.md"))).toBe(false);
+    expect(readFileSync(store.indexPath, "utf8")).not.toContain("(foo.md)");
   });
 
-  it("still honors an explicitly named tier strictly", async () => {
-    const cwd = join(tmpHome, "work", "never-created-2");
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(globalDir, { recursive: true });
-    writeFileSync(
-      join(globalDir, "global-only-2.md"),
-      "---\ndescription: g\ntype: reference\n---\nglobal only body 2\n",
-    );
+  it("reports a refusal instead of claiming success", async () => {
+    // `.trash` present as a plain file: the move cannot happen, and the tool
+    // must say so rather than reporting a removal that did not occur.
+    const cwd = join(tmpHome, "work", "refused");
+    const store = makeStore(cwd, "# P\n- [Foo](foo.md) — f\n", {
+      "foo.md": "---\ndescription: f\ntype: project\n---\nbody\n",
+    });
+    writeFileSync(join(store.dir, ".trash"), "not a directory\n");
 
-    const res = await recallMemoryTool.execute(
-      "t-strict",
-      { name: "global-only-2", tier: "project" },
+    const res = await removeMemoryTool.execute(
+      "t7",
+      { name: "foo" },
       undefined as never,
       undefined as never,
       makeCtx(cwd),
     );
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(text).toContain("No memory directory available");
+    expect(textOf(res)).toContain("not a plain directory");
+    expect((res.details as { ok: boolean }).ok).toBe(false);
+    expect(existsSync(join(store.dir, "foo.md"))).toBe(true);
+    expect(readFileSync(store.indexPath, "utf8")).toContain("(foo.md)");
+  });
+
+  it("says so when this project has no store yet", async () => {
+    const cwd = join(tmpHome, "work", "no-store");
+    const res = await removeMemoryTool.execute(
+      "t8",
+      { name: "anything" },
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain("No memory store for this project yet");
+  });
+});
+
+describe("a request that still names a tier is refused, not retargeted", () => {
+  // The injected anchor taught the model to pass tier: "global" for months, and
+  // a model can carry the habit across sessions. Quietly treating that as the
+  // project store would silently change where a write or a removal lands, so it
+  // is refused with an explanation the model can learn from.
+  it("refuses write_memory with tier: global and writes nothing", async () => {
+    const cwd = join(tmpHome, "work", "legacy");
+    const store = makeStore(cwd);
+
+    const res = await writeMemoryTool.execute(
+      "t9",
+      {
+        name: "legacy-write",
+        description: "d",
+        type: "reference",
+        body: "b",
+        pinned: false,
+        tier: "global",
+      } as never,
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain('No "global" memory tier');
+    expect(existsSync(join(store.dir, "legacy-write.md"))).toBe(false);
+    expect(readFileSync(store.indexPath, "utf8")).not.toContain("legacy-write");
+  });
+
+  it("refuses remove_memory with tier: global and removes nothing", async () => {
+    const cwd = join(tmpHome, "work", "legacy-remove");
+    const store = makeStore(cwd, "# P\n- [Foo](foo.md) — f\n", {
+      "foo.md": "---\ndescription: f\ntype: project\n---\nbody\n",
+    });
+
+    const res = await removeMemoryTool.execute(
+      "t10",
+      { name: "foo", tier: "global" } as never,
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain('No "global" memory tier');
+    expect(existsSync(join(store.dir, "foo.md"))).toBe(true);
+    expect(readFileSync(store.indexPath, "utf8")).toContain("(foo.md)");
+  });
+
+  it("refuses recall_memory with tier: global", async () => {
+    const cwd = join(tmpHome, "work", "legacy-recall");
+    makeStore(cwd, "# P\n- [Foo](foo.md) — f\n", {
+      "foo.md": "---\ndescription: f\ntype: project\n---\nbody\n",
+    });
+
+    const res = await recallMemoryTool.execute(
+      "t11",
+      { name: "foo", tier: "global" } as never,
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain('No "global" memory tier');
+  });
+
+  it("accepts a harmless tier: project echo", async () => {
+    const cwd = join(tmpHome, "work", "echo");
+    makeStore(cwd, "# P\n- [Foo](foo.md) — f\n", {
+      "foo.md": "---\ndescription: f\ntype: project\n---\nbody\n",
+    });
+
+    const res = await recallMemoryTool.execute(
+      "t12",
+      { name: "foo", tier: "project" } as never,
+      undefined as never,
+      undefined as never,
+      makeCtx(cwd),
+    );
+    expect(textOf(res)).toContain("body");
   });
 });
 
@@ -181,8 +298,7 @@ describe("tool error handling", () => {
       makeCtx(cwd),
     );
     // Must not throw: a rejected tool call is worse than an ok:false result.
-    const text = (res.content[0] as { type: string; text: string }).text;
-    expect(typeof text).toBe("string");
+    expect(typeof textOf(res)).toBe("string");
     expect((res.details as { ok: boolean }).ok).toBe(false);
   });
 });
@@ -201,162 +317,6 @@ describe("write_memory guidelines do not promise a reviewer", () => {
     expect(joined).not.toMatch(/reviewer sweeps/i);
     // The anchor owns the statement, so the guideline points at it.
     expect(joined).toContain("memory anchor");
-  });
-});
-
-describe("remove_memory cross-tier", () => {
-  let cwd: string;
-  let projDir: string;
-  let globalDir: string;
-  let projIndex: string;
-  let globalIndex: string;
-
-  const run = (params: Record<string, unknown>) =>
-    removeMemoryTool.execute("t1", params, undefined as never, undefined as never, makeCtx(cwd));
-
-  const textOf = (res: { content: { type: string; text?: string }[] }) =>
-    (res.content[0] as { type: string; text: string }).text;
-
-  beforeEach(() => {
-    cwd = join(tmpHome, "work", "proj");
-    projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
-    globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(projDir, { recursive: true });
-    mkdirSync(globalDir, { recursive: true });
-    projIndex = join(projDir, "MEMORY.md");
-    globalIndex = join(globalDir, "MEMORY.md");
-    // Global OWNS the topic; the project index reaches it by absolute href —
-    // the shape the real my-app store has.
-    writeFileSync(join(globalDir, "shared.md"), "---\ndescription: s\ntype: reference\n---\ns\n");
-    writeFileSync(globalIndex, "# G\n- [Shared](shared.md) — s\n");
-    writeFileSync(projIndex, `# P\n- [Shared](${join(globalDir, "shared.md")}) — s\n`);
-  });
-
-  it("removes a global entry with no tier named even though a project store exists", async () => {
-    // The previous fallback fired only when the requested tier had NO
-    // directory. With a project store present, this answered "not found" in
-    // project and never consulted global, while recall_memory found it fine.
-    const res = await run({ name: "shared" });
-    expect((res.details as { ok: boolean }).ok).toBe(true);
-    expect(existsSync(join(globalDir, "shared.md"))).toBe(false);
-    expect(readFileSync(globalIndex, "utf8")).not.toContain("shared.md");
-    expect(textOf(res)).toContain("Global tier");
-  });
-
-  it("strips the other tier's dangling cross-tier link in the same operation", async () => {
-    const res = await run({ name: "shared" });
-    // The project index linked the trashed file by absolute href. Leaving that
-    // line behind advertises a memory that no longer exists.
-    expect(readFileSync(projIndex, "utf8")).not.toContain("shared.md");
-    expect(textOf(res)).toContain("cross-tier link");
-  });
-
-  it("honors an explicitly named tier strictly", async () => {
-    const res = await run({ name: "shared", tier: "project" });
-    expect((res.details as { ok: boolean }).ok).toBe(false);
-    // Nothing removed from either store.
-    expect(existsSync(join(globalDir, "shared.md"))).toBe(true);
-    expect(readFileSync(globalIndex, "utf8")).toContain("shared.md");
-    expect(readFileSync(projIndex, "utf8")).toContain("shared.md");
-  });
-});
-
-describe("recall_memory reports the most informative failure", () => {
-  it("does not say 'not found' for an entry that exists but is unreadable", () => {
-    // The entry is absent from project but present-and-oversize in global. The
-    // old code kept the FIRST miss, so the caller was told the memory does not
-    // exist — and a model told that may simply write it again, duplicating a
-    // file that is sitting right there.
-    const cwd = join(tmpHome, "work", "proj2");
-    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(projDir, { recursive: true });
-    mkdirSync(globalDir, { recursive: true });
-    writeFileSync(join(projDir, "MEMORY.md"), "# P\n");
-    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Huge](huge.md) — h\n");
-    writeFileSync(
-      join(globalDir, "huge.md"),
-      `---\ndescription: h\ntype: reference\n---\n${"x".repeat(1_100_000)}`,
-    );
-
-    return recallMemoryTool
-      .execute("t1", { name: "huge" }, undefined as never, undefined as never, makeCtx(cwd))
-      .then((res) => {
-        const text = (res.content[0] as { type: string; text: string }).text;
-        expect(text).toContain("too large");
-        expect(text).not.toMatch(/not found/i);
-      });
-  });
-});
-
-describe("remove_memory cleans every index that references the topic", () => {
-  it("strips the other tier's dangling reference even when a tier is named", async () => {
-    // The my-app layout: the PROJECT index links a GLOBAL topic by
-    // absolute href. Naming tier:"global" (which the injected anchor teaches
-    // the model to do for an entry it tagged "[in global tier]") used to make
-    // alsoUnlink empty, because it was derived from the candidate list — and
-    // that list holds exactly one element when a tier is named. The global file
-    // was trashed while the project index kept advertising it.
-    const cwd = join(tmpHome, "work", "myapp");
-    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(projDir, { recursive: true });
-    mkdirSync(globalDir, { recursive: true });
-
-    const globalTopic = join(globalDir, "shared_rule.md");
-    writeFileSync(globalTopic, "---\ndescription: s\ntype: feedback\n---\nrule\n");
-    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Shared](shared_rule.md) — rule\n");
-    writeFileSync(join(projDir, "MEMORY.md"), `# P\n- [Shared](${globalTopic}) — rule\n`);
-
-    const res = await removeMemoryTool.execute(
-      "t1",
-      { name: "shared_rule", tier: "global" },
-      undefined as never,
-      undefined as never,
-      makeCtx(cwd),
-    );
-
-    expect((res.details as { ok: boolean }).ok).toBe(true);
-    expect(readFileSync(join(globalDir, "MEMORY.md"), "utf8")).not.toContain("shared_rule.md");
-    // The dangling absolute reference is gone too, despite the named tier.
-    expect(readFileSync(join(projDir, "MEMORY.md"), "utf8")).not.toContain(globalTopic);
-  });
-
-  it("does not fall through to the other tier when the first tier refuses", async () => {
-    // A refusal is an ANSWER about the tier that refused, not an invitation to
-    // try the other store. Falling through deleted an entry the caller never
-    // named: with `.trash` present as a plain file in the project tier, the
-    // project removal was refused and the GLOBAL copy was trashed instead,
-    // reported as success.
-    const cwd = join(tmpHome, "work", "proj");
-    const projDir = join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
-    const globalDir = join(tmpHome, ".claude", "memory");
-    mkdirSync(projDir, { recursive: true });
-    mkdirSync(globalDir, { recursive: true });
-
-    writeFileSync(join(projDir, "foo.md"), "---\ndescription: p\ntype: project\n---\nP\n");
-    writeFileSync(join(projDir, "MEMORY.md"), "# P\n- [Foo](foo.md) — project\n");
-    writeFileSync(join(projDir, ".trash"), "not a directory\n");
-
-    writeFileSync(join(globalDir, "foo.md"), "---\ndescription: g\ntype: reference\n---\nG\n");
-    writeFileSync(join(globalDir, "MEMORY.md"), "# G\n- [Foo](foo.md) — global\n");
-
-    const res = await removeMemoryTool.execute(
-      "t1",
-      { name: "foo" },
-      undefined as never,
-      undefined as never,
-      makeCtx(cwd),
-    );
-    const text = (res.content[0] as { type: string; text: string }).text;
-
-    // The refusal is reported...
-    expect(text).toContain("not a plain directory");
-    // ...and BOTH stores are intact: the project entry survives its own
-    // refused removal, and the global entry was never a candidate for it.
-    expect(existsSync(join(projDir, "foo.md"))).toBe(true);
-    expect(existsSync(join(globalDir, "foo.md"))).toBe(true);
-    expect(readFileSync(join(globalDir, "MEMORY.md"), "utf8")).toContain("(foo.md)");
   });
 });
 

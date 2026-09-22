@@ -45,8 +45,6 @@ export interface WriteMemoryRequest {
   body: string;
   /** Whether to pin this entry. */
   pinned: boolean;
-  /** Tier: "project" or "global". */
-  tier: "project" | "global";
   /** Priority 1-5 (5=highest). Optional; null/undefined means derive from type. */
   priority?: number | null;
   /** Whether to overwrite an existing entry with the same slug.
@@ -60,16 +58,6 @@ export interface WriteMemoryRequest {
 export interface RemoveMemoryRequest {
   /** Entry name or filename to remove. */
   name: string;
-  /** Tier: "project" or "global". */
-  tier: "project" | "global";
-  /** Other stores whose indexes may also link this topic.
-   *
-   * A topic owned by one tier can be linked from the OTHER tier's index by an
-   * absolute href — the my-app project index on this machine links two
-   * global topics that way. Removing from the owning tier alone leaves the
-   * other tier advertising a topic that no longer exists, so the caller passes
-   * the other resolved store and its dangling line is stripped too. */
-  alsoUnlink?: MemoryDir[];
 }
 
 /** Result of a write or remove operation. */
@@ -708,8 +696,8 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   const destDir = mkdtempSync(join(trashDir, `${filename}.`));
   const trashPath = join(destDir, filename);
   // Pin every spelling of this topic's identity BEFORE the move. Index lines
-  // pointing at it — in this store or the other tier — are matched against this
-  // set: after renameSync the leaf is gone, so a matcher that canonicalizes both
+  // pointing at it are matched against this set: after renameSync the leaf is
+  // gone, so a matcher that canonicalizes both
   // sides can no longer resolve the topic and would miss a cross-tier absolute
   // href entirely.
   const identities = topicIdentities(filePath);
@@ -738,34 +726,6 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     });
   }
 
-  // Strip links to the same topic from the other tier's index.
-  //
-  // A topic owned here can be linked from the other store by an absolute href,
-  // which is how the real my-app project index references two global
-  // topics. Removing the owning copy alone left that store advertising advice
-  // that no longer exists, so the caller (which already resolves both tiers)
-  // passes the other store in and the dangling line goes too. Matching uses the
-  // identity set captured above (lexical and canonical), so a bare or absolute
-  // href, an alias spelling, and a symlinked store root all still match — while
-  // a same-basename entry OWNED by the other tier correctly does not.
-  const crossUnlinked: string[] = [];
-  const crossFailed: string[] = [];
-  for (const other of req.alsoUnlink ?? []) {
-    if (other.indexPath === dir.indexPath || other.dir === dir.dir) continue;
-    try {
-      if (removeFromIndex(other, identities)) crossUnlinked.push(other.label);
-    } catch (err) {
-      crossFailed.push(other.label);
-      debugLog("writer.remove_cross_unlink_failed", {
-        filename,
-        fromTier: dir.tier,
-        otherTier: other.tier,
-        otherIndex: other.indexPath,
-        error: String(err),
-      });
-    }
-  }
-
   debugLog("writer.remove_ok", {
     filename,
     tier: dir.tier,
@@ -773,26 +733,14 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     trashPath,
     linkRemoved,
     indexError,
-    crossUnlinked,
-    crossFailed,
   });
-
-  const crossNote =
-    crossUnlinked.length > 0
-      ? ` Removed its cross-tier link from ${crossUnlinked.join(", ")} tier.`
-      : "";
-  const crossFailNote =
-    crossFailed.length > 0
-      ? ` Could not update the cross-tier index in ${crossFailed.join(", ")} tier; it may still link this topic.`
-      : "";
 
   if (indexError) {
     return {
       ok: true,
       message:
         `Moved memory ${filename} to .trash/ in ${dir.label} tier, but could not update ` +
-        `${dir.indexPath}: ${indexError}. Its index line, if any, still points at the trashed file.` +
-        crossFailNote,
+        `${dir.indexPath}: ${indexError}. Its index line, if any, still points at the trashed file.`,
       filePath: trashPath,
     };
   }
@@ -800,8 +748,8 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   return {
     ok: true,
     message: linkRemoved
-      ? `Moved memory ${filename} to .trash/ in ${dir.label} tier.${crossNote}${crossFailNote}`
-      : `Moved memory ${filename} to .trash/ in ${dir.label} tier, but no matching MEMORY.md line was found to remove.${crossNote}${crossFailNote}`,
+      ? `Moved memory ${filename} to .trash/ in ${dir.label} tier.`
+      : `Moved memory ${filename} to .trash/ in ${dir.label} tier, but no matching MEMORY.md line was found to remove.`,
     filePath: trashPath,
   };
 }

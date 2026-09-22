@@ -210,27 +210,6 @@ export function readBoundedIndex(dir: MemoryDir): BoundedIndex | null {
   };
 }
 
-/** Count link lines in a store's MEMORY.md, or null when it has no readable
- *  index. The global signpost needs a count but must not pay for a full parse
- *  (or a per-entry stat) of a store it does not inject. */
-export function countIndexEntries(dir: MemoryDir): number | null {
-  try {
-    const st = lstatSync(dir.indexPath);
-    if (st.isSymbolicLink() || !st.isFile() || st.size > INDEX_MAX_BYTES) return null;
-  } catch {
-    return null;
-  }
-  try {
-    let n = 0;
-    for (const line of readFileSync(dir.indexPath, "utf8").split("\n")) {
-      if (LINK_PATTERN.test(line)) n++;
-    }
-    return n;
-  } catch {
-    return null;
-  }
-}
-
 /** Describe an index that has grown past the injected excerpt limit, or return
  *  null while it still fits.
  *

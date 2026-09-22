@@ -138,7 +138,6 @@ describe("Claude Code config overrides", () => {
 
     const resolved = resolveMemoryDirs(repo);
     expect(resolved.project?.dir).toBe(memoryDir);
-    expect(resolved.global?.dir).toBe(join(cfg, "memory"));
     expect(existsSync(join(tmpDir, ".claude"))).toBe(false);
   });
 
