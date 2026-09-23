@@ -93,7 +93,12 @@ describe("the startup limit is on SOURCE lines, like Claude Code's", () => {
     // count, not a specific number.
     const totalLines = readFileSync(proj.indexPath, "utf8").split("\n").length;
     expect(section).toContain(`200 of ${totalLines} lines`);
-    expect(section).toContain("cannot be recalled by name");
+    // The notice used to claim a below-the-cut entry "cannot be recalled by
+    // name", which is false: recall resolves against the directory, not the
+    // index (resolveTopicFile), so a dropped link costs discovery, not recall.
+    // This assertion is what let the false claim sit in an injected prompt.
+    expect(section).toContain("still recallable");
+    expect(section).not.toContain("cannot be recalled");
   });
 
   it("counts prose and blank lines against the limit, not just entries", () => {

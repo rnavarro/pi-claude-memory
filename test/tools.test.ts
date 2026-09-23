@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { encodePath } from "../src/resolver.js";
 import {
+  findMemoryTool,
   recallMemoryTool,
   registerMemoryTools,
   removeMemoryTool,
@@ -354,5 +355,87 @@ describe("registered tools run inside a debug-log context", () => {
     const logged = readFileSync(logPath, "utf8");
     expect(logged).toContain("tool.recall_memory");
     expect(logged).toContain("topic_ambiguous");
+  });
+});
+
+describe("find_memory reaches what the injected prefix cannot show", () => {
+  /** An index past the 200-line startup cut, with `tail` appended below it. */
+  const longIndex = (tail: string) => {
+    const filler = Array.from({ length: 260 }, (_, i) => `- [Filler ${i}](filler-${i}.md) — f`);
+    return `# P\n${filler.join("\n")}\n${tail}\n`;
+  };
+  const search = (cwd: string, params: { query: string; limit?: number }) =>
+    findMemoryTool.execute("t1", params, undefined as never, undefined as never, makeCtx(cwd));
+
+  it("finds an entry that sits below the 200-line startup cut", async () => {
+    const cwd = join(tmpHome, "work", "under-cut");
+    makeStore(cwd, longIndex("- [Herdr Keybindings](herdr-keybindings.md) — Herdr prefix syntax"), {
+      "herdr-keybindings.md": "---\nname: x\n---\nbody\n",
+    });
+
+    const text = textOf(await search(cwd, { query: "herdr" }));
+    expect(text).toContain("herdr-keybindings.md");
+    // 261 indexed entries, so the hit is provably outside the injected prefix.
+    expect(text).toContain("1 of 261");
+  });
+
+  it("requires every keyword, and matches title, summary or filename", async () => {
+    const cwd = join(tmpHome, "work", "keywords");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — beta gamma\n- [Delta](delta.md) — epsilon\n", {
+      "alpha.md": "a\n",
+      "delta.md": "d\n",
+    });
+
+    expect(textOf(await search(cwd, { query: "beta gamma" }))).toContain("alpha.md");
+    expect(textOf(await search(cwd, { query: "beta epsilon" }))).toContain("No entries match");
+    expect(textOf(await search(cwd, { query: "DELTA" }))).toContain("delta.md");
+  });
+
+  it("reports a topic file with no index line instead of concealing it", async () => {
+    const cwd = join(tmpHome, "work", "unindexed");
+    makeStore(cwd, "# P\n- [One](one.md) — o\n", { "one.md": "1\n", "orphan-note.md": "2\n" });
+
+    const text = textOf(await search(cwd, { query: "orphan" }));
+    expect(text).toContain("orphan-note.md");
+    expect(text).toContain("no index line");
+  });
+
+  it("puts the newest entries first, because the index is append-ordered", async () => {
+    const cwd = join(tmpHome, "work", "order");
+    makeStore(cwd, "# P\n- [Old Hit](old-hit.md) — target\n- [New Hit](new-hit.md) — target\n", {
+      "old-hit.md": "o\n",
+      "new-hit.md": "n\n",
+    });
+
+    const text = textOf(await search(cwd, { query: "target" }));
+    expect(text.indexOf("new-hit.md")).toBeLessThan(text.indexOf("old-hit.md"));
+  });
+
+  it("bounds its output and says how many matched", async () => {
+    const cwd = join(tmpHome, "work", "bounded");
+    const lines = Array.from({ length: 30 }, (_, i) => `- [Hit ${i}](hit-${i}.md) — needle`);
+    makeStore(cwd, `# P\n${lines.join("\n")}\n`);
+
+    const text = textOf(await search(cwd, { query: "needle", limit: 5 }));
+    expect(text).toContain("30 of 30");
+    expect(text).toContain("Showing the first 5");
+    expect(text).toContain("hit-29.md");
+    expect(text).not.toContain("hit-24.md");
+  });
+
+  it("writes nothing — the index is byte-identical afterwards", async () => {
+    const cwd = join(tmpHome, "work", "read-only");
+    const store = makeStore(cwd, "# P\n- [One](one.md) — o\n", { "one.md": "1\n" });
+    const before = readFileSync(store.indexPath);
+
+    await search(cwd, { query: "one" });
+    expect(readFileSync(store.indexPath)).toEqual(before);
+  });
+
+  it("says so when this project has no store", async () => {
+    const cwd = join(tmpHome, "work", "no-store");
+    expect(textOf(await search(cwd, { query: "anything" }))).toContain(
+      "No memory store for this project",
+    );
   });
 });

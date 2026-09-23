@@ -54,9 +54,15 @@ any durable facts it finds into the store. The reviewer is told the identity of
 every existing entry, so it supersedes an entry instead of creating a
 duplicate. It runs on shutdown and before compaction as well.
 
-**Tools.** `recall_memory`, `write_memory`, and `remove_memory`. Removal moves
-the file into a per-removal directory under `.trash/` rather than deleting it,
-and reports honestly when an index line was not found.
+**Tools.** `recall_memory`, `find_memory`, `write_memory`, and `remove_memory`.
+Removal moves the file into a per-removal directory under `.trash/` rather than
+deleting it, and reports honestly when an index line was not found.
+
+`find_memory` exists because of the cutoff above: on a store past the startup
+limit most entries are invisible to the prompt, and an invisible entry is also
+an undiscoverable one unless you already know its filename. It searches the
+whole store — index and on-disk topic files both — and returns names to hand to
+`recall_memory`. It writes nothing.
 
 ## Configuration
 
