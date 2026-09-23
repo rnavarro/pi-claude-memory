@@ -439,3 +439,34 @@ describe("find_memory reaches what the injected prefix cannot show", () => {
     );
   });
 });
+
+describe("write_memory honours demoteIndexOverflow from settings.json", () => {
+  it("archives the overflow when the key is on, and not when it is absent", async () => {
+    const cwd = join(tmpHome, "work", "demote");
+    const seeded = Array.from({ length: 205 }, (_, i) => `- [E${i + 1}](e${i + 1}.md) — s`);
+    const store = makeStore(cwd, `${seeded.join("\n")}\n`);
+    const params = {
+      name: "fresh-fact",
+      description: "a freshly learned fact",
+      type: "reference" as const,
+      body: "body\n",
+    };
+    const write = () =>
+      writeMemoryTool.execute("t1", params, undefined as never, undefined as never, makeCtx(cwd));
+
+    // No settings.json yet: the planner is off and the index only grows.
+    expect(textOf(await write())).not.toContain("Archived");
+    expect(readFileSync(store.indexPath, "utf8")).not.toContain("## Archive");
+
+    // This is the wiring guard: the key has to reach the writer through the
+    // tool, so a call site that forgets to pass it fails here.
+    mkdirSync(join(tmpHome, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(tmpHome, ".pi", "agent", "settings.json"),
+      JSON.stringify({ "pi-claude-memory": { demoteIndexOverflow: true } }),
+    );
+
+    expect(textOf(await write())).toContain("Archived");
+    expect(readFileSync(store.indexPath, "utf8")).toContain("## Archive");
+  });
+});

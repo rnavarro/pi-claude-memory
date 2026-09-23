@@ -1675,3 +1675,53 @@ describe("write-path fidelity", () => {
     rmSync(root, { recursive: true, force: true });
   });
 });
+
+describe("index overflow demotion (opt-in)", () => {
+  const link = (n: number) => `- [E${n}](e${n}.md) — s${n}`;
+  /** Seed the index past the 200-line startup bound. */
+  const seedOverflow = (count: number) => {
+    const lines = Array.from({ length: count }, (_, i) => link(i + 1));
+    writeFileSync(dir.indexPath, `${lines.join("\n")}\n`);
+    return lines;
+  };
+  const indexLines = () => readFileSync(dir.indexPath, "utf8").split("\n");
+  const entry = {
+    name: "new-one",
+    description: "a freshly learned fact",
+    type: "reference" as const,
+    body: "body\n",
+    pinned: false,
+    allowOverwrite: true,
+  };
+
+  it("leaves the index alone when the option is off", () => {
+    const seeded = seedOverflow(205);
+    writeMemory(dir, entry);
+
+    const after = indexLines();
+    expect(after).not.toContain("## Archive");
+    for (const line of seeded) expect(after).toContain(line);
+    // Appended at the end, which is where the excerpt cut falls.
+    expect(after.at(-2)).toContain("new-one");
+  });
+
+  it("archives the oldest entries and keeps the new one inside the cut", () => {
+    const seeded = seedOverflow(205);
+    const result = writeMemory(dir, entry, { demoteIndexOverflow: true });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("Archived");
+    const after = indexLines();
+    const marker = after.indexOf("## Archive");
+    expect(marker).toBeGreaterThan(-1);
+
+    // The new entry is ABOVE the heading, so the next session can see it. This
+    // is the whole point: an append would land below the cut.
+    const live = after.slice(0, marker);
+    expect(live.some((l) => l.includes("new-one"))).toBe(true);
+    expect(live.length).toBeLessThanOrEqual(200);
+    expect(after.slice(marker)).toContain(seeded[0]);
+    // Nothing was destroyed: every seeded line is still in the file.
+    for (const line of seeded) expect(after).toContain(line);
+  });
+});

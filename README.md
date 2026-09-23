@@ -54,6 +54,21 @@ any durable facts it finds into the store. The reviewer is told the identity of
 every existing entry, so it supersedes an entry instead of creating a
 duplicate. It runs on shutdown and before compaction as well.
 
+**Index overflow.** That cutoff is a read limit on a file that only ever grows,
+so a busy store eventually pushes every new entry past it: the facts a session
+just learned are exactly the ones the next session cannot see, and an invisible
+entry is also an undiscoverable one. With `demoteIndexOverflow` enabled, a write
+that breaches the limit moves the oldest non-pinned entries below an
+`## Archive` heading in the same file. It deletes nothing — the topic files are
+untouched, `recall_memory` and `find_memory` still resolve them by name, and
+moving a line back is the undo. The live region is refitted on every write,
+including an overwrite, so an entry Claude Code appends at the end of the file
+(which is below the heading) is promoted back on the next write. That is why the
+planner ranks entries by topic mtime rather than by position: once a heading
+exists, position no longer says which entry is newer. Pinned entries are never
+moved; if pins and prose alone exceed the cutoff, the write says so rather than
+evicting one to force a fit.
+
 **Tools.** `recall_memory`, `find_memory`, `write_memory`, and `remove_memory`.
 Removal moves the file into a per-removal directory under `.trash/` rather than
 deleting it, and reports honestly when an index line was not found.
@@ -82,6 +97,7 @@ Every field is optional.
 | --- | --- | --- |
 | `debugLog` | `true` | Write structured NDJSON to `~/.pi/agent/pi-claude-memory/debug/<sessionId>.ndjson` (rotated at 10 MB) |
 | `autoLearn` | `true` | Run the background reviewer at all |
+| `demoteIndexOverflow` | `false` | Move the oldest non-pinned index lines below an `## Archive` heading when `MEMORY.md` outgrows the 200-line / 25 KB excerpt, so the live index stays injectable. Deletes nothing; see above |
 | `reviewIntervalTurns` | `10` | Turns between periodic reviews |
 | `injectTokenCap` | — | **Removed.** The bounded-index contract dropped body preloading, so there is no budget left to configure; the key is ignored if still present. |
 | `reviewModel` | `neuralwatt/deepseek-v4-flash` | Model used for reviews, as `{ "provider": ..., "id": ... }` |

@@ -20,6 +20,15 @@ export interface PiClaudeMemoryConfig {
   debugLog: boolean;
   /** Enable background auto-learning. */
   autoLearn: boolean;
+  /** Move the oldest non-pinned index lines below an `## Archive` heading when
+   * MEMORY.md grows past Claude Code's startup excerpt, so the live index stays
+   * injectable. Off by default: it rewrites a shared, human-readable file on a
+   * write that breaches the limit.
+   *
+   * Nothing is deleted. The topic file is untouched, recall_memory still
+   * resolves the name, the reviewer still sees the identity, and moving the line
+   * back is the undo. See fitIndexToExcerpt. */
+  demoteIndexOverflow: boolean;
   /** Run auto-learn review every N turns. */
   reviewIntervalTurns: number;
   /** Auto-learn model. */
@@ -47,6 +56,7 @@ export interface PiClaudeMemoryConfig {
 export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   debugLog: true,
   autoLearn: true,
+  demoteIndexOverflow: false,
   reviewIntervalTurns: 10,
   reviewModel: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   reviewThinking: "off",
@@ -102,6 +112,9 @@ export function loadConfig(): PiClaudeMemoryConfig {
       ...DEFAULT_CONFIG,
       ...(typeof n.debugLog === "boolean" ? { debugLog: n.debugLog } : {}),
       ...(typeof n.autoLearn === "boolean" ? { autoLearn: n.autoLearn } : {}),
+      ...(typeof n.demoteIndexOverflow === "boolean"
+        ? { demoteIndexOverflow: n.demoteIndexOverflow }
+        : {}),
       ...(n.reviewIntervalTurns !== undefined
         ? {
             reviewIntervalTurns: num(

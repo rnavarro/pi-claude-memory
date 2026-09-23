@@ -8,6 +8,7 @@
 import { basename } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { loadConfig } from "./config.js";
 import { debugLog } from "./debug-log.js";
 import { invalidateResolveCache, withToolLogContext } from "./index.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
@@ -340,15 +341,19 @@ const writeTool = defineTool({
     // is stale either way.
     let result: MemoryOpResult;
     try {
-      result = writeMemory(dir, {
-        name: params.name,
-        description: params.description,
-        type: params.type,
-        body: params.body,
-        pinned: params.pinned ?? false,
-        priority: params.priority ?? null,
-        allowOverwrite: true, // tool is user-initiated, overwrite is expected
-      });
+      result = writeMemory(
+        dir,
+        {
+          name: params.name,
+          description: params.description,
+          type: params.type,
+          body: params.body,
+          pinned: params.pinned ?? false,
+          priority: params.priority ?? null,
+          allowOverwrite: true, // tool is user-initiated, overwrite is expected
+        },
+        { demoteIndexOverflow: loadConfig().demoteIndexOverflow },
+      );
     } catch (err) {
       debugLog("tool.write_memory_error", { name: params.name, error: String(err) });
       result = { ok: false, message: `Failed to write memory ${params.name}: ${String(err)}` };

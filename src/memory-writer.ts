@@ -25,13 +25,21 @@ import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import {
+  fitIndexToExcerpt,
+  type IndexFitResult,
+  isArchiveHeading,
   lineTargetsAnyIdentity,
   lineTargetsFile,
   parseLinkLine,
   startupLimitWarning,
 } from "./index-parser.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
-import { INDEX_MAX_BYTES, TOPIC_FILE_MAX_BYTES } from "./types.js";
+import {
+  INDEX_MAX_BYTES,
+  INDEX_STARTUP_MAX_BYTES,
+  INDEX_STARTUP_MAX_LINES,
+  TOPIC_FILE_MAX_BYTES,
+} from "./types.js";
 
 /** A write-memory request. */
 export interface WriteMemoryRequest {
@@ -310,7 +318,11 @@ function roundTripValidate(
  *   The modified timestamp is always refreshed to now (recency sort wants the
  *   latest write time, not the original).
  */
-export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpResult {
+export function writeMemory(
+  dir: MemoryDir,
+  req: WriteMemoryRequest,
+  options: { demoteIndexOverflow?: boolean } = {},
+): MemoryOpResult {
   // Name policy is shared with read/remove: separator/traversal/newline
   // bearing names are invalid AT ENTRY — slugifying them would silently
   // target a different topic than the caller named ("../outer" → outer.md).
@@ -472,31 +484,36 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
   // state withIndexRetry exists to prevent — and (b) in the write_memory
   // tool skip invalidateResolveCache, leaving a stale frozen injection.
   let indexError: string | null = null;
+  let indexFit: IndexFitResult | null = null;
   try {
-    patchIndexAppend(dir, {
-      filename,
-      // Derive the display title from the RESOLVED FILENAME STEM.
-      //
-      // The stem keeps the title in agreement with the href; deriving it from
-      // the SLUG did not. slugify collapses whitespace runs to a single hyphen
-      // but PRESERVES underscores and dots, so the slug of a spaced stem
-      // ("Foo Bar" -> "foo-bar") is a different string from the stem on disk,
-      // and the old hyphen-only title split left an underscore stem as one
-      // unsplit word — the real `feedback_prefer_jq.md` rendered as
-      // "Feedback_prefer_jq".
-      //
-      // (An earlier version of this comment claimed slugify STRIPS underscores
-      // and that the title became "Feedbackpreferjq". That is not what slugify
-      // does — its character class is [^a-z0-9._-], which keeps '_'. Corrected
-      // here so a later reader does not re-derive a wrong model of it.)
-      //
-      // A stem is not automatically safe to interpolate, though: a legal
-      // on-disk name may contain ']'. deriveTitle strips bracket characters and
-      // patchIndexAppend refuses to publish a line that does not parse.
-      title: deriveTitle(filename.replace(/\.md$/, "")),
-      summary: req.description,
-      pinned: req.pinned,
-    });
+    indexFit = patchIndexAppend(
+      dir,
+      {
+        filename,
+        // Derive the display title from the RESOLVED FILENAME STEM.
+        //
+        // The stem keeps the title in agreement with the href; deriving it from
+        // the SLUG did not. slugify collapses whitespace runs to a single hyphen
+        // but PRESERVES underscores and dots, so the slug of a spaced stem
+        // ("Foo Bar" -> "foo-bar") is a different string from the stem on disk,
+        // and the old hyphen-only title split left an underscore stem as one
+        // unsplit word — the real `feedback_prefer_jq.md` rendered as
+        // "Feedback_prefer_jq".
+        //
+        // (An earlier version of this comment claimed slugify STRIPS underscores
+        // and that the title became "Feedbackpreferjq". That is not what slugify
+        // does — its character class is [^a-z0-9._-], which keeps '_'. Corrected
+        // here so a later reader does not re-derive a wrong model of it.)
+        //
+        // A stem is not automatically safe to interpolate, though: a legal
+        // on-disk name may contain ']'. deriveTitle strips bracket characters and
+        // patchIndexAppend refuses to publish a line that does not parse.
+        title: deriveTitle(filename.replace(/\.md$/, "")),
+        summary: req.description,
+        pinned: req.pinned,
+      },
+      { demoteOverflow: options.demoteIndexOverflow },
+    );
   } catch (err) {
     indexError = String(err);
     debugLog("writer.index_patch_failed", {
@@ -542,9 +559,36 @@ export function writeMemory(dir: MemoryDir, req: WriteMemoryRequest): MemoryOpRe
       label: dir.label,
     });
   }
+  // Demotion is what keeps the notice above from being permanent: it moves the
+  // oldest links below the cut so the live index fits again. Reported because it
+  // changes what a later session can see, without anyone having asked for it.
+  let demotedNote: string | null = null;
+  let cannotFitNote: string | null = null;
+  if (indexFit && indexFit.demoted.length > 0) {
+    debugLog("writer.index_demoted", {
+      slug,
+      count: indexFit.demoted.length,
+      names: indexFit.demoted.slice(0, 20),
+      tier: dir.tier,
+      label: dir.label,
+    });
+    demotedNote =
+      `Archived ${indexFit.demoted.length} older entries below the ` +
+      `${INDEX_STARTUP_MAX_LINES}-line/${INDEX_STARTUP_MAX_BYTES}-byte injection cut; ` +
+      `recall_memory and find_memory still reach them by name.`;
+  }
+  if (indexFit?.cannotFit) {
+    debugLog("writer.index_demote_cannot_fit", { slug, tier: dir.tier, label: dir.label });
+    cannotFitNote =
+      "The live index is still past the injection cut: only prose or pinned entries remain to " +
+      "move, and demotion is not forced.";
+  }
+  const notes = [limitNote ? `Warning: ${limitNote}` : null, demotedNote, cannotFitNote].filter(
+    (note): note is string => note !== null,
+  );
   return {
     ok: true,
-    message: limitNote ? `${base}. Warning: ${limitNote}` : base,
+    message: notes.length > 0 ? `${base}. ${notes.join(" ")}` : base,
     filePath,
   };
 }
@@ -587,7 +631,8 @@ function deriveTitle(name: string): string {
 function patchIndexAppend(
   dir: MemoryDir,
   entry: { filename: string; title: string; summary: string; pinned: boolean },
-): void {
+  options: { demoteOverflow?: boolean } = {},
+): IndexFitResult | null {
   const indexPath = dir.indexPath;
 
   const pin = entry.pinned ? "⛔ " : "";
@@ -622,9 +667,36 @@ function patchIndexAppend(
   // If MEMORY.md doesn't exist, create it with the entry — no-clobber so
   // losing a creation race falls through to merge into the winner's index.
   if (!existsSync(indexPath)) {
-    if (atomicWriteFileNoClobber(indexPath, `${newLine}\n`)) return;
+    if (atomicWriteFileNoClobber(indexPath, `${newLine}\n`)) return null;
   }
 
+  let lastFit: IndexFitResult | null = null;
+  // Fitting and serialising are one step, because BOTH branches below are writes
+  // that a store over the bound may need to fit. The replace branch used to
+  // return before the fit ran, so an overwrite never demoted — a store could sit
+  // permanently past the cut while its entries were being rewritten.
+  const publish = (lines: string[]): string => {
+    // Off by default. When on, the live region is refitted on every write, so the
+    // archive catches up in one publish and stays caught up as Claude Code
+    // appends into it.
+    lastFit = options.demoteOverflow
+      ? fitIndexToExcerpt(lines, {
+          // Topic mtime is the recency signal. It costs one stat per link line on
+          // a write that is over the bound, which is what buys the ability to tell
+          // an entry Claude Code appended at the end of the file from one this
+          // planner archived earlier. Frontmatter `metadata.modified` would be
+          // more precise and costs a parse per topic instead of a stat.
+          recencyAt: (filename) => {
+            try {
+              return statSync(join(dir.dir, filename)).mtimeMs;
+            } catch {
+              return 0;
+            }
+          },
+        })
+      : null;
+    return (lastFit ? lastFit.lines : lines).join("\n");
+  };
   withIndexRetry(
     indexPath,
     (content) => {
@@ -639,19 +711,31 @@ function patchIndexAppend(
       if (existingIdx >= 0) {
         // Replace the existing line in place
         lines[existingIdx] = newLine;
-        return lines.join("\n");
+        return publish(lines);
       }
 
-      // Append at end. Preserve trailing newline state — and treat EMPTY
-      // content as needing no separator: `"".endsWith("\n")` is false, so an
-      // empty-but-existing MEMORY.md would otherwise gain a stray leading
-      // blank line, which parseIndexContent keeps as an IndexLine and
-      // renderIndexSection re-emits into the prompt on every turn.
-      const ending = content === "" || content.endsWith("\n") ? "" : "\n";
-      return `${content}${ending}${newLine}\n`;
+      // Insert the new line at the END OF THE LIVE REGION, preserving trailing
+      // newline state. A plain append would land after an `## Archive` heading,
+      // which is below the injection cut — hiding the very entry this write was
+      // asked to make visible, and re-hiding it on every later write.
+      //
+      // Trailing newline: `"".endsWith("\n")` is false, so an empty-but-existing
+      // MEMORY.md would otherwise gain a stray leading blank line, which
+      // parseIndexContent keeps as an IndexLine and the injector re-emits into
+      // the prompt on every turn.
+      const markerIdx = lines.findIndex(isArchiveHeading);
+      if (markerIdx >= 0) {
+        lines.splice(markerIdx, 0, newLine);
+      } else if (lines.at(-1) === "") {
+        lines.splice(lines.length - 1, 0, newLine);
+      } else {
+        lines.push(newLine, "");
+      }
+      return publish(lines);
     },
     () => existsSync(join(dir.dir, entry.filename)),
   );
+  return lastFit;
 }
 
 /** Remove a memory: move file to .trash/ and remove its MEMORY.md entry. */

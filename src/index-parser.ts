@@ -11,7 +11,7 @@
 // are structured for programmatic use (injection, patching, reconciliation).
 
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
 import { INDEX_MAX_BYTES, INDEX_STARTUP_MAX_BYTES, INDEX_STARTUP_MAX_LINES } from "./types.js";
 
@@ -360,4 +360,203 @@ export function reconcileIndex(parsed: ParsedIndex, dir: string): ReconcileResul
   const unindexed = [...diskFiles].filter((f) => !indexedFiles.has(f));
 
   return { unindexed, missing };
+}
+
+/** The heading that separates the live index from demoted entries.
+ *
+ * A heading rather than a comment because this file stays a human-readable
+ * MEMORY.md: someone who opens it should find a section that explains itself,
+ * and the parser already preserves headings as prose, so no other reader needs
+ * to learn a new syntax. */
+export const ARCHIVE_HEADING = "## Archive";
+
+/** True for the archive divider, and only for it.
+ *
+ * Anchored to a bare heading so a link whose title merely contains the word
+ * "Archive" is not mistaken for the divider. */
+export function isArchiveHeading(line: string): boolean {
+  return /^#{1,6}\s+archive$/i.test(line.trim());
+}
+
+/** True when an index line carries a pin marker.
+ *
+ * Exported so the fit planner ranks pins with the parser's own rule (`⛔`
+ * anywhere in the line, or `[pin]` in the summary) instead of keeping a second
+ * copy of the marker syntax that can drift away from this one. */
+export function isPinnedIndexLine(line: string): boolean {
+  const link = parseLinkLine(line);
+  return link !== null && isPinnedLine(line, link.summary);
+}
+
+/** True when a line is a link the fit planner may move below the archive
+ *  heading. Prose, headings, blank lines and pinned links are never moved. */
+function isDemotableLinkLine(line: string): boolean {
+  return parseLinkLine(line) !== null && !isPinnedIndexLine(line);
+}
+
+/** Bytes a run of lines occupies under the excerpt reader's arithmetic: UTF-8
+ *  bytes plus one byte for each newline joining them.
+ *
+ * Deliberately the same rule as readBoundedIndex, so a region this function
+ * calls fitting is a region that reader actually keeps whole. */
+export function excerptBytes(lines: readonly string[]): number {
+  let bytes = 0;
+  for (let i = 0; i < lines.length; i++) {
+    bytes += Buffer.byteLength(lines[i] ?? "", "utf8") + (i > 0 ? 1 : 0);
+  }
+  return bytes;
+}
+
+/** True when a run of lines is entirely inside the startup excerpt. */
+export function fitsExcerpt(
+  lines: readonly string[],
+  maxLines: number = INDEX_STARTUP_MAX_LINES,
+  maxBytes: number = INDEX_STARTUP_MAX_BYTES,
+): boolean {
+  return lines.length <= maxLines && excerptBytes(lines) <= maxBytes;
+}
+
+export interface IndexFitOptions {
+  /** Line bound for the live region. Defaults to the startup excerpt limit. */
+  maxLines?: number;
+  /** UTF-8 byte bound for the live region, using the excerpt reader's rule. */
+  maxBytes?: number;
+  /**
+   * Recency of a topic file, epoch ms, or 0 when unknown. The planner asks for
+   * this only when an archive heading already exists, which is the point at
+   * which file position stops being a faithful rank.
+   */
+  recencyAt?: (filename: string) => number;
+}
+
+export interface IndexFitResult {
+  /** The whole index: live region first, archive region last. */
+  lines: string[];
+  /** Filenames NEWLY demoted by this call, in the order they moved. A link that
+   *  was already archived and gets re-demoted is not news and is not listed. */
+  demoted: string[];
+  /** True when the live region is still past the bound because only prose,
+   *  headings, or pinned entries remain to move. Nothing is evicted to force a
+   *  fit. */
+  cannotFit: boolean;
+}
+
+/** Move the oldest non-pinned link lines below an `## Archive` heading until the
+ * live region fits inside Claude Code's startup excerpt.
+ *
+ * Why this is not destruction: the topic file is never touched, recall_memory
+ * resolves names against the directory rather than the index, and the parser
+ * (which the reconciler and the auto-learn reviewer both use) reads link lines
+ * wherever they sit — so a demoted line still suppresses a false "unindexed"
+ * warning and still tells the reviewer that the topic exists. Moving the line
+ * back is the undo.
+ *
+ * Why it is pure: no reads, no clock, no ranking metadata. The index is
+ * append-ordered, so the earliest surviving link line is the oldest entry and
+ * position is a sufficient rank; reading a thousand topic frontmatters for a
+ * better one would make the writer's retry closure impure and slow on every
+ * attempt. */
+/** Fit the live region of an index into Claude Code's startup excerpt.
+ *
+ * Promotion is why this can be recomputed from scratch on every write. Position
+ * stops encoding recency the moment a heading exists, because the newest entries
+ * sit above it and the oldest below it; Claude Code appends new entries at the
+ * END OF THE FILE, which is below the heading, so position alone can never tell
+ * that such a line is the newest one there. Promoting archived links back into
+ * the live region before refitting is what keeps an external writer's append
+ * visible.
+ *
+ * Promotion therefore requires a recency signal. Without one, an archived line's
+ * position is YOUNGER than the live lines that survived (they are above it), so
+ * promoting would invert the rank and demote the wrong entries. In that mode
+ * archived lines stay archived and only the live region is re-ranked by position,
+ * which is a faithful rank while no archive exists. The writer always supplies a
+ * signal; this degraded mode exists for callers that cannot.
+ *
+ * Pure: no reads of its own, no clock. Any I/O is the caller's `recencyAt`. */
+export function fitIndexToExcerpt(
+  input: readonly string[],
+  options: IndexFitOptions = {},
+): IndexFitResult {
+  const maxLines = options.maxLines ?? INDEX_STARTUP_MAX_LINES;
+  const maxBytes = options.maxBytes ?? INDEX_STARTUP_MAX_BYTES;
+  const recencyAt = options.recencyAt;
+  const promote = recencyAt !== undefined;
+
+  const lines = [...input];
+  // A trailing empty element is the file's final newline, not a line. Hold it
+  // aside so rebuilding cannot consume it or double it.
+  const trailing = lines.at(-1) === "" ? lines.pop() : undefined;
+
+  const markerIdx = lines.findIndex(isArchiveHeading);
+  const hadMarker = markerIdx >= 0;
+  const livePre = markerIdx >= 0 ? lines.slice(0, markerIdx) : [...lines];
+  const archived = markerIdx >= 0 ? lines.slice(markerIdx + 1) : [];
+
+  // Only link lines are ever demoted, so only link lines are promoted back.
+  // Prose authored below the heading stays below it.
+  const parked = archived.filter((line) => parseLinkLine(line) === null);
+  const alreadyArchived = archived.filter((line) => parseLinkLine(line) !== null);
+  const live = promote ? [...livePre, ...alreadyArchived] : [...livePre];
+  const archivedLinks: string[] = promote ? [] : [...alreadyArchived];
+  const demoted: string[] = [];
+
+  const assemble = (fits: boolean): IndexFitResult => {
+    const out = [...live];
+    if (hadMarker || archivedLinks.length > 0 || parked.length > 0) {
+      out.push(ARCHIVE_HEADING, ...parked, ...archivedLinks);
+    }
+    if (trailing !== undefined) out.push(trailing);
+    return { lines: out, demoted, cannotFit: !fits };
+  };
+
+  if (fitsExcerpt(live, maxLines, maxBytes)) return assemble(true);
+
+  // A link that was already archived and gets re-demoted is not news: the steady
+  // state re-demotes the same lines on every write, and reporting them would
+  // make every write look like it changed something.
+  const previouslyArchived = new Set(
+    alreadyArchived.flatMap((line) => {
+      const link = parseLinkLine(line);
+      return link ? [basename(link.href).toLowerCase()] : [];
+    }),
+  );
+  // Ages are computed once against the pre-splice positions and spliced in step
+  // with `live`, so the positional fallback does not drift as lines leave.
+  const ages = live.map((line, at) => {
+    const link = parseLinkLine(line);
+    // Prose and headings are never victims, so their age never decides anything.
+    if (link === null) return Number.POSITIVE_INFINITY;
+    const known = recencyAt ? recencyAt(basename(link.href)) : 0;
+    return known > 0 ? known : at;
+  });
+
+  while (!fitsExcerpt(live, maxLines, maxBytes)) {
+    let victimIdx = -1;
+    let victimAge = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < live.length; i++) {
+      const line = live[i];
+      if (line === undefined || !isDemotableLinkLine(line)) continue;
+      const age = ages[i] ?? Number.POSITIVE_INFINITY;
+      if (age < victimAge) {
+        victimAge = age;
+        victimIdx = i;
+      }
+    }
+    if (victimIdx < 0) {
+      // Only prose, headings, or pins are left. Refuse to evict a pin: a pin is a
+      // claim that the line must stay visible, and quietly dropping one is the
+      // failure this mechanism exists to prevent. Report instead.
+      break;
+    }
+    const moved = live.splice(victimIdx, 1)[0];
+    ages.splice(victimIdx, 1);
+    if (moved === undefined) continue;
+    const link = parseLinkLine(moved);
+    const name = link ? basename(link.href) : moved;
+    if (!previouslyArchived.has(name.toLowerCase())) demoted.push(name);
+    archivedLinks.push(moved);
+  }
+
+  return assemble(fitsExcerpt(live, maxLines, maxBytes));
 }
