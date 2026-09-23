@@ -197,7 +197,9 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string 
         : `${INDEX_STARTUP_MAX_LINES} lines`;
     parts.push(
       `Index truncated at ${bound} (${kept} of ${bounded.totalLines} lines shown). ` +
-        `Entries below the cut are NOT listed and cannot be recalled by name — read ${project.indexPath} to see them.`,
+        `Entries below the cut are not listed here, but they are still recallable: ` +
+        `pass the exact name to recall_memory, or use find_memory to find one by keyword. ` +
+        `The full list is in ${project.indexPath}.`,
     );
   }
 
