@@ -1802,3 +1802,34 @@ describe("index overflow demotion (opt-in)", () => {
     for (const line of seeded) expect(after).toContain(line);
   });
 });
+
+describe("the parse-cap warning", () => {
+  const probe = {
+    name: "cap-probe",
+    description: "a fact",
+    type: "project" as const,
+    body: "body\n",
+    pinned: false,
+    allowOverwrite: false,
+  };
+
+  it("warns on a write once the index approaches the cap the parser refuses", () => {
+    // ~660 KB: parseable today (the cap is 1 MB) but close enough that the next
+    // weeks of appends cross it, at which point every entry in the store vanishes
+    // from injection AND index updates are refused. This write is the last moment
+    // any warning is possible, which is why the threshold warns well before it.
+    writeFileSync(dir.indexPath, "prose line\n".repeat(60_001));
+
+    const res = writeMemory(dir, probe);
+
+    expect(res.ok).toBe(true);
+    expect(res.message).toContain(`approaching the ${INDEX_MAX_BYTES}-byte cap`);
+  });
+
+  it("says nothing about the cap on a store that is nowhere near it", () => {
+    const res = writeMemory(dir, probe);
+
+    expect(res.ok).toBe(true);
+    expect(res.message).not.toContain(`${INDEX_MAX_BYTES}-byte cap`);
+  });
+});

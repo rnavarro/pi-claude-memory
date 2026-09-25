@@ -69,6 +69,15 @@ exists, position no longer says which entry is newer. Pinned entries are never
 moved; if pins and prose alone exceed the cutoff, the write says so rather than
 evicting one to force a fit.
 
+Demotion moves lines within the file; it does not shrink it. So the file keeps
+growing, and there is a second and harder limit at 1 MB: past it the parser
+refuses the whole index, which hides *every* entry in that store from injection
+and makes the writer refuse index updates. A write warns once the file passes
+600 KB, while curation is still a choice, and if an index is already past 1 MB
+the injected memory section says the index was not injected rather than silently
+looking empty. Bringing a store back down from there means deleting or merging
+entries, which the planner deliberately does not do.
+
 **Tools.** `recall_memory`, `find_memory`, `write_memory`, and `remove_memory`.
 Removal moves the file into a per-removal directory under `.trash/` rather than
 deleting it, and reports honestly when an index line was not found.

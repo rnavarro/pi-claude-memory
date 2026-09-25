@@ -101,8 +101,10 @@ export function buildMemoryInjection(
   const warnings: string[] = [];
   const blocks: string[] = [];
 
-  const projectBlock = project ? buildProjectIndexBlock(project, warnings) : null;
-  if (projectBlock) blocks.push(projectBlock);
+  const projectIndex = project
+    ? buildProjectIndexBlock(project, warnings)
+    : { block: null, rejectedReason: null };
+  if (projectIndex.block) blocks.push(projectIndex.block);
 
   const hasAnyEntries = blocks.length > 0;
 
@@ -123,23 +125,44 @@ export function buildMemoryInjection(
   // access to.
   const finalAnchor = hasCtxSearch ? anchor : anchor.replace(/\n.*ctx_search\..*$/m, "");
 
+  // Say out loud when the store's index exists but could not be injected. The
+  // model otherwise reads a memory section that is merely empty and answers "I
+  // have no memories of that" with full confidence. This is also the only
+  // surface that CAN report it: an oversize index is refused on the write side
+  // too, so no write-time warning can fire once a store is in that state.
+  const rejectedNotice = projectIndex.rejectedReason
+    ? `**This project's MEMORY.md exists but was not injected (${projectIndex.rejectedReason}).** ` +
+      `No memories from it are available this turn, and index updates are refused until the file ` +
+      `is repaired: ${project?.indexPath}`
+    : null;
+  const text =
+    `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}` +
+    (rejectedNotice ? `\n\n${rejectedNotice}` : "");
+
   debugLog("injector.build", {
     hasProject: project !== null,
     hasAnyEntries,
     hasCtxSearch,
     warningCount: warnings.length,
-    textLength: `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}`.trimEnd().length,
+    indexRejected: projectIndex.rejectedReason,
+    textLength: text.trimEnd().length,
   });
 
-  return {
-    text: `\n\n## Memory\n\n${finalAnchor}\n\n${blocks.join("\n\n")}`.trimEnd(),
-    warnings,
-  };
+  return { text: text.trimEnd(), warnings };
+}
+
+/** The project block, plus the reason the index could not be injected at all.
+ *
+ * The reason is carried out of the builder rather than only pushed as a warning
+ * because an unreadable index is the one state no write can report about. */
+interface ProjectIndexBlock {
+  block: string | null;
+  rejectedReason: string | null;
 }
 
 /** Build the project tier block: the bounded index excerpt plus the routing
  *  guidance that only makes sense for the entries actually shown. */
-function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string | null {
+function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): ProjectIndexBlock {
   // Reconcile against the FULL index, never the bounded excerpt: a topic whose
   // link sits below the 200-line cut is still indexed, so reporting it as
   // unindexed would be a lie. This is also the only signal that a topic file
@@ -172,7 +195,7 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string 
 
   const bounded = readBoundedIndex(project);
   // No index file at all: not a warning, just a store without an index yet.
-  if (!bounded) return null;
+  if (!bounded) return { block: null, rejectedReason: null };
   if (!bounded.ok) {
     // A symlinked, non-regular, or oversize MEMORY.md is a real
     // misconfiguration: the store exists but contributes nothing to the prompt.
@@ -184,7 +207,7 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string 
       indexPath: project.indexPath,
       reason: bounded.reason,
     });
-    return null;
+    return { block: null, rejectedReason: bounded.reason };
   }
 
   const parts = [`### Memory (${project.label})`, "#### Index", bounded.content.trimEnd()];
@@ -203,5 +226,5 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): string 
     );
   }
 
-  return parts.join("\n\n");
+  return { block: parts.join("\n\n"), rejectedReason: null };
 }
