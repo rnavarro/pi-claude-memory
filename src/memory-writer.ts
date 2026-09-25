@@ -7,6 +7,7 @@
 // touched (replaced in place, or removed on request), never the rest of the file.
 
 import {
+  copyFileSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -318,6 +319,70 @@ function roundTripValidate(
  *   The modified timestamp is always refreshed to now (recency sort wants the
  *   latest write time, not the original).
  */
+/** Reserve a fresh directory under .trash/ for one displaced body.
+ *
+ * Shared by removal (which moves the file) and overwrite (which copies it), so the
+ * two paths cannot drift on the parts that matter:
+ *
+ * - The symlink check runs BEFORE anything is created. Displacing a file through
+ *   an attacker-controlled `.trash` symlink would relocate store contents outside
+ *   the store, and mkdirSync would follow the link.
+ * - The destination is a fresh mkdtempSync directory. The earlier
+ *   `${filename}.${Date.now()}.bak` naming collided when the same topic was
+ *   displaced twice within one millisecond (or across processes sharing a
+ *   timestamp), and renameSync overwrites silently, so the second displacement
+ *   destroyed the first backup, contradicting the recoverability promise. */
+function reserveTrashPath(
+  dir: MemoryDir,
+  filename: string,
+): { ok: true; path: string } | { ok: false; message: string } {
+  const trashDir = join(dir.dir, TRASH_DIRNAME);
+  try {
+    const st = lstatSync(trashDir);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      debugLog("writer.trash_not_directory", { trashDir, tier: dir.tier });
+      return { ok: false, message: `.trash in ${dir.label} tier is not a plain directory` };
+    }
+  } catch {
+    // Absent — create it below.
+    mkdirSync(trashDir, { recursive: true });
+  }
+  try {
+    return { ok: true, path: join(mkdtempSync(join(trashDir, `${filename}.`)), filename) };
+  } catch (err) {
+    return {
+      ok: false,
+      message: `could not reserve a .trash directory in ${dir.label} tier (${String(err)})`,
+    };
+  }
+}
+
+/** Copy a topic body into .trash/ before an overwrite replaces it.
+ *
+ * An overwrite is the only write path that can destroy a body. A wrong-but-valid
+ * target — an entry that exists, is unchanged, and is simply not the one the
+ * judge meant — passes every other guard in this file: the slug resolves, the
+ * stale-overwrite mtime snapshot matches, and the index line it rewrites is
+ * well-formed. Nothing in code can tell that apart from a correct overwrite, so
+ * the only defence is keeping the displaced body recoverable.
+ *
+ * Copy rather than move: the publish below still needs the path, and if it then
+ * fails the original is untouched and the copy is merely redundant. */
+function backupTopicForOverwrite(
+  dir: MemoryDir,
+  filePath: string,
+): { ok: true; path: string } | { ok: false; message: string } {
+  const filename = basename(filePath);
+  const reserved = reserveTrashPath(dir, filename);
+  if (!reserved.ok) return reserved;
+  try {
+    copyFileSync(filePath, reserved.path);
+    return reserved;
+  } catch (err) {
+    return { ok: false, message: `could not back up ${filename} to .trash (${String(err)})` };
+  }
+}
+
 export function writeMemory(
   dir: MemoryDir,
   req: WriteMemoryRequest,
@@ -391,10 +456,15 @@ export function writeMemory(
   // and write fresh; the publish below replaces the link rather than following
   // it either way.
   let existingIsPlainFile = false;
+  // Kept separate from existingIsPlainFile because the oversize branch below
+  // clears that flag to skip preservation, while the file is still a real,
+  // replaceable body the overwrite backup must copy.
+  let existingIsRealFile = false;
   let existingBytes = 0;
   try {
     const st = lstatSync(filePath);
     existingIsPlainFile = st.isFile() && !st.isSymbolicLink();
+    existingIsRealFile = existingIsPlainFile;
     existingBytes = st.size;
   } catch {
     existingIsPlainFile = false;
@@ -462,6 +532,30 @@ export function writeMemory(
 
   // Ensure the directory exists
   mkdirSync(dir.dir, { recursive: true });
+
+  // Back the displaced body up before replacing it. Fail closed: an overwrite
+  // that cannot be backed up is refused, because recoverability is the point.
+  if (req.allowOverwrite && existingIsRealFile) {
+    const backup = backupTopicForOverwrite(dir, filePath);
+    if (!backup.ok) {
+      debugLog("writer.overwrite_backup_failed", {
+        slug,
+        filename,
+        tier: dir.tier,
+        message: backup.message,
+      });
+      return {
+        ok: false,
+        message: `Refusing to overwrite ${filename}: ${backup.message}. The existing entry is untouched.`,
+      };
+    }
+    debugLog("writer.overwrite_backed_up", {
+      slug,
+      filename,
+      tier: dir.tier,
+      dest: backup.path,
+    });
+  }
 
   // Write the topic file. Auto-learn (allowOverwrite=false) publishes
   // no-clobber: another writer creating the same slug between the collision
@@ -750,35 +844,16 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
     };
   }
 
-  // Move to .trash/ (never delete — user can recover)
-  const trashDir = join(dir.dir, TRASH_DIRNAME);
+  // Move to .trash/ (never delete — user can recover). The reservation is shared
+  // with the overwrite backup so the two paths cannot drift on what matters: the
+  // symlink check runs before anything is created, and the destination is a fresh
+  // directory rather than a timestamped name that could collide.
   const filename = basename(filePath);
-  // Unique per-removal destination. `${filename}.${Date.now()}.bak` collided
-  // when the same topic was removed twice within one millisecond (or across
-  // processes sharing a timestamp), and renameSync overwrites silently — so
-  // the second removal would destroy the first backup, contradicting the
-  // recoverability promise. mkdtempSync reserves a fresh directory instead.
-  //
-  // The .trash dir is also checked for symlink-ness: moving files through an
-  // attacker-controlled symlink would relocate them outside the store. The
-  // check runs BEFORE creating anything, so an existing symlink is rejected
-  // rather than followed by mkdirSync.
-  try {
-    const st = lstatSync(trashDir);
-    if (st.isSymbolicLink() || !st.isDirectory()) {
-      debugLog("writer.trash_not_directory", { trashDir, tier: dir.tier });
-      return {
-        ok: false,
-        reason: "refused",
-        message: `.trash in ${dir.label} tier is not a plain directory`,
-      };
-    }
-  } catch {
-    // Absent — create it below.
-    mkdirSync(trashDir, { recursive: true });
+  const reserved = reserveTrashPath(dir, filename);
+  if (!reserved.ok) {
+    return { ok: false, reason: "refused", message: reserved.message };
   }
-  const destDir = mkdtempSync(join(trashDir, `${filename}.`));
-  const trashPath = join(destDir, filename);
+  const trashPath = reserved.path;
   // Pin every spelling of this topic's identity BEFORE the move. Index lines
   // pointing at it are matched against this set: after renameSync the leaf is
   // gone, so a matcher that canonicalizes both
