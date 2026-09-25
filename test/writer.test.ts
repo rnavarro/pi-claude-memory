@@ -982,6 +982,83 @@ describe("trash recoverability", () => {
     expect(readdirSync(outside).length).toBe(0);
     rmSync(outside, { recursive: true, force: true });
   });
+
+  it("keeps the displaced body when an overwrite replaces it", () => {
+    writeMemory(dir, {
+      name: "displaced",
+      description: "v1",
+      type: "project",
+      body: "the original body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+
+    const res = writeMemory(dir, {
+      name: "displaced",
+      description: "v2",
+      type: "project",
+      body: "the replacement body",
+      pinned: false,
+      allowOverwrite: true,
+    });
+
+    expect(res.ok).toBe(true);
+    expect(readFileSync(join(dir.dir, "displaced.md"), "utf8")).toContain("the replacement body");
+
+    // An overwrite is the one write that can destroy a body, so the body it
+    // displaced is recoverable. A wrong-but-valid target (an entry that exists,
+    // is unchanged, and is simply not the one intended) passes every other
+    // guard, which is why the answer has to be reversibility rather than
+    // detection.
+    const trashDir = join(dir.dir, ".trash");
+    const entries = readdirSync(trashDir, { withFileTypes: true }).filter((e) => e.isDirectory());
+    expect(entries.length).toBe(1);
+    const backedUp = readFileSync(join(trashDir, entries[0].name, "displaced.md"), "utf8");
+    expect(backedUp).toContain("the original body");
+    expect(backedUp).not.toContain("the replacement body");
+  });
+
+  it("refuses an overwrite rather than replacing a body it cannot back up", () => {
+    writeMemory(dir, {
+      name: "unbacked",
+      description: "v1",
+      type: "project",
+      body: "must survive",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    const outside = mkdtempSync(join(tmpdir(), "pcm-ow-trash-out-"));
+    symlinkSync(outside, join(dir.dir, ".trash"));
+
+    const res = writeMemory(dir, {
+      name: "unbacked",
+      description: "v2",
+      type: "project",
+      body: "replacement",
+      pinned: false,
+      allowOverwrite: true,
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("Refusing to overwrite");
+    // The entry is untouched, and nothing was written through the symlink.
+    expect(readFileSync(join(dir.dir, "unbacked.md"), "utf8")).toContain("must survive");
+    expect(readdirSync(outside).length).toBe(0);
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("does not create .trash for a write that displaces nothing", () => {
+    writeMemory(dir, {
+      name: "fresh",
+      description: "d",
+      type: "project",
+      body: "b",
+      pinned: false,
+      allowOverwrite: false,
+    });
+
+    expect(existsSync(join(dir.dir, ".trash"))).toBe(false);
+  });
 });
 
 describe("atomicWriteFile temp cleanup", () => {
