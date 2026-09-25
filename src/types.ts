@@ -30,6 +30,18 @@ export const INDEX_MAX_BYTES = 1_000_000;
 export const INDEX_STARTUP_MAX_LINES = 200;
 export const INDEX_STARTUP_MAX_BYTES = 25_000;
 
+/** Size at which the writer starts warning that MEMORY.md is approaching
+ *  INDEX_MAX_BYTES.
+ *
+ * That cap is a cliff rather than a slope: past it parseIndexFile returns null,
+ * which hides EVERY entry in the store from injection and makes the writer refuse
+ * every index update. Nothing warned before reaching it, so the first symptom was
+ * total memory loss that no write could report. This threshold turns it into a
+ * scheduling problem: at the growth rate the largest store on this machine shows
+ * (about 26 KB/day) there are weeks of lead time from here, and curating an old
+ * archive is a task someone has to choose to do. */
+export const INDEX_PARSE_CAP_WARN_BYTES = 600_000;
+
 /** The 3 known frontmatter type values. null = untyped/no frontmatter. */
 export type MemoryType = "feedback" | "reference" | "project" | "user" | null;
 

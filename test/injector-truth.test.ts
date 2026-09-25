@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildMemoryInjection } from "../src/injector.js";
-import { INDEX_STARTUP_MAX_BYTES } from "../src/types.js";
+import { INDEX_MAX_BYTES, INDEX_STARTUP_MAX_BYTES } from "../src/types.js";
 
 let tmpDir: string;
 
@@ -186,5 +186,22 @@ describe("anchor gating keeps the index guidance", () => {
     // it once shared a line with the ctx_search clause and was deleted with it.
     expect(text).toContain("Durable facts across sessions");
     expect(text).not.toContain("ctx_search");
+  });
+});
+
+describe("an index that exists but cannot be injected", () => {
+  it("says so instead of showing an empty memory section", () => {
+    // Over the parse cap, so every entry in that store is unreachable from the
+    // prompt. No write can report it either: an oversize index is refused on the
+    // write side too, which leaves this notice as the only surface that can.
+    const proj = mkStore("p7", "proj", "x".repeat(INDEX_MAX_BYTES + 1));
+
+    const { text, warnings } = buildMemoryInjection(proj);
+
+    expect(text).toContain("exists but was not injected (oversize)");
+    // It names the file, because the fix is a file edit someone has to make.
+    expect(text).toContain(proj.indexPath);
+    // And it is still reported as a warning for the debug log.
+    expect(warnings.join(" ")).toContain("not injected (oversize)");
   });
 });

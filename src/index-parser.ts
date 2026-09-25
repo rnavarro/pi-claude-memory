@@ -13,7 +13,12 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
-import { INDEX_MAX_BYTES, INDEX_STARTUP_MAX_BYTES, INDEX_STARTUP_MAX_LINES } from "./types.js";
+import {
+  INDEX_MAX_BYTES,
+  INDEX_PARSE_CAP_WARN_BYTES,
+  INDEX_STARTUP_MAX_BYTES,
+  INDEX_STARTUP_MAX_LINES,
+} from "./types.js";
 
 // Match: - [title](href) — summary
 // The summary is OPTIONAL. Hand-authored and emoji-marked index lines
@@ -240,6 +245,46 @@ export function startupLimitWarning(dir: MemoryDir): string | null {
     "Entries below the cutoff are not injected, and appends go to the end, so " +
     "the newest entries are the ones being dropped. Read through the file with " +
     "recall_memory, or consolidate the index."
+  );
+}
+
+/** Warn while MEMORY.md is approaching the byte cap the parser refuses.
+ *
+ * Distinct from startupLimitWarning above. That one is about how much of the
+ * index reaches a prompt; this one is about whether the index can be parsed at
+ * all. Past INDEX_MAX_BYTES, parseIndexFile returns null: every entry in the
+ * store disappears from injection and the writer refuses every index update.
+ * Neither the archive nor the demotion planner shrinks the file — demotion moves
+ * lines within it — so the only fix is deleting or merging entries.
+ *
+ * The write path is the right place for the approach warning because a write is
+ * what makes the file grow, and it is also the LAST moment a warning is possible:
+ * once the cap is crossed, writes are refused and only the injector can report it. */
+export function indexParseCapWarning(dir: MemoryDir): string | null {
+  let bytes: number;
+  try {
+    const st = lstatSync(dir.indexPath);
+    // A symlinked or non-regular index is a different fault, and the injector
+    // already reports it with the reason it measured.
+    if (st.isSymbolicLink() || !st.isFile()) return null;
+    bytes = st.size;
+  } catch {
+    return null; // no index yet — the caller is about to create one
+  }
+  if (bytes <= INDEX_PARSE_CAP_WARN_BYTES) return null;
+  const measured = `MEMORY.md is ${bytes} bytes`;
+  const advice =
+    " The archive keeps demoted entries reachable but does not shrink the file, " +
+    "so entries have to be deleted or merged to bring it back down.";
+  if (bytes > INDEX_MAX_BYTES) {
+    return (
+      `${measured}, past the ${INDEX_MAX_BYTES}-byte cap: the parser refuses it, so ` +
+      `no entry in this store is injected and index updates are refused until it shrinks.${advice}`
+    );
+  }
+  return (
+    `${measured}, approaching the ${INDEX_MAX_BYTES}-byte cap past which the parser ` +
+    `refuses the whole index and every entry disappears from injection.${advice}`
   );
 }
 

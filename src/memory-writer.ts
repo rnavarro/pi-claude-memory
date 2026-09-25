@@ -28,6 +28,7 @@ import { parseMemoryContent } from "./frontmatter.js";
 import {
   fitIndexToExcerpt,
   type IndexFitResult,
+  indexParseCapWarning,
   isArchiveHeading,
   lineTargetsAnyIdentity,
   lineTargetsFile,
@@ -653,6 +654,14 @@ export function writeMemory(
       label: dir.label,
     });
   }
+  // The parse cap is a different failure from the excerpt cutoff above, and a
+  // worse one: past INDEX_MAX_BYTES every entry disappears from injection AND the
+  // writer refuses every index update, so this is the last write that can report
+  // it. The threshold warns well before that, when curation is still a choice.
+  const capNote = indexError ? null : indexParseCapWarning(dir);
+  if (capNote) {
+    debugLog("writer.index_near_parse_cap", { slug, filename, tier: dir.tier, label: dir.label });
+  }
   // Demotion is what keeps the notice above from being permanent: it moves the
   // oldest links below the cut so the live index fits again. Reported because it
   // changes what a later session can see, without anyone having asked for it.
@@ -677,9 +686,12 @@ export function writeMemory(
       "The live index is still past the injection cut: only prose or pinned entries remain to " +
       "move, and demotion is not forced.";
   }
-  const notes = [limitNote ? `Warning: ${limitNote}` : null, demotedNote, cannotFitNote].filter(
-    (note): note is string => note !== null,
-  );
+  const notes = [
+    limitNote ? `Warning: ${limitNote}` : null,
+    capNote,
+    demotedNote,
+    cannotFitNote,
+  ].filter((note): note is string => note !== null);
   return {
     ok: true,
     message: notes.length > 0 ? `${base}. ${notes.join(" ")}` : base,
