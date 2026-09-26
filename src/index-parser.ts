@@ -230,12 +230,21 @@ export function startupLimitWarning(dir: MemoryDir): string | null {
   } catch {
     return null; // no index yet — the caller is about to create one
   }
-  const lines = raw.split("\n").length;
-  const bytes = Buffer.byteLength(raw, "utf8");
-  if (lines <= INDEX_STARTUP_MAX_LINES && bytes <= INDEX_STARTUP_MAX_BYTES) return null;
+  // Measure the region that is actually injected: everything above the archive
+  // heading. Parked entries below it are not part of the excerpt, so counting
+  // them kept this warning firing on every write to a demoted store while telling
+  // the operator the newest entries were the ones being dropped, which is the
+  // exact failure demotion prevents. With no heading the live region is the whole
+  // file, so a store that never demotes measures as it always did.
+  const lines = raw.split("\n");
+  const marker = lines.findIndex(isArchiveHeading);
+  const live = marker === -1 ? lines : lines.slice(0, marker);
+  if (fitsExcerpt(live)) return null;
+  const lineCount = live.length;
+  const bytes = excerptBytes(live);
   const over: string[] = [];
-  if (lines > INDEX_STARTUP_MAX_LINES) {
-    over.push(`${lines} lines (limit ${INDEX_STARTUP_MAX_LINES})`);
+  if (lineCount > INDEX_STARTUP_MAX_LINES) {
+    over.push(`${lineCount} lines (limit ${INDEX_STARTUP_MAX_LINES})`);
   }
   if (bytes > INDEX_STARTUP_MAX_BYTES) {
     over.push(`${bytes} bytes (limit ${INDEX_STARTUP_MAX_BYTES})`);

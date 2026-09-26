@@ -614,6 +614,53 @@ describe("index concurrency primitives", () => {
     expect(result.message).toContain("past the injected excerpt limit");
   });
 
+  it("stays quiet when a demoted store's live region fits, though the file does not", () => {
+    // The whole file is far past the limit, but only the region above the archive
+    // heading is injected, and that region fits. Counting the parked entries made
+    // this warn on every write to a demoted store while telling the operator the
+    // newest entries were being dropped, which is what demotion prevents.
+    const live = Array.from(
+      { length: 100 },
+      (_, i) => `- [Live ${i}](live-${i}.md) — ${"x".repeat(60)}`,
+    );
+    const parked = Array.from(
+      { length: 400 },
+      (_, i) => `- [Old ${i}](old-${i}.md) — ${"y".repeat(60)}`,
+    );
+    writeFileSync(join(dir.dir, "MEMORY.md"), [...live, "## Archive", ...parked, ""].join("\n"));
+
+    const result = writeMemory(dir, {
+      name: "live-fits",
+      description: "d",
+      type: "reference",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).not.toContain("past the injected excerpt limit");
+  });
+
+  it("still warns when the live region itself is over, archive or not", () => {
+    // The converse guard: measuring the live region must not become never warning.
+    const live = Array.from({ length: 205 }, (_, i) => `- [Live ${i}](live-${i}.md) — x`);
+    const parked = Array.from({ length: 400 }, (_, i) => `- [Old ${i}](old-${i}.md) — y`);
+    writeFileSync(join(dir.dir, "MEMORY.md"), [...live, "## Archive", ...parked, ""].join("\n"));
+
+    const result = writeMemory(dir, {
+      name: "live-over",
+      description: "d",
+      type: "reference",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("past the injected excerpt limit");
+  });
+
   it("does not warn while the index still fits the excerpt", () => {
     writeFileSync(join(dir.dir, "MEMORY.md"), "# M\n- [One](one.md) — o\n");
     const result = writeMemory(dir, {
