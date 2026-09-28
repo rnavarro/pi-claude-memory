@@ -11,7 +11,7 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { debugLog } from "./debug-log.js";
 import { type FindField, queryTerms, rankEntries } from "./find-rank.js";
-import { invalidateResolveCache, withToolLogContext } from "./index.js";
+import { withToolLogContext } from "./index.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
 import type { MemoryOpResult } from "./memory-writer.js";
 import { readMemory, readTopicFile, removeMemory, writeMemory } from "./memory-writer.js";
@@ -387,9 +387,12 @@ const writeTool = defineTool({
 
     // The writer touches the filesystem in several places (mkdir, temp write
     // + rename, index patch). A failure there must surface as ok:false rather
-    // than reject the tool call, and invalidation must still run: the topic
-    // file may well have landed before the failure, so the frozen injection
-    // is stale either way.
+    // than reject the tool call.
+    //
+    // The write deliberately does NOT refresh the injected MEMORY.md: like
+    // Claude Code, the injection refreshes only at session start and after
+    // compaction (see src/index.ts). Refreshing here would change the system
+    // prompt and void the prompt cache for the whole conversation.
     let result: MemoryOpResult;
     try {
       result = writeMemory(
@@ -408,11 +411,6 @@ const writeTool = defineTool({
     } catch (err) {
       debugLog("tool.write_memory_error", { name: params.name, error: String(err) });
       result = { ok: false, message: `Failed to write memory ${params.name}: ${String(err)}` };
-    } finally {
-      // Invalidate the resolver cache so the next before_agent_start picks up
-      // any newly created project dir or index changes. This causes a one-time
-      // cache miss on the next turn (user explicitly wrote, one miss is fine).
-      invalidateResolveCache();
     }
     return {
       content: [
@@ -454,11 +452,10 @@ const removeTool = defineTool({
     } catch (err) {
       debugLog("tool.remove_memory_error", { name: params.name, error: String(err) });
       result = { ok: false, message: `Failed to remove memory ${params.name}: ${String(err)}` };
-    } finally {
-      // Invalidate the resolver cache so the next before_agent_start reflects
-      // the removed entry in the index.
-      invalidateResolveCache();
     }
+    // No injection refresh here either: the removal shows up in the injected
+    // index after the next compaction or in the next session, as in Claude
+    // Code. recall/find read the store fresh, so they see it immediately.
 
     return {
       content: [{ type: "text", text: result.message }],

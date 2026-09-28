@@ -577,7 +577,7 @@ export function writeMemory(
   // would (a) in auto-learn be swallowed by the per-candidate catch, leaving
   // a topic with NO index line — invisible to every injection, the exact
   // state withIndexRetry exists to prevent — and (b) in the write_memory
-  // tool skip invalidateResolveCache, leaving a stale frozen injection.
+  // tool turn a landed write into a reported failure.
   let indexError: string | null = null;
   let indexFit: IndexFitResult | null = null;
   try {

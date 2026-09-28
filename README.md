@@ -48,6 +48,14 @@ first, the same limit Claude Code applies to its own auto memory — with an
 explicit notice when it truncates. Topic bodies are never injected: the model
 reads one on demand with `recall_memory`, passing the entry's filename.
 
+The injected text is computed once, at the first turn of a session, and reused
+byte for byte on every later turn so the prompt cache stays valid. It is
+recomputed from disk only at session start and after a compaction, the same
+points at which Claude Code refreshes its auto memory. Writes do not refresh it:
+an entry added by `write_memory`, `remove_memory` or auto-learning is on disk at
+once, and `recall_memory` sees it, but it reaches the injected index only after
+the next compaction or in the next session.
+
 **Auto-learning.** After a configurable number of turns Pi runs a background
 review of the recent conversation, using a model of your choosing, and writes
 any durable facts it finds into the store. The reviewer is told the identity of

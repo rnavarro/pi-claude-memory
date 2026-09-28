@@ -18,6 +18,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
+  SessionCompactEvent,
   SessionEntry,
   SessionMessageEntry,
   SessionShutdownEvent,
@@ -36,14 +37,21 @@ import type { ResolveResult } from "./types.js";
 // Session-level caches
 //
 // Pi rebuilds the system prompt from scratch every turn. To keep the prompt
-// cache prefix stable, we freeze the injection text at session start and reuse
-// the exact same bytes every turn. Only explicit user actions
-// (write_memory / remove_memory) invalidate the frozen text — a one-time cache
-// miss that's acceptable because the user explicitly asked.
+// cache prefix stable, we freeze the injection text at the first
+// before_agent_start and reuse the exact same bytes every turn. The frozen text
+// is recomputed from disk at exactly two points, matching Claude Code, which
+// refreshes auto memory only at session start and after compaction:
 //
-// Auto-learn writes do NOT invalidate: they take effect next session. The model
-// already has the context from the conversation; the new memory is for future
-// sessions, not the current one.
+//   - session_start (and a cwd change, which is a different store);
+//   - session_compact, after a compaction has actually happened. Compaction
+//     already rewrites the conversation prefix, so the cache is lost anyway
+//     and the refresh costs nothing extra.
+//
+// No write refreshes it: not write_memory, not remove_memory, not auto-learn.
+// A mid-session write would otherwise change the system prompt and void the
+// prompt cache for the whole conversation. The model already has the new fact
+// from the conversation (it just wrote it, or can recall_memory it), and the
+// store on disk is current for find/recall, which resolve fresh on every call.
 // ---------------------------------------------------------------------------
 
 /** Frozen injection text + resolve result for the current session. */
@@ -173,6 +181,10 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     }
   }
 
+  // Refresh the frozen injection after compaction, as Claude Code does.
+  // Registered regardless of autoLearn: this is injection policy, not review.
+  pi.on("session_compact", handleSessionCompact);
+
   // Reset caches on session lifecycle events
   pi.on("session_start", (_event, ctx) => {
     currentSessionId = getSessionId(ctx);
@@ -199,6 +211,23 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
       },
     );
   });
+}
+
+/** Handle session_compact: drop the frozen injection so the next
+ * before_agent_start recomputes it from the store on disk.
+ *
+ * This is the post-compaction event, fired only once a compaction has been
+ * applied. session_before_compact is deliberately not used for this: a handler
+ * there can still cancel the compaction, and dropping the injection for a
+ * compaction that never happened would void the prompt cache for nothing. */
+function handleSessionCompact(event: SessionCompactEvent, ctx: ExtensionContext): void {
+  frozenInjection = null;
+  withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    () => {
+      debugLog("session.compact", { reason: event.reason, refreshInjection: true });
+    },
+  );
 }
 
 /** Handle session_before_compact: fire auto-learn over the pre-compaction
@@ -763,10 +792,10 @@ function launchAutoLearn(
       ) {
         reviewedRevision = revAtLaunch;
       }
-      // IMPORTANT: do NOT invalidate the frozen injection. Auto-learn writes
-      // take effect next session — the model already has this context from
-      // the conversation. Invalidating here would bust the prompt cache for
-      // facts the model just saw.
+      // IMPORTANT: do NOT invalidate the frozen injection. No write does:
+      // the injection refreshes only at session start and after compaction
+      // (see the header comment). Invalidating here would bust the prompt
+      // cache for facts the model just saw.
       return written;
     })
     .catch((err) => {
@@ -906,18 +935,4 @@ function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
       t.unref?.();
     }),
   ]);
-}
-
-/** Invalidate the frozen injection.
- *
- * Called after write_memory/remove_memory modifies the memory store. The next
- * before_agent_start will recompute from disk and pick up the changes.
- *
- * This is a one-time cache miss on the next turn (system prompt changes because
- * new memory content appears). That's acceptable — the user explicitly wrote.
- *
- * Auto-learn does NOT call this — its writes take effect next session to
- * preserve the prompt cache prefix. */
-export function invalidateResolveCache(): void {
-  frozenInjection = null;
 }
