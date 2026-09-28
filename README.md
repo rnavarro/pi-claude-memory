@@ -122,6 +122,19 @@ an undiscoverable one unless you already know its filename. It searches the
 whole store — index and on-disk topic files both — and returns names to hand to
 `recall_memory`. It writes nothing.
 
+The query can be a natural question or a few keywords. Matching is
+case-insensitive, common words are ignored, and any remaining keyword is enough
+to match. Results are ranked by a field-weighted BM25 over the index title,
+summary and filename and the topic body (frontmatter is not searched as body),
+with the metadata fields weighted above the body and word rarity computed over
+the store on each call. An entry holding the exact query phrase ranks first,
+then one holding every keyword, so anything the old all-words search found
+still comes out on top. Every hit says which fields matched. Bodies are read
+through the same guarded read `recall_memory` uses. A symlinked or non-regular
+topic is excluded by the directory listing and never read, and an oversize or
+unreadable one is refused by the read guard and counted in the result; either
+way the entry is matched on its index line alone.
+
 ## Configuration
 
 Settings live in `~/.pi/agent/settings.json` under a `pi-claude-memory` key.
