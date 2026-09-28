@@ -1010,12 +1010,23 @@ export function resolveWikilinks(
   return { text, resolved, unresolved };
 }
 
-/** Read a memory file by name, returning full content with resolved wikilinks. */
-export function readMemory(
+/** Read and parse one topic file by name through the store's read guards.
+ *
+ * This is the single guarded read path for topic bodies: exact containment and
+ * plain-regular-file resolution (resolveTopicFile, which lstats and rejects
+ * symlinks, directories and FIFOs), then the TOPIC_FILE_MAX_BYTES cap, then the
+ * read. recall_memory and find_memory both go through it, so a search can never
+ * read a file that a recall would refuse. It logs only failures: find_memory
+ * calls it once per candidate, and a success line per file would flood the debug
+ * log on every search.
+ *
+ * A failed read or parse is returned as ok:false rather than thrown, so one bad
+ * file cannot take down a caller that is iterating the store. */
+export function readTopicFile(
   dir: MemoryDir,
   name: string,
 ):
-  | { ok: true; content: string; filePath: string; frontmatter: ParsedFrontmatter }
+  | { ok: true; raw: string; filePath: string; frontmatter: ParsedFrontmatter }
   | { ok: false; message: string } {
   const filePath = resolveTopicFile(dir, name);
   if (!filePath) {
@@ -1047,16 +1058,34 @@ export function readMemory(
     return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
   }
 
-  const content = readFileSync(filePath, "utf8");
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const frontmatter = parseMemoryContent(raw, basename(filePath), Date.now());
+    return { ok: true, raw, filePath, frontmatter };
+  } catch (err) {
+    debugLog("writer.read_error", { name, tier: dir.tier, error: String(err) });
+    return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
+  }
+}
+
+/** Read a memory file by name, returning full content with resolved wikilinks. */
+export function readMemory(
+  dir: MemoryDir,
+  name: string,
+):
+  | { ok: true; content: string; filePath: string; frontmatter: ParsedFrontmatter }
+  | { ok: false; message: string } {
+  const read = readTopicFile(dir, name);
+  if (!read.ok) return read;
+  const { raw, filePath, frontmatter } = read;
   const filename = basename(filePath);
-  const frontmatter = parseMemoryContent(content, filename, Date.now());
   const { text, resolved, unresolved } = resolveWikilinks(frontmatter.body, dir);
 
   debugLog("writer.read_ok", {
     filename,
     tier: dir.tier,
     label: dir.label,
-    contentLength: content.length,
+    contentLength: raw.length,
     wikilinksResolved: resolved.length,
     wikilinksUnresolved: unresolved.length,
   });

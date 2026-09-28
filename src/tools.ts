@@ -10,10 +10,11 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { debugLog } from "./debug-log.js";
+import { type FindField, queryTerms, rankEntries } from "./find-rank.js";
 import { invalidateResolveCache, withToolLogContext } from "./index.js";
 import { parseIndexFile, reconcileIndex } from "./index-parser.js";
 import type { MemoryOpResult } from "./memory-writer.js";
-import { readMemory, removeMemory, writeMemory } from "./memory-writer.js";
+import { readMemory, readTopicFile, removeMemory, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir } from "./types.js";
 
@@ -109,6 +110,10 @@ interface FindHit {
   summary: string;
   /** Index line number, or null when no index line points at the file. */
   line: number | null;
+  /** Fields containing at least one keyword, in display order. */
+  fields: FindField[];
+  score: number;
+  tier: 0 | 1 | 2;
 }
 
 /** Find a memory entry by keyword across the FULL store, not the injected prefix.
@@ -119,20 +124,26 @@ interface FindHit {
  * This is the discovery half of that fix: the reader still shows the prefix, and
  * this searches everything.
  *
- * It writes nothing and reads only the index (guarded and size-capped) plus one
- * directory listing, so it cannot disturb the store or race the writer. */
+ * Any keyword matches; results are ranked by rankEntries (field-weighted BM25
+ * over title, summary, filename and body, with exact-phrase and all-keyword hits
+ * first). Bodies are read through readTopicFile, the same guarded path
+ * recall_memory uses (containment, plain regular file, size cap); a file it
+ * refuses is matched on its metadata alone rather than failing the search. It
+ * writes nothing, so it cannot disturb the store or race the writer. */
 const findTool = defineTool({
   name: "find_memory",
   label: "Search Memory",
   description:
-    "Find memory entry names by keyword across this project's WHOLE memory store. " +
+    "Search this project's WHOLE memory store (titles, summaries, filenames and topic bodies) and return entry names ranked by relevance. " +
     "The injected index is cut at Claude Code's startup limit (200 lines or 25 KB), so entries " +
     "below that cut are invisible to the prompt even though they are present and recallable. " +
-    "Search before concluding a memory does not exist. Returns names for recall_memory, not bodies.",
+    "Search before concluding a memory does not exist. Pass a natural question or a few distinctive keywords; " +
+    "any keyword can match, and entries containing the exact phrase or every keyword rank first. " +
+    "Each hit says which fields matched. Returns names for recall_memory, not bodies.",
   parameters: Type.Object({
     query: Type.String({
       description:
-        "Case-insensitive keywords. Every word must appear in the entry's title, summary, or filename.",
+        "A natural-language question or a few keywords, case-insensitive. Common words are ignored; an entry matches if it contains any remaining keyword, and ranks higher the more rare keywords it holds, especially in its title or summary. Distinctive names (hosts, tools, error strings) work best.",
     }),
     limit: Type.Optional(
       Type.Number({
@@ -141,7 +152,7 @@ const findTool = defineTool({
     ),
   }),
   promptSnippet:
-    "find_memory - Find a memory entry's name by keyword when the injected index is truncated.",
+    "find_memory - Search the whole memory store (including bodies) with a question or keywords when the injected index is truncated.",
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
     const refusal = tierRefusal(params);
     if (refusal) {
@@ -161,11 +172,7 @@ const findTool = defineTool({
       };
     }
 
-    const terms = params.query
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((t) => t.length > 0);
-    if (terms.length === 0) {
+    if (queryTerms(params.query).length === 0) {
       return {
         content: [{ type: "text", text: "find_memory needs at least one keyword." }],
         details: undefined as unknown,
@@ -176,44 +183,82 @@ const findTool = defineTool({
         ? Math.floor(params.limit)
         : FIND_DEFAULT_LIMIT;
     const limit = Math.max(1, Math.min(FIND_MAX_LIMIT, requested));
-    const matches = (haystack: string) => terms.every((t) => haystack.includes(t));
 
     const parsed = parseIndexFile(dir);
-    const hits: FindHit[] = [];
-    const claimed = new Set<string>();
+    const recon = reconcileIndex(parsed ?? { lines: [], entries: [] }, dir.dir);
+    // An index line whose file is gone has no body to search. Skipping it here
+    // also keeps the read path's slug-scan fallback (a directory listing per
+    // unresolved name) from running once per dangling line.
+    const missing = new Set(recon.missing.map((e) => basename(e.href).toLowerCase()));
+    let unreadable = 0;
+    const bodyOf = (name: string): string | null => {
+      if (missing.has(name.toLowerCase())) return null;
+      const read = readTopicFile(dir, name);
+      if (!read.ok) {
+        unreadable++;
+        return null;
+      }
+      return read.frontmatter.body;
+    };
 
-    // Indexed entries, newest first. The index is append-ordered, so the line
-    // number is the only recency signal the index itself carries — priority and
-    // modified live in the topic frontmatter, and reading a thousand of those to
-    // rank a keyword search costs more than it returns. Newest-first also puts
-    // the entries most likely to be missing from the injected prefix on top,
-    // which is the case this tool exists for.
+    // Candidates: every indexed entry (first line wins for a duplicated file),
+    // then every topic file no index line points at. The latter is still
+    // recallable by name and is exactly the silent-invisibility case a search
+    // should surface; it has no index title or summary, so its stem stands in.
+    const candidates: { name: string; title: string; summary: string; line: number | null }[] = [];
+    const claimed = new Set<string>();
     for (const entry of parsed?.entries ?? []) {
       const name = basename(entry.href);
-      const key = name.toLowerCase();
-      if (claimed.has(key)) continue;
-      if (!matches(`${entry.title}\n${entry.summary}\n${entry.href}`.toLowerCase())) continue;
-      claimed.add(key);
-      hits.push({ name, title: entry.title, summary: entry.summary, line: entry.lineNumber });
+      if (claimed.has(name.toLowerCase())) continue;
+      claimed.add(name.toLowerCase());
+      candidates.push({
+        name,
+        title: entry.title,
+        summary: entry.summary,
+        line: entry.lineNumber,
+      });
     }
-    hits.sort((a, b) => (b.line ?? 0) - (a.line ?? 0));
-
-    // A topic file no index line points at is still recallable by name, and it is
-    // exactly the silent-invisibility case a search should surface rather than
-    // conceal. Its title lives in frontmatter, which this does not read, so it
-    // matches on filename alone.
-    const recon = reconcileIndex(parsed ?? { lines: [], entries: [] }, dir.dir);
-    const unindexed: FindHit[] = [];
     for (const filename of recon.unindexed) {
-      const key = filename.toLowerCase();
-      if (claimed.has(key)) continue;
-      const stem = filename.replace(/\.md$/, "");
-      if (!matches(`${stem}\n${filename}`.toLowerCase())) continue;
-      claimed.add(key);
-      unindexed.push({ name: filename, title: stem, summary: "", line: null });
+      if (claimed.has(filename.toLowerCase())) continue;
+      claimed.add(filename.toLowerCase());
+      candidates.push({
+        name: filename,
+        title: filename.replace(/\.md$/, ""),
+        summary: "",
+        line: null,
+      });
     }
-    unindexed.sort((a, b) => a.name.localeCompare(b.name));
-    hits.push(...unindexed);
+
+    const results = rankEntries(
+      params.query,
+      candidates.map((c) => ({
+        title: c.title,
+        summary: c.summary,
+        filename: c.name,
+        body: bodyOf(c.name),
+      })),
+    );
+    const hits: FindHit[] = [];
+    candidates.forEach((c, i) => {
+      const r = results[i];
+      if (r && r.score > 0) hits.push({ ...c, ...r });
+    });
+    // Exact tiers first, then score. Ties go to the newest index line (the index
+    // is append-ordered, so the line number is its only recency signal), then to
+    // unindexed files by name.
+    hits.sort(
+      (a, b) =>
+        b.tier - a.tier ||
+        b.score - a.score ||
+        (b.line ?? -1) - (a.line ?? -1) ||
+        a.name.localeCompare(b.name),
+    );
+    debugLog("tool.find_memory_scan", {
+      hits: hits.length,
+      exact: hits.filter((h) => h.tier > 0).length,
+      searched: candidates.length,
+      unreadable,
+    });
 
     const searched = (parsed?.entries.length ?? 0) + recon.unindexed.length;
     const shown = hits.slice(0, limit);
@@ -224,16 +269,22 @@ const findTool = defineTool({
           : hit.summary;
       const detail = summary.length > 0 ? ` — ${summary}` : "";
       const where = hit.line === null ? "no index line" : `index line ${hit.line}`;
-      return `- ${hit.name} — ${hit.title}${detail}  [${where}]`;
+      const exact = hit.tier === 2 ? "; exact phrase" : hit.tier === 1 ? "; all keywords" : "";
+      return `- ${hit.name} — ${hit.title}${detail}  [${where}; matched: ${hit.fields.join(", ")}${exact}]`;
     });
 
     const header =
       hits.length === 0
         ? `No entries match ${JSON.stringify(params.query)} in this project's memory store (${searched} entries searched).`
-        : `${hits.length} of ${searched} entries match ${JSON.stringify(params.query)}, newest first. Pass an exact name to recall_memory.`;
+        : `${hits.length} of ${searched} entries match ${JSON.stringify(params.query)}, most relevant first. Pass an exact name to recall_memory.`;
     const notes: string[] = [];
     if (hits.length > shown.length) {
-      notes.push(`Showing the first ${shown.length}; narrow the query or raise limit.`);
+      notes.push(`Showing the first ${shown.length}; add distinctive keywords or raise limit.`);
+    }
+    if (unreadable > 0) {
+      notes.push(
+        `${unreadable} topic file(s) could not be read (oversize or unreadable), so they were matched on title, summary and filename only.`,
+      );
     }
     if (!parsed) {
       notes.push(
