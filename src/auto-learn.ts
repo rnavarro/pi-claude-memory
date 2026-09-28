@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { findContentIssues, scanMemoryCandidate } from "./content-scan.js";
 import { debugLog } from "./debug-log.js";
 import { parseIndexFile } from "./index-parser.js";
 import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
@@ -75,7 +76,7 @@ If there is nothing worth extracting, return an empty array: []
 
 Return ONLY the JSON array. No prose, no code fence.`;
 
-interface MemoryCandidate {
+export interface MemoryCandidate {
   name: string;
   description: string;
   type: "feedback" | "reference" | "project" | "user";
@@ -211,7 +212,11 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
 
   debugLog("auto_learn.llm_response", {
     replyChars: replyText.length,
-    replyPreview: replyText.slice(0, 200),
+    // The preview is logged before candidates are scanned, so a reply that
+    // carries a secret value is withheld whole rather than logged in clear.
+    replyPreview: findContentIssues(replyText).some((f) => f.kind === "secret")
+      ? "(withheld: reply contains a secret value)"
+      : replyText.slice(0, 200),
     candidatesParsed: candidates.length,
   });
 
@@ -229,7 +234,26 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     return 0;
   }
 
-  // Write each candidate. Count successes.
+  return writeCandidates(candidates, resolved, mtimes, cwd, signal);
+}
+
+/**
+ * Write validated candidates, one at a time. Returns the number written.
+ *
+ * Every candidate is content-scanned FIRST, before anything that can touch
+ * disk (store creation, overwrite backup to .trash, the write itself): an
+ * auto-learned title and description become an index line injected into
+ * every later turn, so a prompt injection or a secret value must never land.
+ * Rejection is per entry — the rest of the batch still writes. The explicit
+ * write_memory tool is not scanned: there the user is the author.
+ */
+export function writeCandidates(
+  candidates: MemoryCandidate[],
+  resolved: ResolveResult,
+  mtimes: Map<string, number>,
+  cwd: string,
+  signal?: AbortSignal,
+): number {
   let written = 0;
   for (const c of candidates) {
     // Abort between candidates: a shutdown-timeout abort raised mid-loop
@@ -237,6 +261,17 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     if (signal?.aborted) {
       debugLog("auto_learn.skip_writes_aborted", { remaining: candidates.length - written });
       break;
+    }
+    // Content scan before any disk change. Reasons carry masked snippets
+    // only, so the debug log never holds the secret it refused to store.
+    const scan = scanMemoryCandidate(c);
+    if (!scan.ok) {
+      // A secret in the title would leak through the logged name itself.
+      debugLog("auto_learn.content_rejected", {
+        name: logSafeName(c.name),
+        reasons: scan.reasons,
+      });
+      continue;
     }
     // One store. A missing store is created on first write (a fresh install
     // has none); if that fails, skip this candidate rather than dropping the
@@ -313,6 +348,14 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   return written;
 }
 
+/** A candidate name as it may appear in the debug log: withheld whole when
+ *  it holds a secret value, since the name is logged verbatim. */
+function logSafeName(name: string): string {
+  return findContentIssues(name).some((f) => f.kind === "secret")
+    ? "(withheld: name holds a secret)"
+    : name;
+}
+
 /** Parse a JSON array of MemoryCandidate from the LLM reply, tolerating fences and prose. */
 export function parseCandidates(reply: string): MemoryCandidate[] {
   // Strip code fences if present
@@ -347,7 +390,9 @@ export function parseCandidates(reply: string): MemoryCandidate[] {
           .slice(0, 5)
           .map((c) => {
             const o = c as { name?: unknown; tier?: unknown };
-            return { name: String(o?.name ?? "?"), tier: String(o?.tier ?? "?") };
+            // Logged before any content scan, so a name holding a secret
+            // value is withheld here too.
+            return { name: logSafeName(String(o?.name ?? "?")), tier: String(o?.tier ?? "?") };
           }),
       });
     }
