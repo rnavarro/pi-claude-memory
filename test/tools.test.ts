@@ -6,7 +6,15 @@
 // none either: the second tier, its cross-tier fallback, the cross-store index
 // sweep, and the `tier` parameter are all gone.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -18,6 +26,7 @@ import {
   removeMemoryTool,
   writeMemoryTool,
 } from "../src/tools.js";
+import { TOPIC_FILE_MAX_BYTES } from "../src/types.js";
 
 let tmpHome: string;
 let origHome: string | undefined;
@@ -379,16 +388,67 @@ describe("find_memory reaches what the injected prefix cannot show", () => {
     expect(text).toContain("1 of 261");
   });
 
-  it("requires every keyword, and matches title, summary or filename", async () => {
+  it("matches any keyword, case-insensitively, in title, summary or filename", async () => {
     const cwd = join(tmpHome, "work", "keywords");
     makeStore(cwd, "# P\n- [Alpha](alpha.md) — beta gamma\n- [Delta](delta.md) — epsilon\n", {
       "alpha.md": "a\n",
       "delta.md": "d\n",
     });
 
-    expect(textOf(await search(cwd, { query: "beta gamma" }))).toContain("alpha.md");
-    expect(textOf(await search(cwd, { query: "beta epsilon" }))).toContain("No entries match");
+    // Changed from all-words semantics: a keyword in either entry is enough.
+    const either = textOf(await search(cwd, { query: "beta epsilon" }));
+    expect(either).toContain("alpha.md");
+    expect(either).toContain("delta.md");
     expect(textOf(await search(cwd, { query: "DELTA" }))).toContain("delta.md");
+    expect(textOf(await search(cwd, { query: "zeta" }))).toContain("No entries match");
+  });
+
+  it("ignores stopwords, so a natural question does not match every entry", async () => {
+    const cwd = join(tmpHome, "work", "stopwords");
+    makeStore(cwd, "# P\n- [Filler](filler.md) — f\n- [Pane Input](pane-input.md) — p\n", {
+      "filler.md": "---\nname: x\n---\nwhat is the way to do it\n",
+      "pane-input.md": "---\nname: x\n---\nsend keystrokes with herdr pane send-keys\n",
+    });
+
+    const text = textOf(
+      await search(cwd, { query: "How do I push keystrokes into another pane?" }),
+    );
+    expect(text).toContain("pane-input.md");
+    expect(text).not.toContain("filler.md");
+  });
+
+  it("ranks an entry holding every keyword above a stronger partial match", async () => {
+    const cwd = join(tmpHome, "work", "all-words-tier");
+    // "common" is everywhere, so it carries almost no weight; the partial entry
+    // repeats the one rare word and would win on score alone.
+    const filler = Array.from({ length: 20 }, (_, i) => `- [F${i}](f${i}.md) — common`);
+    const files: Record<string, string> = {
+      "partial.md": "---\nname: x\n---\nzorblat zorblat zorblat\n",
+      "complete.md": `---\nname: x\n---\n${"padding words here ".repeat(40)}common zorblat\n`,
+    };
+    for (let i = 0; i < 20; i++) files[`f${i}.md`] = "---\nname: x\n---\nf\n";
+    makeStore(
+      cwd,
+      `# P\n${filler.join("\n")}\n- [Complete](complete.md) — c\n- [Partial](partial.md) — p\n`,
+      files,
+    );
+
+    const text = textOf(await search(cwd, { query: "zorblat common" }));
+    expect(text.indexOf("complete.md")).toBeGreaterThan(-1);
+    expect(text.indexOf("complete.md")).toBeLessThan(text.indexOf("partial.md"));
+    expect(text).toMatch(/complete\.md .*all keywords\]/);
+  });
+
+  it("ranks an exact phrase above the same keywords scattered", async () => {
+    const cwd = join(tmpHome, "work", "phrase-tier");
+    makeStore(cwd, "# P\n- [Phrase](phrase.md) — p\n- [Scattered](scattered.md) — s\n", {
+      "phrase.md": `---\nname: x\n---\n${"filler text ".repeat(40)}the retention window\n`,
+      "scattered.md": "---\nname: x\n---\nretention retention and window window\n",
+    });
+
+    const text = textOf(await search(cwd, { query: "retention window" }));
+    expect(text.indexOf("phrase.md")).toBeLessThan(text.indexOf("scattered.md"));
+    expect(text).toMatch(/phrase\.md .*exact phrase\]/);
   });
 
   it("reports a topic file with no index line instead of concealing it", async () => {
@@ -400,7 +460,7 @@ describe("find_memory reaches what the injected prefix cannot show", () => {
     expect(text).toContain("no index line");
   });
 
-  it("puts the newest entries first, because the index is append-ordered", async () => {
+  it("breaks score ties newest first, because the index is append-ordered", async () => {
     const cwd = join(tmpHome, "work", "order");
     makeStore(cwd, "# P\n- [Old Hit](old-hit.md) — target\n- [New Hit](new-hit.md) — target\n", {
       "old-hit.md": "o\n",
@@ -430,6 +490,87 @@ describe("find_memory reaches what the injected prefix cannot show", () => {
 
     await search(cwd, { query: "one" });
     expect(readFileSync(store.indexPath)).toEqual(before);
+  });
+
+  it("matches a keyword that appears only in the topic body, and says so", async () => {
+    const cwd = join(tmpHome, "work", "body-only");
+    makeStore(cwd, "# P\n- [Router Notes](router-notes.md) — edge config\n", {
+      "router-notes.md": "---\nname: x\n---\nThe WireGuard peer uses port 51820.\n",
+    });
+
+    const text = textOf(await search(cwd, { query: "wireguard 51820" }));
+    expect(text).toContain("router-notes.md");
+    expect(text).toContain("matched: body");
+  });
+
+  it("does not treat frontmatter as body", async () => {
+    const cwd = join(tmpHome, "work", "frontmatter");
+    makeStore(cwd, "# P\n- [Plain](plain.md) — p\n", {
+      "plain.md": "---\nname: x\ndescription: zanzibar\n---\nnothing here\n",
+    });
+
+    expect(textOf(await search(cwd, { query: "zanzibar" }))).toContain("No entries match");
+  });
+
+  it("weights a title, summary or filename hit above a body-only hit", async () => {
+    const cwd = join(tmpHome, "work", "rank");
+    // The body hit is on the NEWER line, so newest-first alone would put it on top.
+    makeStore(
+      cwd,
+      "# P\n- [Kafka Retention](kafka-retention.md) — r\n- [Broker Notes](broker-notes.md) — b\n",
+      {
+        "kafka-retention.md": "---\nname: x\n---\nr\n",
+        "broker-notes.md": "---\nname: x\n---\nkafka kafka kafka\n",
+      },
+    );
+
+    const text = textOf(await search(cwd, { query: "kafka" }));
+    expect(text).toContain("broker-notes.md");
+    expect(text.indexOf("kafka-retention.md")).toBeLessThan(text.indexOf("broker-notes.md"));
+    expect(text).toMatch(/kafka-retention\.md .*matched: title, filename;/);
+  });
+
+  it("lets a query split across title and body match, reporting both fields", async () => {
+    const cwd = join(tmpHome, "work", "split");
+    makeStore(cwd, "# P\n- [Ceph Pools](ceph-pools.md) — storage\n", {
+      "ceph-pools.md": "---\nname: x\n---\nreplication size is three\n",
+    });
+
+    const text = textOf(await search(cwd, { query: "ceph replication" }));
+    expect(text).toContain("ceph-pools.md");
+    expect(text).toContain("matched: title, filename, body");
+  });
+
+  it("finds a topic file with no index line by its body", async () => {
+    const cwd = join(tmpHome, "work", "unindexed-body");
+    makeStore(cwd, "# P\n", { "stray.md": "---\nname: x\n---\nquokka sighting\n" });
+
+    const text = textOf(await search(cwd, { query: "quokka" }));
+    expect(text).toContain("stray.md");
+    expect(text).toContain("no index line; matched: body");
+  });
+
+  it("skips an oversize body instead of reading it, and still matches its metadata", async () => {
+    const cwd = join(tmpHome, "work", "oversize");
+    const huge = `---\nname: x\n---\n${"secretword ".repeat(TOPIC_FILE_MAX_BYTES / 10)}\n`;
+    makeStore(cwd, "# P\n- [Big Entry](big.md) — large\n", { "big.md": huge });
+
+    const missed = textOf(await search(cwd, { query: "secretword" }));
+    expect(missed).toContain("No entries match");
+    expect(missed).toContain("1 topic file(s) could not be read");
+    expect(textOf(await search(cwd, { query: "big" }))).toContain("big.md");
+  });
+
+  it("never follows a symlinked topic to read its target", async () => {
+    const cwd = join(tmpHome, "work", "symlink");
+    const store = makeStore(cwd, "# P\n- [Linked](linked.md) — l\n");
+    const outside = join(tmpHome, "outside.md");
+    writeFileSync(outside, "---\nname: x\n---\nexfiltrated\n");
+    symlinkSync(outside, join(store.dir, "linked.md"));
+    mkdirSync(join(store.dir, "folder.md"));
+
+    expect(textOf(await search(cwd, { query: "exfiltrated" }))).toContain("No entries match");
+    expect(textOf(await search(cwd, { query: "linked" }))).toContain("linked.md");
   });
 
   it("says so when this project has no store", async () => {
