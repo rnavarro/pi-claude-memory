@@ -245,7 +245,8 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
  * auto-learned title and description become an index line injected into
  * every later turn, so a prompt injection or a secret value must never land.
  * Rejection is per entry — the rest of the batch still writes. The explicit
- * write_memory tool is not scanned: there the user is the author.
+ * write_memory tool is scanned too, since the model authors those calls, but
+ * for injection and invisible characters only (see scanWriteToolInput).
  */
 export function writeCandidates(
   candidates: MemoryCandidate[],

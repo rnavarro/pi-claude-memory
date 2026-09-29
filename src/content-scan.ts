@@ -1,4 +1,5 @@
-// Content scan for auto-learned memory candidates.
+// Content scan for memory writes: auto-learned candidates (every rule) and
+// explicit write_memory calls (injection and invisible-character rules only).
 //
 // Auto-learn writes text an LLM extracted from a conversation, and that text
 // can carry whatever the conversation carried: a pasted token, or instructions
@@ -59,7 +60,7 @@ function clip(s: string, max = 60): string {
 /** Role and boundary tag names: system blocks, this plugin's own memory
  *  boundary, and chat roles. Used as a regex alternation. */
 const ROLE_TAG_NAMES =
-  "system|system[-_]prompt|system[-_]reminder|instructions?|memory|memory[-_]index|stored[-_]memory|assistant|user|human|developer";
+  "system|system[-_]prompt|system[-_]reminder|instructions?|memory|memory[-_]index|memory[-_]note|memory[-_]search|stored[-_]memory|assistant|user|human|developer";
 
 const INJECTION_RULES: { rule: string; re: RegExp }[] = [
   {
@@ -290,18 +291,30 @@ function findSecrets(text: string): ContentFinding[] {
 // Public API
 // ---------------------------------------------------------------------------
 
-/** Every finding in one piece of text. */
-export function findContentIssues(text: string): ContentFinding[] {
+/** The finding kinds a scan can run. */
+export type ContentFindingKind = ContentFinding["kind"];
+
+const ALL_KINDS: readonly ContentFindingKind[] = ["injection", "invisible", "secret"];
+
+/** Every finding in one piece of text, limited to `kinds` (all by default). */
+export function findContentIssues(
+  text: string,
+  kinds: readonly ContentFindingKind[] = ALL_KINDS,
+): ContentFinding[] {
   const findings: ContentFinding[] = [];
-  for (const { rule, re } of INJECTION_RULES) {
-    const m = re.exec(text);
-    if (m) findings.push({ kind: "injection", rule, snippet: clip(m[0]) });
+  if (kinds.includes("injection")) {
+    for (const { rule, re } of INJECTION_RULES) {
+      const m = re.exec(text);
+      if (m) findings.push({ kind: "injection", rule, snippet: clip(m[0]) });
+    }
   }
-  for (const { rule, re } of INVISIBLE_RULES) {
-    const m = re.exec(text);
-    if (m) findings.push({ kind: "invisible", rule, snippet: codepoint(m[0]) });
+  if (kinds.includes("invisible")) {
+    for (const { rule, re } of INVISIBLE_RULES) {
+      const m = re.exec(text);
+      if (m) findings.push({ kind: "invisible", rule, snippet: codepoint(m[0]) });
+    }
   }
-  findings.push(...findSecrets(text));
+  if (kinds.includes("secret")) findings.push(...findSecrets(text));
   return findings;
 }
 
@@ -332,7 +345,10 @@ export interface ScannableCandidate {
  * description become the MEMORY.md index line, injected every turn; the body
  * is what recall_memory returns. Any finding in any field rejects the entry.
  */
-export function scanMemoryCandidate(c: ScannableCandidate): ContentScanResult {
+export function scanMemoryCandidate(
+  c: ScannableCandidate,
+  kinds: readonly ContentFindingKind[] = ALL_KINDS,
+): ContentScanResult {
   const reasons: string[] = [];
   const fields: [string, string][] = [
     ["title", c.name],
@@ -341,7 +357,7 @@ export function scanMemoryCandidate(c: ScannableCandidate): ContentScanResult {
   ];
   const inIndexFields = new Set<string>();
   for (const [field, value] of fields) {
-    for (const f of findContentIssues(value)) {
+    for (const f of findContentIssues(value, kinds)) {
       reasons.push(`${f.kind}:${f.rule} in ${field} (${f.snippet})`);
       if (field !== "body") inIndexFields.add(`${f.kind}:${f.rule}:${f.snippet}`);
     }
@@ -349,9 +365,24 @@ export function scanMemoryCandidate(c: ScannableCandidate): ContentScanResult {
   // The index line joins title and description, so a phrase split across the
   // two ("Ignore all previous" + "instructions: ...") is only visible joined.
   // A finding already reported for one field alone is not repeated.
-  for (const f of findContentIssues(`${c.name} ${c.description}`)) {
+  for (const f of findContentIssues(`${c.name} ${c.description}`, kinds)) {
     if (inIndexFields.has(`${f.kind}:${f.rule}:${f.snippet}`)) continue;
     reasons.push(`${f.kind}:${f.rule} in title+description (${f.snippet})`);
   }
   return reasons.length === 0 ? { ok: true } : { ok: false, reasons };
+}
+
+/** The finding kinds the explicit write_memory tool is scanned for.
+ *
+ * write_memory's arguments are authored by the model, not typed by the user, so
+ * a prompt injection planted in a tool result can reach them just as it reaches
+ * an auto-learn candidate. Secret rules are left out on this path: saving a
+ * credential the user asked to keep is a deliberate choice, and the secret
+ * rules' false positives would block ordinary requests. */
+export const WRITE_TOOL_SCAN_KINDS: readonly ContentFindingKind[] = ["injection", "invisible"];
+
+/** Scan a write_memory call: the same fields and joined index line as
+ *  scanMemoryCandidate, with the injection and invisible-character rules only. */
+export function scanWriteToolInput(c: ScannableCandidate): ContentScanResult {
+  return scanMemoryCandidate(c, WRITE_TOOL_SCAN_KINDS);
 }
