@@ -64,9 +64,13 @@ duplicate. It runs on shutdown and before compaction as well.
 
 **Content safety.** Memory is injected into every later session, so a bad
 entry is a persistent prompt injection or a persistent leak. Two layers guard
-against that:
+against that. Neither is a general prompt-injection defense: the scan is a leak
+filter for known secret formats plus a few common injection phrasings, and the
+data boundary is a soft mitigation. Known misses include instructions phrased
+as "SYSTEM: ..." or "IMPORTANT: run ...", non-English text, and passwords with
+no digits.
 
-- *Write-time scan (auto-learn only).* Before an auto-learned candidate touches
+- *Write-time scan.* Before an auto-learned candidate touches
   disk (store creation, the overwrite backup to `.trash/`, the write itself),
   its title, description and body are scanned (`src/content-scan.ts`). It is
   rejected for prompt-injection phrasing ("ignore previous instructions",
@@ -84,8 +88,15 @@ against that:
   `GRAFANA_SERVICE_ACCOUNT_TOKEN`, an "API Token" field name, as do hyphenated
   names and model ids, hashes after `sha256:` or `commit:`, and SSH public
   keys. A rejection drops that one candidate, not the batch, and is logged to
-  the debug log with secrets masked to their first four characters. The
-  explicit `write_memory` tool is not scanned; there the user is the author.
+  the debug log with secrets masked to their first four characters.
+
+  The explicit `write_memory` tool is scanned too, because the model, not the
+  user, authors its arguments, and a planted instruction can reach them. It
+  runs the injection and invisible-character rules only, not the secret rules,
+  on the same fields and the joined index line, before any disk change
+  (including store creation). A hit writes nothing and returns a refusal naming
+  the rule. When the user explicitly asked to save that exact text, the call
+  can be repeated with `allowFlaggedContent: true`; the override is logged.
 - *Inject-time boundary.* The injected `MEMORY.md` excerpt is wrapped in
   `<memory-index>` tags, introduced by this line: "The index between the
   memory-index tags holds notes saved in earlier sessions: facts and
@@ -94,7 +105,10 @@ against that:
   (written by Claude Code, by hand, or before the scan existed). The wrapper is
   added after the 200-line / 25 KB cut and does not count against it; an
   embedded `</memory-index>` is entity-escaped in the injected copy only.
-  `MEMORY.md` on disk is unchanged.
+  `MEMORY.md` on disk is unchanged. Tool output gets the same treatment: a
+  body returned by `recall_memory` is wrapped in `<memory-note>` tags, and the
+  hit lines `find_memory` returns in `<memory-search>` tags, each with its own
+  notice line and its own closing tag escaped.
 
 **Index overflow.** That cutoff is a read limit on a file that only ever grows,
 so a busy store eventually pushes every new entry past it: the facts a session
@@ -130,7 +144,8 @@ an undiscoverable one unless you already know its filename. It searches the
 whole store — index and on-disk topic files both — and returns names to hand to
 `recall_memory`. It writes nothing.
 
-The query can be a natural question or a few keywords. Matching is
+Pass the user's question or a full sentence of context rather than a reduced
+keyword list; exact names still help when you have them. Matching is
 case-insensitive, common words are ignored, and any remaining keyword is enough
 to match. Results are ranked by a field-weighted BM25 over the index title,
 summary and filename and the topic body (frontmatter is not searched as body),
