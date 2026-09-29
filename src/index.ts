@@ -17,6 +17,7 @@ import type {
   BeforeAgentStartEventResult,
   ExtensionAPI,
   ExtensionContext,
+  InputEvent,
   SessionBeforeCompactEvent,
   SessionCompactEvent,
   SessionEntry,
@@ -27,6 +28,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type AutoLearnConfig, runAutoLearn } from "./auto-learn.js";
 import { loadConfig, type PiClaudeMemoryConfig } from "./config.js";
+import { detectCorrectionPattern } from "./correction.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { buildMemoryInjection } from "./injector.js";
 import { orphanSignpost, resolveMemoryDirs } from "./resolver.js";
@@ -113,6 +115,38 @@ interface PendingCompact {
 }
 let pendingCompact: PendingCompact | null = null;
 
+// Tool results since the last settle-launched review, for the tool-call
+// trigger (reviewEveryToolCalls). Counts every tool_result, including ones
+// with no text, and resets whenever turnCount does.
+let toolCallCount = 0;
+
+// Correction trigger state (reviewOnCorrection).
+//
+// Detection happens on `input`, but the review launches at agent_settled:
+// when `input` fires, the user's message is not in the branch yet, so a
+// review launched there would miss the very correction it exists for. By
+// settle the branch holds the correction and the reply to it.
+//
+// correctionDetected: a correction arrived and no review has covered it yet.
+// pendingCorrection: a settle found a review already in flight, so the
+//   correction waits for it; launchAutoLearn's completion handler drains it
+//   (after any queued compaction snapshot). Holds the settle ctx for the
+//   drain. Never dropped: if the debounce blocks the drain it stays queued
+//   for the next settle, and the shutdown review covers it regardless (the
+//   detection bumped materialRevision).
+let correctionDetected = false;
+
+// The text of the outstanding correction, held in memory only (never logged)
+// so a pre-compaction review can tell whether its snapshot contains it. Null
+// once the correction is consumed.
+let correctionText: string | null = null;
+let pendingCorrection: ExtensionContext | null = null;
+
+// Date.now() of the last TRIGGERED (correction or tool-call) review launch,
+// for reviewTriggerDebounceSeconds. The periodic turn trigger neither checks
+// nor stamps it.
+let lastTriggeredReviewAt = Number.NEGATIVE_INFINITY;
+
 // Recent tool results captured for auto-learn context.
 const TOOL_RESULT_MAX_CHARS = 8000;
 let toolResultChunk = "";
@@ -151,6 +185,9 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     reviewThinking: config.reviewThinking,
     reviewOnShutdown: config.reviewOnShutdown,
     reviewOnCompact: config.reviewOnCompact,
+    reviewOnCorrection: config.reviewOnCorrection,
+    reviewEveryToolCalls: config.reviewEveryToolCalls,
+    reviewTriggerDebounceSeconds: config.reviewTriggerDebounceSeconds,
   });
 
   // Phase 1: inject memory into the system prompt on every before_agent_start.
@@ -165,6 +202,11 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     pi.on("turn_end", handleTurnEnd);
     pi.on("tool_result", handleToolResult);
     pi.on("agent_settled", handleAgentSettled);
+
+    // Early review on a user correction: detected here, launched at settle.
+    if (config.reviewOnCorrection) {
+      pi.on("input", handleInput);
+    }
 
     // Fire auto-learn before compaction so pre-compaction conversation detail
     // is not permanently lost (after compaction getBranch() returns the
@@ -190,7 +232,12 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     currentSessionId = getSessionId(ctx);
     frozenInjection = null;
     turnCount = 0;
+    toolCallCount = 0;
     toolResultChunk = "";
+    correctionDetected = false;
+    pendingCorrection = null;
+    correctionText = null;
+    lastTriggeredReviewAt = Number.NEGATIVE_INFINITY;
     // A fresh session means fresh unreviewed material: revision state must
     // not leak the previous branch's "already reviewed" conclusion.
     materialRevision = 0;
@@ -300,6 +347,7 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         };
         return;
       }
+      consumeTriggersForCompactReview(truncated);
       void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated);
     },
   );
@@ -321,6 +369,14 @@ async function handleSessionShutdown(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     async () => {
       debugLog("session.shutdown", { reason: event.reason, turnCount });
+      // The final review below covers the full branch, correction included.
+      // Drop the correction queue now so a review settling while we await it
+      // cannot drain a smaller correction review in its place. The shutdown
+      // skip gate still sees the correction: detection bumped
+      // materialRevision.
+      correctionDetected = false;
+      pendingCorrection = null;
+      correctionText = null;
       // True handler wall time: the review-phase event timestamps clip at
       // the deadline, so this is the only place the ACTUAL shutdown cost
       // (astra's measurement gap) gets recorded.
@@ -568,6 +624,7 @@ function handleTurnEnd(_event: TurnEndEvent, ctx: ExtensionContext): void {
 
 /** Handle tool_result: capture tool output text for auto-learn context. */
 function handleToolResult(event: ToolResultEvent, ctx: ExtensionContext): void {
+  toolCallCount++;
   const text = toolResultToText(event);
   if (text) {
     toolResultChunk = appendToToolResultChunk(toolResultChunk, text);
@@ -579,67 +636,152 @@ function handleToolResult(event: ToolResultEvent, ctx: ExtensionContext): void {
   }
 }
 
-/** Handle agent_settled: fire background auto-learn every N turns. */
+/** Handle input: flag a user correction for an early review.
+ *
+ * Only flags it. The review launches at agent_settled, once the correction
+ * and the reply to it are in the branch (see correctionDetected). Input from
+ * another extension is not the user speaking and is ignored. Returns nothing,
+ * so the input passes through untouched. */
+function handleInput(event: InputEvent, ctx: ExtensionContext): void {
+  if (event.source === "extension") return;
+  const pattern = detectCorrectionPattern(event.text);
+  if (pattern === null) return;
+  correctionDetected = true;
+  correctionText = event.text.trim();
+  // The correction is unreviewed material. Bumping here means a review
+  // already in flight cannot mark it reviewed on completion, and the
+  // shutdown skip gate cannot skip it.
+  materialRevision++;
+  withDebugLogContext(
+    { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
+    // The pattern name only, never the message text: enough to tune the
+    // detector from the log without copying what the user wrote into it.
+    () => debugLog("correction.detected", { pattern }),
+  );
+}
+
+/** Whether a TRIGGERED review (correction, tool-call count) is still inside
+ * the debounce window of the last one. */
+function isTriggerDebounced(): boolean {
+  const windowMs = config.reviewTriggerDebounceSeconds * 1000;
+  return windowMs > 0 && Date.now() - lastTriggeredReviewAt < windowMs;
+}
+
+type SettleReason = "turns" | "correction" | "tool_calls" | "correction_drain";
+
+/** Handle agent_settled: fire a background review when a trigger is due.
+ *
+ * Three triggers share this one launch point: every reviewIntervalTurns
+ * turns (periodic), a detected user correction, and reviewEveryToolCalls
+ * tool results. Any launch consumes ALL of them (turn counter, tool counter,
+ * correction flag, tool-result buffer): the review covers the same recent
+ * branch whichever trigger fired, so a triggered review resets the periodic
+ * counter instead of letting it fire a second review over the same turns
+ * shortly after. The triggered two are debounced; the periodic one is not. */
 function handleAgentSettled(_event: AgentSettledEvent, ctx: ExtensionContext): void {
   withDebugLogContext(
     { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
     () => {
-      if (turnCount < config.reviewIntervalTurns) {
-        debugLog("auto_learn.skip", { turnCount, threshold: config.reviewIntervalTurns });
+      const turnDue = turnCount >= config.reviewIntervalTurns;
+      const correctionDue =
+        config.reviewOnCorrection && (correctionDetected || pendingCorrection !== null);
+      const toolDue =
+        config.reviewEveryToolCalls > 0 && toolCallCount >= config.reviewEveryToolCalls;
+      if (!turnDue && !correctionDue && !toolDue) {
+        debugLog("auto_learn.skip", {
+          turnCount,
+          threshold: config.reviewIntervalTurns,
+          toolCallCount,
+        });
         return;
       }
-      // If a review is already running, do NOT reset the counter or drain the
+      // If a review is already running, do NOT reset the counters or drain the
       // tool-result chunk — preserve them so the next settle fires with the
-      // accumulated context instead of starting from an empty window.
+      // accumulated context instead of starting from an empty window. A
+      // correction is queued for the in-flight review's completion handler,
+      // which launches it as soon as the slot frees.
       if (autoLearnInFlight) {
-        debugLog("auto_learn.skip_inflight", { turnCount });
+        if (correctionDue) {
+          pendingCorrection = ctx;
+          correctionDetected = false;
+        }
+        debugLog("auto_learn.skip_inflight", {
+          turnCount,
+          toolCallCount,
+          correctionQueued: pendingCorrection !== null,
+        });
         return;
       }
-      // Build conversation text from the session branch — this gives us user
-      // prompts, assistant text, and tool calls (tool results are truncated in
-      // the branch, so we supplement with the toolResultChunk).
-      const branchText = serializeBranch(ctx);
-      const toolText = toolResultChunk;
-
-      // Combine: branch has the conversation flow, toolText has the full tool outputs
-      const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
-
-      if (!chunk.trim()) {
-        // Do NOT reset the counter or drop the tool-result chunk here. An
-        // empty chunk usually means the branch read failed, and forfeiting the
-        // accumulated turns (and the tool output collected with them)
-        // postpones the review a whole interval for a window that was in fact
-        // captured.
-        debugLog("auto_learn.skip_empty_chunk", {});
+      // Debounce the triggered reviews only. A debounced trigger consumes
+      // nothing: the correction flag and counters stay for the next settle.
+      if (!turnDue && isTriggerDebounced()) {
+        debugLog("auto_learn.skip_debounce", {
+          correctionDue,
+          toolCallCount,
+          debounceSeconds: config.reviewTriggerDebounceSeconds,
+        });
         return;
       }
-
-      // Consumed only now that a review is definitely starting.
-      turnCount = 0;
-      toolResultChunk = "";
-
-      // Truncate to configured max, keeping the RECENT end. Compaction is the
-      // event meant to preserve recent raw material, so truncating from the
-      // head discarded exactly what it exists to keep.
-      const truncated = truncateReviewChunk(chunk, config.reviewMaxChunkChars);
-
-      debugLog("auto_learn.trigger", {
-        chunkChars: truncated.length,
-        branchChars: branchText.length,
-        toolResultChars: toolText.length,
-      });
-
-      const autoLearnCfg: AutoLearnConfig = {
-        everyTurns: config.reviewIntervalTurns,
-        model: config.reviewModel,
-        thinking: config.reviewThinking,
-        maxOutputTokens: config.reviewMaxOutputTokens,
-      };
-
-      // Fire-and-forget: never block the user's next turn.
-      void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated);
+      launchSettleReview(ctx, turnDue ? "turns" : correctionDue ? "correction" : "tool_calls");
     },
   );
+}
+
+/** Build the recent-branch chunk and launch a review for a settle trigger.
+ * Shared by agent_settled and the pending-correction drain, so every trigger
+ * consumes the same state and goes through launchAutoLearn (single flight,
+ * generation guard, owned AbortController, revision snapshot) and
+ * runAutoLearn (writeCandidates and its content scan). */
+function launchSettleReview(ctx: ExtensionContext, reason: SettleReason): void {
+  // Build conversation text from the session branch — this gives us user
+  // prompts, assistant text, and tool calls (tool results are truncated in
+  // the branch, so we supplement with the toolResultChunk).
+  const branchText = serializeBranch(ctx);
+  const toolText = toolResultChunk;
+
+  // Combine: branch has the conversation flow, toolText has the full tool outputs
+  const chunk = toolText ? `${branchText}\n\n### Tool Results\n${toolText}` : branchText;
+
+  if (!chunk.trim()) {
+    // Do NOT reset the counter or drop the tool-result chunk here. An
+    // empty chunk usually means the branch read failed, and forfeiting the
+    // accumulated turns (and the tool output collected with them)
+    // postpones the review a whole interval for a window that was in fact
+    // captured.
+    debugLog("auto_learn.skip_empty_chunk", { reason });
+    return;
+  }
+
+  // Consumed only now that a review is definitely starting.
+  turnCount = 0;
+  toolCallCount = 0;
+  toolResultChunk = "";
+  correctionDetected = false;
+  pendingCorrection = null;
+  correctionText = null;
+  if (reason !== "turns") lastTriggeredReviewAt = Date.now();
+
+  // Truncate to configured max, keeping the RECENT end. Compaction is the
+  // event meant to preserve recent raw material, so truncating from the
+  // head discarded exactly what it exists to keep.
+  const truncated = truncateReviewChunk(chunk, config.reviewMaxChunkChars);
+
+  debugLog("auto_learn.trigger", {
+    reason,
+    chunkChars: truncated.length,
+    branchChars: branchText.length,
+    toolResultChars: toolText.length,
+  });
+
+  const autoLearnCfg: AutoLearnConfig = {
+    everyTurns: config.reviewIntervalTurns,
+    model: config.reviewModel,
+    thinking: config.reviewThinking,
+    maxOutputTokens: config.reviewMaxOutputTokens,
+  };
+
+  // Fire-and-forget: never block the user's next turn.
+  void launchAutoLearn(ctx, autoLearnCfg, ctx.cwd, truncated);
 }
 
 /** Serialize the session branch to text for auto-learn input. */
@@ -813,10 +955,36 @@ function launchAutoLearn(
       // triggers see a clean slate.
       if (autoLearnInFlight === promise) autoLearnInFlight = null;
       if (autoLearnAbort === controller) autoLearnAbort = null;
+      // Compaction first: its material no longer exists in the branch, while
+      // a correction review rebuilds from the live branch at any time.
       drainPendingCompact();
+      drainPendingCorrection();
     });
 
   return promise;
+}
+
+/** Reset the settle triggers when a pre-compaction review launches.
+ *
+ * That review covers the turns and tool calls counted so far. Without the
+ * reset, the next settle fires a periodic or tool-call review over the
+ * compaction summary, which holds nothing the pre-compaction review did not
+ * already see. The correction flag is consumed only when the snapshot
+ * actually contains the correction's text: a correction typed after the
+ * snapshot was taken (or cut off by truncation) still needs its own review.
+ * The tool-result buffer is left alone, as before (see
+ * handleSessionBeforeCompact). */
+function consumeTriggersForCompactReview(chunk: string): void {
+  turnCount = 0;
+  toolCallCount = 0;
+  const covered =
+    correctionText !== null && correctionText !== "" && chunk.includes(correctionText);
+  if (covered) {
+    correctionDetected = false;
+    pendingCorrection = null;
+    correctionText = null;
+  }
+  debugLog("auto_learn.compact_consumed_triggers", { correctionCovered: covered });
 }
 
 /** Launch a queued compaction snapshot if one is waiting. Called from
@@ -832,7 +1000,27 @@ function drainPendingCompact(): void {
   // resolution — the just-finished review's new memories are visible to
   // supersession.
   debugLog("auto_learn.compact_drain", { chunkChars: p.chunk.length });
+  consumeTriggersForCompactReview(p.chunk);
   void launchAutoLearn(p.ctx, p.cfg, p.cwd, p.chunk);
+}
+
+/** Launch a correction that was queued behind an in-flight review. Called
+ * from launchAutoLearn's completion handler, after drainPendingCompact, and
+ * only when the slot is still free. The debounce still applies: a blocked
+ * drain leaves the correction queued (the next settle launches it, and the
+ * shutdown review covers it) rather than holding a timer and a ctx past the
+ * session. */
+function drainPendingCorrection(): void {
+  if (!pendingCorrection || autoLearnInFlight) return;
+  if (!config.reviewOnCorrection) {
+    pendingCorrection = null;
+    return;
+  }
+  if (isTriggerDebounced()) {
+    debugLog("auto_learn.correction_drain_debounced", {});
+    return;
+  }
+  launchSettleReview(pendingCorrection, "correction_drain");
 }
 
 /** Compose the shutdown review input from an optional queued pre-compaction

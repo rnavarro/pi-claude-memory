@@ -62,6 +62,25 @@ any durable facts it finds into the store. The reviewer is told the identity of
 every existing entry, so it supersedes an entry instead of creating a
 duplicate. It runs on shutdown and before compaction as well.
 
+It also runs early in two cases. When your message reads as a correction
+("no, use pnpm", "don't touch the lockfile", "stop adding comments", "from now
+on ...", "that's wrong", "I told you ...", "it's 8443 not 8080", "I prefer
+jq", "revert that", "you keep doing X"), the review runs once the agent
+settles, so it sees the correction and the reply to it. Detection leans toward
+catching corrections, since a false alarm costs one debounced review, but
+quoted and code text is ignored, idioms such as "no problem", "don't worry" and
+"never mind" do not count, and "stop the server" is an instruction, not a
+correction. The debug log records which pattern fired, never the message. It also runs after a set number of tool
+results since the last review. Any review launched at settle resets the turn,
+tool-call and correction state, so the periodic review does not follow with a
+second pass over the same turns. A pre-compaction review resets the turn and
+tool-call counts too, and the correction state when its snapshot contains the
+correction. These two triggers share a debounce; the
+periodic one does not. A correction that arrives while a review is running is
+queued and runs when that review finishes (debounce permitting); one that the
+debounce holds back runs at the next settle, and the shutdown review covers it
+either way.
+
 **Content safety.** Memory is injected into every later session, so a bad
 entry is a persistent prompt injection or a persistent leak. Two layers guard
 against that:
@@ -172,6 +191,9 @@ Every field is optional.
 | `shutdownMinChunkChars` | `1000` | Do not review tiny shutdown chunks |
 | `shutdownTimeoutMs` | `5000` | Total shutdown budget for awaiting and running a review |
 | `reviewOnCompact` | `true` | Review before context compaction |
+| `reviewOnCorrection` | `true` | Review early when your message reads as a correction |
+| `reviewEveryToolCalls` | `25` | Also review after this many tool results since the last review, checked when the agent settles; `0` disables |
+| `reviewTriggerDebounceSeconds` | `60` | Minimum seconds between two correction- or tool-call-triggered reviews; `0` disables |
 
 Values that are present but invalid (wrong type, or a number out of range) fall
 back to the default and produce a warning, rather than being silently accepted.

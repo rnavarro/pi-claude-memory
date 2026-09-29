@@ -69,3 +69,65 @@ describe("loadConfig guard behavior", () => {
     }
   });
 });
+
+describe("correction and tool-call trigger settings", () => {
+  async function loadWith(settings: Record<string, unknown>) {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "pcm-cfg-"));
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(
+      join(home, ".pi", "agent", "settings.json"),
+      JSON.stringify({ "pi-claude-memory": settings }),
+    );
+    const origHome = process.env.HOME;
+    const origAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const warn = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { loadConfig } = await import("../src/config.js");
+      return { cfg: loadConfig(), msgs: warn.mock.calls.map((c) => String(c[0])) };
+    } finally {
+      warn.mockRestore();
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+      if (origAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = origAgentDir;
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  it("defaults: corrections on, 25 tool calls, 60 s debounce", async () => {
+    const { DEFAULT_CONFIG } = await import("../src/config.js");
+    expect(DEFAULT_CONFIG.reviewOnCorrection).toBe(true);
+    expect(DEFAULT_CONFIG.reviewEveryToolCalls).toBe(25);
+    expect(DEFAULT_CONFIG.reviewTriggerDebounceSeconds).toBe(60);
+  });
+
+  it("accepts the off values (false, 0, 0)", async () => {
+    const { cfg, msgs } = await loadWith({
+      reviewOnCorrection: false,
+      reviewEveryToolCalls: 0,
+      reviewTriggerDebounceSeconds: 0,
+    });
+    expect(cfg.reviewOnCorrection).toBe(false);
+    expect(cfg.reviewEveryToolCalls).toBe(0);
+    expect(cfg.reviewTriggerDebounceSeconds).toBe(0);
+    expect(msgs).toHaveLength(0);
+  });
+
+  it("falls back loudly on invalid numbers and ignores a non-boolean switch", async () => {
+    const { DEFAULT_CONFIG } = await import("../src/config.js");
+    const { cfg, msgs } = await loadWith({
+      reviewOnCorrection: "no",
+      reviewEveryToolCalls: -1,
+      reviewTriggerDebounceSeconds: 1.5,
+    });
+    expect(cfg.reviewOnCorrection).toBe(true);
+    expect(cfg.reviewEveryToolCalls).toBe(DEFAULT_CONFIG.reviewEveryToolCalls);
+    expect(cfg.reviewTriggerDebounceSeconds).toBe(DEFAULT_CONFIG.reviewTriggerDebounceSeconds);
+    expect(msgs.some((m) => m.includes("reviewEveryToolCalls"))).toBe(true);
+    expect(msgs.some((m) => m.includes("reviewTriggerDebounceSeconds"))).toBe(true);
+  });
+});
