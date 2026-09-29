@@ -51,6 +51,16 @@ export interface PiClaudeMemoryConfig {
   shutdownTimeoutMs: number;
   /** Fire auto-learn on session_before_compact (catches pre-compaction loss). */
   reviewOnCompact: boolean;
+  /** Review early when the user's message reads as a correction ("no, use
+   * X", "don't do Y", "from now on ..."). The review runs once the agent
+   * settles, so it sees the correction and the reply to it. */
+  reviewOnCorrection: boolean;
+  /** Also review after this many tool results since the last review,
+   * checked when the agent settles, alongside the turn trigger. 0 disables. */
+  reviewEveryToolCalls: number;
+  /** Minimum seconds between two TRIGGERED reviews (correction or tool-call
+   * count). The periodic turn trigger is not debounced. 0 disables. */
+  reviewTriggerDebounceSeconds: number;
 }
 
 export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
@@ -66,6 +76,9 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   shutdownMinChunkChars: 1000,
   shutdownTimeoutMs: 5000,
   reviewOnCompact: true,
+  reviewOnCorrection: true,
+  reviewEveryToolCalls: 25,
+  reviewTriggerDebounceSeconds: 60,
 };
 
 const SETTINGS_KEY = "pi-claude-memory";
@@ -178,6 +191,31 @@ export function loadConfig(): PiClaudeMemoryConfig {
           }
         : {}),
       ...(typeof n.reviewOnCompact === "boolean" ? { reviewOnCompact: n.reviewOnCompact } : {}),
+      ...(typeof n.reviewOnCorrection === "boolean"
+        ? { reviewOnCorrection: n.reviewOnCorrection }
+        : {}),
+      ...(n.reviewEveryToolCalls !== undefined
+        ? {
+            reviewEveryToolCalls: num(
+              n.reviewEveryToolCalls,
+              "reviewEveryToolCalls",
+              DEFAULT_CONFIG.reviewEveryToolCalls,
+              0,
+              100000,
+            ),
+          }
+        : {}),
+      ...(n.reviewTriggerDebounceSeconds !== undefined
+        ? {
+            reviewTriggerDebounceSeconds: num(
+              n.reviewTriggerDebounceSeconds,
+              "reviewTriggerDebounceSeconds",
+              DEFAULT_CONFIG.reviewTriggerDebounceSeconds,
+              0,
+              86400,
+            ),
+          }
+        : {}),
     };
   } catch {
     return { ...DEFAULT_CONFIG };
