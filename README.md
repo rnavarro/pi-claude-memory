@@ -198,7 +198,7 @@ Every field is optional.
 | `demoteIndexOverflow` | `false` | Move the oldest non-pinned index lines below an `## Archive` heading when `MEMORY.md` outgrows the 200-line / 25 KB excerpt, so the live index stays injectable. Deletes nothing; see above |
 | `reviewIntervalTurns` | `10` | Turns between periodic reviews |
 | `injectTokenCap` | — | **Removed.** The bounded-index contract dropped body preloading, so there is no budget left to configure; the key is ignored if still present. |
-| `reviewModel` | `neuralwatt/deepseek-v4-flash` | Model used for reviews, as `{ "provider": ..., "id": ... }` |
+| `reviewModel` | session model | Model used for reviews. Unset, each review runs on the session's current model. Set it as `{ "provider": ..., "id": ... }` to pin a cheaper or faster model; if that model is not in the registry, reviews fail (debug-logged) rather than fall back |
 | `reviewThinking` | `off` | Reasoning effort for the reviewer |
 | `reviewMaxOutputTokens` | `2048` | Reviewer output cap |
 | `reviewMaxChunkChars` | `50000` | Conversation characters sent per review |

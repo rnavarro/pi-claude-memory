@@ -31,8 +31,9 @@ export interface PiClaudeMemoryConfig {
   demoteIndexOverflow: boolean;
   /** Run auto-learn review every N turns. */
   reviewIntervalTurns: number;
-  /** Auto-learn model. */
-  reviewModel: { provider: string; id: string };
+  /** Pin auto-learn to this model. Unset (the default) reviews with the
+   * session's current model, resolved at review time. */
+  reviewModel?: { provider: string; id: string };
   /** Thinking level for auto-learn. "off" omits reasoning entirely. */
   reviewThinking: "off" | "minimal" | "low" | "medium" | "high";
   /** Max output tokens for auto-learn LLM call. */
@@ -68,7 +69,6 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   autoLearn: true,
   demoteIndexOverflow: false,
   reviewIntervalTurns: 10,
-  reviewModel: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   reviewThinking: "off",
   reviewMaxOutputTokens: 2048,
   reviewMaxChunkChars: 50000,
@@ -227,7 +227,7 @@ function isModelObj(v: unknown): v is { provider: string; id: string } {
   const o = v as Record<string, unknown>;
   // Non-empty: {provider: "", id: ""} passes a bare typeof check and then
   // fails much later as a confusing "model / not found". Reject it here so
-  // the default model is used instead.
+  // the session model is used instead.
   return (
     typeof o.provider === "string" &&
     o.provider.length > 0 &&
