@@ -10,17 +10,15 @@ be reviewed and extended in the background from the conversation itself.
 
 ## Install
 
+Install from GitHub, pinned to a release tag:
+
 ```bash
-pnpm add pi-claude-memory
+pi install git:github.com/rnavarro/pi-claude-memory@v0.1.0
 ```
 
-Add it to Pi's extension list in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "extensions": ["pi-claude-memory"]
-}
-```
+A pinned tag stays put; move to a newer release with the same command and the
+new tag. Leave off `@<tag>` to track `main` instead, which `pi update
+--extensions` keeps current. Releases are listed under the repository's tags.
 
 Or point Pi at a local checkout, which is what the development workflow below
 uses.
