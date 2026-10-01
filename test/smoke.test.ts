@@ -1,49 +1,84 @@
-// Quick smoke test against the real Claude Code memory corpus
-// Run: node --import tsx test/smoke.test.ts
+// Smoke tests for the resolver, parsers and injector. Every store is built
+// under a temp HOME, so the suite runs the same on any machine.
 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseMemoryContent } from "../src/frontmatter.js";
 import { parseIndexContent } from "../src/index-parser.js";
 import { buildMemoryInjection } from "../src/injector.js";
 import { encodePath, resolveMemoryDirs } from "../src/resolver.js";
 import type { MemoryDir as MemoryDirType } from "../src/types.js";
 
+// None of these paths exist on disk: outside a repository the resolver uses
+// the cwd itself as the project identity root, so only the encoded store
+// under the temp HOME matters.
 const APP_CWD = "/home/user/workspace/my-app";
-const OTHER_CWD = "/home/user/workspace/other-project";
 const UNKNOWN_CWD = "/home/user/workspace/nonexistent-project";
 
-// The resolver and injector describes run against the real Claude Code
-// memory corpus on this machine. They are skipped when that corpus is
-// absent (e.g. CI / a fresh clone) so the suite stays portable; the pure
-// frontmatter and index-parser describes always run.
-const REAL_CORPUS = existsSync(APP_CWD) && existsSync(join(homedir(), ".claude/memory"));
+/** Run each test under its own temp HOME, restoring the previous one after. */
+function useTempHome(prefix: string): () => string {
+  let home = "";
+  let origHome: string | undefined;
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    home = mkdtempSync(join(tmpdir(), prefix));
+    process.env.HOME = home;
+  });
+  afterEach(() => {
+    if (origHome === undefined) Reflect.deleteProperty(process.env, "HOME");
+    else process.env.HOME = origHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+  return () => home;
+}
 
-describe.skipIf(!REAL_CORPUS)("resolver", () => {
+/** The encoded project dir for `cwd` under `home` (holds MEMORY.md or memory/). */
+const projectRoot = (home: string, cwd: string) =>
+  join(home, ".claude", "projects", encodePath(cwd));
+
+/** Build a standard-layout store: <project>/memory/MEMORY.md plus topics. */
+function makeStandardStore(home: string, cwd: string, index: string): string {
+  const mem = join(projectRoot(home, cwd), "memory");
+  mkdirSync(mem, { recursive: true });
+  writeFileSync(join(mem, "MEMORY.md"), index);
+  return mem;
+}
+
+describe("resolver", () => {
+  const home = useTempHome("pcm-smoke-res-");
+
   it("encodes paths the way Claude Code does", () => {
     expect(encodePath(APP_CWD)).toBe("-home-user-workspace-my-app");
-    expect(encodePath("/home/user/workspace/foo-bar")).toBe(
-      "-home-user-workspace-foo-bar",
+    expect(encodePath("/home/user/workspace/other-project")).toBe(
+      "-home-user-workspace-other-project",
     );
   });
 
-  it("resolves my-app project memory", () => {
+  it("resolves a standard-layout project store", () => {
+    const mem = makeStandardStore(home(), APP_CWD, "# My App\n- [T](t.md) — x\n");
     const result = resolveMemoryDirs(APP_CWD);
     expect(result.project).not.toBeNull();
     expect(result.project?.tier).toBe("project");
+    expect(result.project?.dir).toBe(mem);
     expect(result.project?.dir).toContain("my-app");
+    expect(result.project?.indexPath).toBe(join(mem, "MEMORY.md"));
     expect(result.project && existsSync(result.project.indexPath)).toBe(true);
   });
 
-  it("resolves other-project (root-level MEMORY.md anomaly)", () => {
-    const result = resolveMemoryDirs(OTHER_CWD);
-    expect(result.project).not.toBeNull();
-    expect(result.project && existsSync(result.project.indexPath)).toBe(true);
+  it("resolves a root-level MEMORY.md with no memory/ subdir to the project dir", () => {
+    // Layout 2 without the sibling memory/: topics live next to the index.
+    const proj = projectRoot(home(), APP_CWD);
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, "MEMORY.md"), "- [T](t.md) — x\n");
+    const result = resolveMemoryDirs(APP_CWD);
+    expect(result.project?.indexPath).toBe(join(proj, "MEMORY.md"));
+    expect(result.project?.dir).toBe(proj);
   });
 
   it("returns null project for unknown cwd", () => {
+    makeStandardStore(home(), APP_CWD, "# My App\n");
     const result = resolveMemoryDirs(UNKNOWN_CWD);
     expect(result.project).toBeNull();
   });
@@ -180,12 +215,25 @@ describe("index-parser", () => {
   });
 });
 
-describe.skipIf(!REAL_CORPUS)("injector (real corpus, bounded index)", () => {
-  it("injects a bounded index and no full text for my-app", () => {
+describe("injector (bounded index)", () => {
+  const home = useTempHome("pcm-smoke-inj-");
+
+  it("injects a bounded index and no full text for a resolved store", () => {
+    const mem = makeStandardStore(
+      home(),
+      APP_CWD,
+      "# My App - Working Memory\n\n## Feedback\n- [No auth](feedback_no_auth.md) — owner decision\n",
+    );
+    writeFileSync(
+      join(mem, "feedback_no_auth.md"),
+      "---\ndescription: owner decision\ntype: feedback\n---\nAPP_BODY_SENTINEL\n",
+    );
     const result = resolveMemoryDirs(APP_CWD);
     const { text } = buildMemoryInjection(result.project);
     expect(text).toContain("## Memory");
-    expect(text).toContain("APP");
+    expect(text).toContain("My App - Working Memory");
+    expect(text).toContain("[No auth](feedback_no_auth.md)");
+    expect(text).not.toContain("APP_BODY_SENTINEL");
     expect(text).toContain("#### Index");
     // This assertion used to be the opposite: "#### Full Text" plus a loaded
     // body. Bodies are not loaded at prompt-build time under this contract.
@@ -196,7 +244,7 @@ describe.skipIf(!REAL_CORPUS)("injector (real corpus, bounded index)", () => {
 describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
   it("resolves the index at the root and the topic base to memory/", () => {
     // This LOCKS the resolver behaviour rather than "fixing" hrefs to be
-    // relative to the index file. A real store on this machine has exactly
+    // relative to the index file. Real stores have been seen with exactly
     // this shape: a root MEMORY.md whose lines are bare (`user_location.md`)
     // with the topics in the sibling memory/. The read base is memory/, so
     // those bare hrefs resolve for recall. Emitting index-relative links
@@ -217,7 +265,7 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
       writeFileSync(join(proj, "MEMORY.md"), "- [User location](user_location.md) — Springfield\n");
       writeFileSync(
         join(mem, "user_location.md"),
-        "---\ndescription: loc\ntype: user\n---\nTOPIC_BODY_SENTINEL\n",
+        "---\ndescription: loc\ntype: user\n---\nLOCATION_BODY_SENTINEL\n",
       );
 
       const resolved = resolveMemoryDirs(cwd);
@@ -226,7 +274,7 @@ describe("Layout-2 anomaly: root MEMORY.md with topics in memory/", () => {
 
       const { text } = buildMemoryInjection(resolved.project);
       expect(text).toContain("[User location](user_location.md)");
-      expect(text).not.toContain("TOPIC_BODY_SENTINEL");
+      expect(text).not.toContain("LOCATION_BODY_SENTINEL");
     } finally {
       if (origHome === undefined) Reflect.deleteProperty(process.env, "HOME");
       else process.env.HOME = origHome;

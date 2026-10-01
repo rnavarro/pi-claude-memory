@@ -144,14 +144,14 @@ function resolveLinkedWorktreeRoot(worktreeDir: string, dotGitFile: string): str
  *
  * Checks for two layouts:
  * 1. Standard: <project>/memory/MEMORY.md + <project>/memory/*.md
- * 2. Root-level: <project>/MEMORY.md + <project>/memory/*.md (other-project anomaly)
+ * 2. Root-level: <project>/MEMORY.md + <project>/memory/*.md (seen on real stores)
  *
  * Resolution is EXACT for every operation — reads, writes, and removals all
  * share one rule. The basename-glob fallback that reads used to apply was
  * removed: suffix matching on the encoded name cannot tell "this project at
  * an old path" from "an unrelated project whose basename ends the same way"
- * (encodePath is lossy, '/' → '-', so /x/my-app and /y/control encode
- * to names sharing the -control suffix), and a wrong guess injects another
+ * (encodePath is lossy, '/' → '-', so /x/my-app and /y/app encode
+ * to names sharing the -app suffix), and a wrong guess injects another
  * project's memories into this one's prompt. Renames are reported in
  * orphanStores as a signpost for the user to act on instead.
  */
@@ -257,7 +257,7 @@ function resolveProjectMemory(
     }
   }
 
-  // Layout 2: <project>/MEMORY.md (root-level, other-project anomaly)
+  // Layout 2: <project>/MEMORY.md (root-level, seen on real stores)
   const rootMemoryPath = `${projectDir}/MEMORY.md`;
   if (existsSync(rootMemoryPath)) {
     // The topic files may still be in a memory/ subdir

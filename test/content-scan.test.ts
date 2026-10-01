@@ -114,8 +114,9 @@ describe("content scan rejects", () => {
 
 describe("content scan passes notes ABOUT secrets and ordinary prose", () => {
   it.each([
-    "Read it with `pass show <item-id> </dev/null`.",
-    "Reads $GRAFANA_SERVICE_ACCOUNT_TOKEN and GRAFANA_URL from ~/.secrets.",
+    "Read it with `pass show work/api-password </dev/null`.",
+    "Fetch it with `op read op://vault/item/password`.",
+    "Reads $MY_SERVICE_TOKEN and MY_SERVICE_URL from ~/.secrets.",
     "jq -r '.fields[]|select(.name==\"API Token\").value'",
     "Mail lives under /home/admin/imap/<domain>/<user>/Maildir.",
     "model=wafer/DeepSeek-V4-Flash-0731-Fast, provider: baseten/deepseek-ai/DeepSeek-V4-Flash",
@@ -497,7 +498,7 @@ const hex40 = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 describe("labeled hex: bare hex is a secret only after a credential label", () => {
   it.each([
     `Server details. machineIdentifier=${hex40}. Movies library section 1.`,
-    `Live config SHA256 hashes: pps config.json = ${hex64}, gate big-project.json = ${hex64}.`,
+    `Live config SHA256 hashes: pps config.json = ${hex64}, gate my-gate.json = ${hex64}.`,
     `The run is idempotent. Census signature: ${hex64}. Rates follow.`,
     `CF account id (not secret) = ${hex32}. Next step follows.`,
   ])("unlabeled hex passes: %s", (text) => {

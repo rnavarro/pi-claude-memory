@@ -82,7 +82,7 @@ export function lineTargetsFile(line: string, baseDir: string, targetPath: strin
  * caller may be an index belonging to a DIFFERENT store than the topic. A line
  * whose href is literally `(notes.md)` in another tier's index links that
  * tier's OWN `notes.md`, not the topic being removed. The real corpus holds
- * `user_location.md` in both the global store and the other-project project
+ * `user_location.md` in both the global store and a project
  * store, each linked by a bare basename in its own index, so a basename-based
  * cross-tier match stripped a live, unrelated entry's line and reported it as a
  * cleanup. Resolving the href is the only rule that is both

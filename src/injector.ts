@@ -12,7 +12,7 @@
 //
 // What this replaced, and why: the injector used to render EVERY index line
 // and then greedily load topic bodies under a 5000-token budget. The budget was
-// a rounding error next to the index it competed with — big-project's 1341-line
+// a rounding error next to the index it competed with — one real project's 1341-line
 // index alone cost ~74k tokens per turn, and the since-removed cross-project
 // tier's 734 lines cost ~35k tokens in every session of every project. Bounding
 // the index is the substance of the fix; dropping body preloading follows from

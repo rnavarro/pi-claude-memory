@@ -103,8 +103,8 @@ no digits.
   (mixed-case; 32+ hex only after a credential label such as `API_KEY=` or `key:`) after `=`, `:`, `Bearer`, a credential flag such as
   `--token` or `--api-key`, or "token is". Title and description are also
   scanned joined, as the index line shows them. Notes *about* secrets pass: a
-  `pass show` command, an env var name like
-  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, an "API Token" field name, as do hyphenated
+  `pass show work/api-password` command, an env var name like
+  `MY_SERVICE_TOKEN`, an "API Token" field name, as do hyphenated
   names and model ids, hashes after `sha256:` or `commit:`, and SSH public
   keys. A rejection drops that one candidate, not the batch, and is logged to
   the debug log with secrets masked to their first four characters.
