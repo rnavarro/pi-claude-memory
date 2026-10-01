@@ -103,8 +103,8 @@ no digits.
   (mixed-case; 32+ hex only after a credential label such as `API_KEY=` or `key:`) after `=`, `:`, `Bearer`, a credential flag such as
   `--token` or `--api-key`, or "token is". Title and description are also
   scanned joined, as the index line shows them. Notes *about* secrets pass: a
-  `pass show` command, an env var name like
-  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, an "API Token" field name, as do hyphenated
+  `pass show work/api-password` command, an env var name like
+  `MY_SERVICE_TOKEN`, an "API Token" field name, as do hyphenated
   names and model ids, hashes after `sha256:` or `commit:`, and SSH public
   keys. A rejection drops that one candidate, not the batch, and is logged to
   the debug log with secrets masked to their first four characters.
@@ -198,7 +198,7 @@ Every field is optional.
 | `demoteIndexOverflow` | `false` | Move the oldest non-pinned index lines below an `## Archive` heading when `MEMORY.md` outgrows the 200-line / 25 KB excerpt, so the live index stays injectable. Deletes nothing; see above |
 | `reviewIntervalTurns` | `10` | Turns between periodic reviews |
 | `injectTokenCap` | — | **Removed.** The bounded-index contract dropped body preloading, so there is no budget left to configure; the key is ignored if still present. |
-| `reviewModel` | `neuralwatt/deepseek-v4-flash` | Model used for reviews, as `{ "provider": ..., "id": ... }` |
+| `reviewModel` | session model | Model used for reviews. Unset, each review runs on the session's current model. Set it as `{ "provider": ..., "id": ... }` to pin a cheaper or faster model; if that model is not in the registry, reviews fail (debug-logged) rather than fall back |
 | `reviewThinking` | `off` | Reasoning effort for the reviewer |
 | `reviewMaxOutputTokens` | `2048` | Reviewer output cap |
 | `reviewMaxChunkChars` | `50000` | Conversation characters sent per review |
@@ -221,6 +221,7 @@ pnpm check     # biome lint + tsc + vitest
 ```
 
 `pnpm check` is the gate. It type-checks the test suite as well as `src/`.
+Optionally enable the repo's pre-commit hook with `git config core.hooksPath .githooks`.
 
 Reading and writing the store is guarded: paths are canonicalized, files must
 be plain regular files under an approved store root, sizes are capped before any

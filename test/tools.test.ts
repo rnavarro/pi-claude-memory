@@ -729,7 +729,7 @@ describe("write_memory is content-scanned for injection and invisible characters
     const res = await write(cwd, {
       name: "system-prompt-notes",
       description: "The system prompt is assembled in src/index.ts; tokens come from pass",
-      body: "Run `pass show <id>` for GRAFANA_SERVICE_ACCOUNT_TOKEN.\nThe index is wrapped in <memory-index> tags.",
+      body: "Run `pass show work/api-password` for MY_SERVICE_TOKEN.\nThe index is wrapped in <memory-index> tags.",
     });
     expect((res.details as { ok: boolean }).ok).toBe(true);
     expect(existsSync(join(dir, "system-prompt-notes.md"))).toBe(true);

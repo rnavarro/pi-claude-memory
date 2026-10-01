@@ -19,8 +19,8 @@
 // - Invisible / control characters: zero-width (soft hyphen, CGJ, Mongolian
 //   vowel separator included), bidi overrides and isolates, Unicode tag
 //   characters, C0/C1 controls other than tab and newline.
-// - Secret VALUES, never secret keywords. Notes ABOUT tokens ("pass get
-//   password", GRAFANA_SERVICE_ACCOUNT_TOKEN, an "API Token" field name) are
+// - Secret VALUES, never secret keywords. Notes ABOUT tokens ("pass show
+//   work/api-password", MY_SERVICE_TOKEN, an "API Token" field name) are
 //   legitimate and must pass; only known key formats and long random-looking
 //   strings (mixed-case base64-ish, or 32+ hex after a credential label) are rejected, and only after
 //   "=" or ":", "Bearer", a credential flag (--token, --api-key) or

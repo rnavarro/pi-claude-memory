@@ -1,0 +1,10 @@
+# gitleaks config: the default rules, plus one path allowlist.
+# test/content-scan.test.ts is full of synthetic secrets by design: it checks
+# that the memory content scanner rejects them.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic secrets in the content-scanner test fixtures"
+paths = ['''test/content-scan\.test\.ts''']

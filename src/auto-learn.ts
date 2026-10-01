@@ -7,7 +7,7 @@
 // indistinguishable from Claude Code's own.
 //
 // Fire-and-forget: never blocks the user's turn. All errors are caught and
-// logged to stderr.
+// recorded in the debug log.
 
 import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -25,8 +25,10 @@ import type { MemoryDir, ResolveResult } from "./types.js";
 export interface AutoLearnConfig {
   /** Review every N turns. */
   everyTurns: number;
-  /** Model provider/id. */
-  model: { provider: string; id: string };
+  /** Pinned review model (provider/id, looked up in the model registry).
+   * Unset means "use the session's current model", resolved at review time
+   * because the user can switch models mid-session. */
+  model?: { provider: string; id: string };
   /** Thinking level: "off" omits reasoning entirely (like pi-observational-memory). */
   thinking: "off" | "minimal" | "low" | "medium" | "high";
   /** Max output tokens for the review call. */
@@ -35,7 +37,6 @@ export interface AutoLearnConfig {
 
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
-  model: { provider: "neuralwatt", id: "deepseek-v4-flash" },
   thinking: "off",
   maxOutputTokens: 2048,
 };
@@ -107,19 +108,13 @@ export async function runAutoLearn(
 ): Promise<number> {
   if (!chunk.trim()) return 0;
 
-  // Resolve the model
-  const model = ctx.modelRegistry.find(cfg.model.provider, cfg.model.id) as Model<Api> | undefined;
-  if (!model) {
-    debugLog("auto_learn.model_not_found", { provider: cfg.model.provider, id: cfg.model.id });
-    console.error(
-      `[pi-claude-memory] auto-learn: model ${cfg.model.provider}/${cfg.model.id} not found`,
-    );
-    return -1;
-  }
+  const resolvedModel = resolveReviewModel(ctx, cfg);
+  if (!resolvedModel) return -1;
+  const { model, source } = resolvedModel;
 
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
-    debugLog("auto_learn.no_api_key", { provider: cfg.model.provider });
+    debugLog("auto_learn.no_api_key", { provider: model.provider, id: model.id, source });
     return -1;
   }
 
@@ -169,8 +164,9 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     modelSupportsReasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {};
 
   debugLog("auto_learn.model_call", {
-    provider: cfg.model.provider,
-    id: cfg.model.id,
+    provider: model.provider,
+    id: model.id,
+    source,
     thinking: cfg.thinking,
     modelSupportsReasoning,
     reasoningPassed: thinkingLevel !== "off" && modelSupportsReasoning,
@@ -182,8 +178,8 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   try {
     // Resolve the stream function from the model registry's provider.
     // Since pi 0.81, the compat completeSimple only resolves builtin API IDs
-    // (openai, anthropic, etc.). A provider-registered custom API (e.g.
-    // neuralwatt) is unknown to it and throws "No API provider registered for
+    // (openai, anthropic, etc.). A provider-registered custom API is unknown
+    // to it and throws "No API provider registered for
     // api: ...". Routing through the registry's composed provider avoids that
     // crash. Falls back to compat completeSimple for builtin providers.
     // Pattern copied from pi-observational-memory's resolveStreamFn.
@@ -235,6 +231,43 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
   }
 
   return writeCandidates(candidates, resolved, mtimes, cwd, signal);
+}
+
+/**
+ * Pick the model a review runs on.
+ *
+ * A pinned cfg.model is looked up in the registry and nothing else: if it is
+ * missing the review fails rather than silently running on a different (and
+ * possibly far more expensive) model. Unset, the session's current model is
+ * used, read from ctx at call time so a mid-session model switch is followed.
+ * Failure is debug-logged only; a console line would land inside the TUI.
+ */
+function resolveReviewModel(
+  ctx: ExtensionContext,
+  cfg: AutoLearnConfig,
+): { model: Model<Api>; source: "configured" | "session" } | undefined {
+  if (cfg.model) {
+    const found = ctx.modelRegistry.find(cfg.model.provider, cfg.model.id);
+    if (!found) {
+      debugLog("auto_learn.model_not_found", {
+        provider: cfg.model.provider,
+        id: cfg.model.id,
+        source: "configured",
+        reason: "configured reviewModel is not in the model registry",
+      });
+      return undefined;
+    }
+    return { model: found, source: "configured" };
+  }
+  const session = ctx.model as Model<Api> | undefined;
+  if (!session) {
+    debugLog("auto_learn.model_not_found", {
+      source: "session",
+      reason: "no reviewModel configured and the session has no model selected",
+    });
+    return undefined;
+  }
+  return { model: session, source: "session" };
 }
 
 /**
@@ -639,8 +672,8 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
 /** Resolve a stream/complete function from the model registry's provider.
  *
  * Since pi 0.81, the compat completeSimple only resolves builtin API IDs.
- * A provider-registered custom API (e.g. neuralwatt) is unknown to it and
- * throws. Routing through the registry's composed provider avoids that.
+ * A provider-registered custom API is unknown to it and throws. Routing
+ * through the registry's composed provider avoids that.
  * Returns undefined if the provider has no streamSimple (caller falls back
  * to compat completeSimple).
  *

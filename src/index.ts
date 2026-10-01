@@ -181,7 +181,9 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     debugLog: config.debugLog,
     autoLearn: config.autoLearn,
     reviewIntervalTurns: config.reviewIntervalTurns,
-    reviewModel: `${config.reviewModel.provider}/${config.reviewModel.id}`,
+    reviewModel: config.reviewModel
+      ? `${config.reviewModel.provider}/${config.reviewModel.id}`
+      : "session",
     reviewThinking: config.reviewThinking,
     reviewOnShutdown: config.reviewOnShutdown,
     reviewOnCompact: config.reviewOnCompact,
