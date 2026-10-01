@@ -35,8 +35,7 @@
     "lint": "biome check --error-on-warnings",
     "format": "biome check --write",
     "test": "vitest run",
-    "check": "pnpm lint && pnpm typecheck && pnpm test",
-    "prepare": "git config --unset core.hooksPath || true; git config hooks.dispatchRepoHooks true || true"
+    "check": "pnpm lint && pnpm typecheck && pnpm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

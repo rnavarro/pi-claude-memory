@@ -221,6 +221,7 @@ pnpm check     # biome lint + tsc + vitest
 ```
 
 `pnpm check` is the gate. It type-checks the test suite as well as `src/`.
+Optionally enable the repo's pre-commit hook with `git config core.hooksPath .githooks`.
 
 Reading and writing the store is guarded: paths are canonicalized, files must
 be plain regular files under an approved store root, sizes are capped before any
