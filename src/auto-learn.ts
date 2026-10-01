@@ -672,7 +672,8 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
 /** Resolve a stream/complete function from the model registry's provider.
  *
  * Since pi 0.81, the compat completeSimple only resolves builtin API IDs.
- * A provider-registered custom API is unknown to it and throws. Routing through the registry's composed provider avoids that.
+ * A provider-registered custom API is unknown to it and throws. Routing
+ * through the registry's composed provider avoids that.
  * Returns undefined if the provider has no streamSimple (caller falls back
  * to compat completeSimple).
  *
