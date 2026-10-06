@@ -11,7 +11,7 @@
 
 import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, TranscriptContext } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findContentIssues, scanMemoryCandidate } from "./content-scan.js";
@@ -176,13 +176,13 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
 
   let replyText: string;
   try {
-    // Resolve the stream function from the model registry's provider.
+    // Resolve the stream function from the model registry.
     // Since pi 0.81, the compat completeSimple only resolves builtin API IDs
     // (openai, anthropic, etc.). A provider-registered custom API is unknown
     // to it and throws "No API provider registered for
-    // api: ...". Routing through the registry's composed provider avoids that
-    // crash. Falls back to compat completeSimple for builtin providers.
-    // Pattern copied from pi-observational-memory's resolveStreamFn.
+    // api: ...". Routing through the registry avoids that crash; see
+    // resolveStreamFn for why the registry's own streamSimple comes first.
+    // Falls back to compat completeSimple when the registry has neither path.
     const streamFn = resolveStreamFn(ctx, model);
     const doComplete = streamFn ?? completeSimple;
     const reply = await doComplete(model, context, {
@@ -669,15 +669,21 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
   return lines.join("\n");
 }
 
-/** Resolve a stream/complete function from the model registry's provider.
+/** Resolve a stream/complete function from the model registry.
  *
  * Since pi 0.81, the compat completeSimple only resolves builtin API IDs.
  * A provider-registered custom API is unknown to it and throws. Routing
- * through the registry's composed provider avoids that.
- * Returns undefined if the provider has no streamSimple (caller falls back
- * to compat completeSimple).
+ * through the registry avoids that.
  *
- * Pattern copied from pi-observational-memory's resolveStreamFn. */
+ * Since pi 0.86, providers take a normalized TranscriptContext and read the
+ * system prompt from context.messages, so a plain Context handed straight to
+ * provider.streamSimple loses its systemPrompt field without any error. The
+ * registry's own streamSimple (added in 0.86) normalizes the Context first,
+ * so it is preferred. The getProvider path remains for hosts older than 0.86,
+ * whose providers still take a plain Context.
+ *
+ * Returns undefined if neither path is available (caller falls back to compat
+ * completeSimple). */
 function resolveStreamFn(
   ctx: ExtensionContext,
   model: unknown,
@@ -691,15 +697,27 @@ function resolveStreamFn(
   const providerName = (model as { provider?: string }).provider;
   if (!providerName) return undefined;
   try {
+    const registry = ctx.modelRegistry;
+    if (typeof registry.streamSimple === "function") {
+      debugLog("auto_learn.stream_resolved", { providerName, source: "registry_stream" });
+      return (m, c, o) =>
+        registry.streamSimple(m as Model<Api>, c, o as Record<string, unknown>).result();
+    }
     const provider =
       typeof ctx.modelRegistry.getProvider === "function"
         ? ctx.modelRegistry.getProvider(providerName)
         : undefined;
     const streamSimple = provider?.streamSimple;
     if (typeof streamSimple !== "function") return undefined;
-    debugLog("auto_learn.stream_resolved", { providerName, source: "registry" });
+    debugLog("auto_learn.stream_resolved", { providerName, source: "registry_provider" });
+    // Pre-0.86 hosts only: their providers take a plain Context, which the
+    // current TranscriptContext type cannot express.
     return (m, c, o) =>
-      streamSimple(m as Model<Api>, c as Context, o as Record<string, unknown>).result();
+      streamSimple(
+        m as Model<Api>,
+        c as unknown as TranscriptContext,
+        o as Record<string, unknown>,
+      ).result();
   } catch (err) {
     debugLog("auto_learn.stream_resolve_failed", { providerName, error: String(err) });
     return undefined;
