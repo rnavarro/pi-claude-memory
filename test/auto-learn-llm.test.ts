@@ -2,7 +2,8 @@
 // parseCandidates and writeCandidates into a real store under a temp HOME.
 //
 // The model is reached the way a provider-registered API reaches it: through
-// ctx.modelRegistry.getProvider(...).streamSimple.
+// ctx.modelRegistry.streamSimple on pi >= 0.86, or
+// ctx.modelRegistry.getProvider(...).streamSimple on older hosts.
 // The compat completeSimple fallback is module-mocked to throw, so a
 // fall-through to it fails loudly instead of attempting a network call.
 
@@ -19,6 +20,7 @@ vi.mock("@earendil-works/pi-ai/compat", () => ({
   },
 }));
 
+import { type Context, getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
 import { DEFAULT_AUTOLEARN_CONFIG, runAutoLearn } from "../src/auto-learn.js";
 import { encodePath } from "../src/resolver.js";
 
@@ -46,15 +48,34 @@ interface FakeModel {
 const SESSION_MODEL: FakeModel = { provider: "session-prov", id: "session-model" };
 const PINNED_MODEL: FakeModel = { provider: "pinned-prov", id: "pinned-model" };
 
-/** A context whose model registry answers with `reply` and records prompts.
- * `sessionModel` is ctx.model; `registry` is what modelRegistry.find holds. */
+interface FakeMessage {
+  role: string;
+  content: string | { type: string; text?: string }[];
+}
+
+const lastUserText = (messages: FakeMessage[]): string => {
+  const user = messages.filter((m) => m.role === "user").at(-1);
+  if (!user) return "";
+  return typeof user.content === "string" ? user.content : (user.content[0]?.text ?? "");
+};
+
+/** A context whose model registry answers with `reply` and records what the
+ * provider received. `sessionModel` is ctx.model; `registry` is what
+ * modelRegistry.find holds.
+ *
+ * By default it models a pi >= 0.86 host: providers take a TranscriptContext
+ * and read the system prompt from context.messages, and the registry's own
+ * streamSimple normalizes a plain Context first, as the real runtime does.
+ * `legacyHost` models pi < 0.86: no registry streamSimple, and providers read
+ * a plain Context's systemPrompt field. */
 function fakeCtx(
   reply: string,
-  opts: { sessionModel?: FakeModel; registry?: FakeModel[] } = {
+  opts: { sessionModel?: FakeModel; registry?: FakeModel[]; legacyHost?: boolean } = {
     sessionModel: SESSION_MODEL,
   },
 ) {
   const prompts: string[] = [];
+  const systemPrompts: string[] = [];
   const streamedModels: FakeModel[] = [];
   const find = vi.fn((provider: string, id: string) =>
     (opts.registry ?? []).find((m) => m.provider === provider && m.id === id),
@@ -64,21 +85,50 @@ function fakeCtx(
     apiKey: "test-key",
     headers: {},
   }));
-  const getProvider = vi.fn(() => ({
-    streamSimple: (model: FakeModel, context: { messages: { content: { text: string }[] }[] }) => {
-      streamedModels.push(model);
-      prompts.push(context.messages[0]?.content[0]?.text ?? "");
-      return {
-        result: async () => ({ content: [{ type: "text", text: reply }] }),
+  const answer = () => ({
+    result: async () => ({ content: [{ type: "text", text: reply }] }),
+  });
+  const provider = opts.legacyHost
+    ? {
+        streamSimple: (
+          model: FakeModel,
+          context: { systemPrompt?: string; messages: FakeMessage[] },
+        ) => {
+          streamedModels.push(model);
+          systemPrompts.push(context.systemPrompt ?? "");
+          prompts.push(lastUserText(context.messages));
+          return answer();
+        },
+      }
+    : {
+        streamSimple: (model: FakeModel, context: { messages: FakeMessage[] }) => {
+          streamedModels.push(model);
+          systemPrompts.push(getCurrentSystemPrompt(context.messages as never));
+          prompts.push(lastUserText(context.messages));
+          return answer();
+        },
       };
-    },
-  }));
+  const getProvider = vi.fn(() => provider);
+  const registryStreamSimple = vi.fn((model: FakeModel, context: Context) =>
+    provider.streamSimple(model, normalizeContext(context) as never),
+  );
   const ctx = {
     signal: undefined,
     model: opts.sessionModel,
-    modelRegistry: { find, getApiKeyAndHeaders, getProvider },
+    modelRegistry: opts.legacyHost
+      ? { find, getApiKeyAndHeaders, getProvider }
+      : { find, getApiKeyAndHeaders, getProvider, streamSimple: registryStreamSimple },
   };
-  return { ctx: ctx as never, prompts, streamedModels, find, getApiKeyAndHeaders };
+  return {
+    ctx: ctx as never,
+    prompts,
+    systemPrompts,
+    streamedModels,
+    find,
+    getApiKeyAndHeaders,
+    getProvider,
+    registryStreamSimple,
+  };
 }
 
 const storeDir = (cwd: string) => join(tmpHome, ".claude", "projects", encodePath(cwd), "memory");
@@ -137,6 +187,39 @@ describe("runAutoLearn with a fake model", () => {
     expect(prompts).toHaveLength(1);
     expect(compatCalls.count).toBe(0);
     expect(existsSync(storeDir(cwd))).toBe(false);
+  });
+});
+
+describe("runAutoLearn system prompt delivery", () => {
+  const reply = JSON.stringify([candidate({})]);
+
+  it("reaches the model through the registry's streamSimple on pi >= 0.86", async () => {
+    const cwd = join(tmpHome, "work", "sys-current");
+    const { ctx, systemPrompts, prompts, getProvider, registryStreamSimple } = fakeCtx(reply);
+
+    const written = await runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, cwd, "user: use jq");
+
+    expect(written).toBe(1);
+    expect(registryStreamSimple).toHaveBeenCalledTimes(1);
+    expect(getProvider).not.toHaveBeenCalled();
+    expect(systemPrompts).toHaveLength(1);
+    expect(systemPrompts[0]).toContain("You are a memory extraction agent");
+    expect(prompts[0]).toContain("user: use jq");
+  });
+
+  it("reaches the model through getProvider with a plain Context on pi < 0.86", async () => {
+    const cwd = join(tmpHome, "work", "sys-legacy");
+    const { ctx, systemPrompts, getProvider } = fakeCtx(reply, {
+      sessionModel: SESSION_MODEL,
+      legacyHost: true,
+    });
+
+    const written = await runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, cwd, "user: use jq");
+
+    expect(written).toBe(1);
+    expect(getProvider).toHaveBeenCalledWith(SESSION_MODEL.provider);
+    expect(systemPrompts).toHaveLength(1);
+    expect(systemPrompts[0]).toContain("You are a memory extraction agent");
   });
 });
 
