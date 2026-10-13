@@ -540,6 +540,22 @@ export function applyStemKeys(
  * the review prompt without bound. */
 const SUMMARY_BUDGET_CHARS = 6000;
 
+/** Order items oldest write first by the mtime of the file each names.
+ * A missing or unreadable file sorts first; ties keep their input order. */
+function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
+  const writeTime = (item: T): number => {
+    try {
+      return statSync(pathOf(item)).mtimeMs;
+    } catch {
+      return Number.NEGATIVE_INFINITY;
+    }
+  };
+  return items
+    .map((item) => ({ item, time: writeTime(item) }))
+    .sort((a, b) => (a.time === b.time ? 0 : a.time < b.time ? -1 : 1))
+    .map(({ item }) => item);
+}
+
 /** Build a compact summary of the existing memory index for the LLM.
  *
  * Parses MEMORY.md (not a raw readdir) so the LLM sees entry descriptions,
@@ -552,7 +568,16 @@ const SUMMARY_BUDGET_CHARS = 6000;
  * Only this store's own topics are listed. An index line whose href resolves
  * outside the store names another store's topic: it is not addressable by name
  * here, so advertising it would invite overwriting an unrelated local file whose
- * stem happens to match. */
+ * stem happens to match.
+ *
+ * Entries are listed oldest write first (topic file mtime), not in MEMORY.md
+ * order. The writer inserts a new line just above `## Archive`, so file order
+ * put each new entry mid-list in a store with an Archive section, changing the
+ * extraction prompt from that point on and missing the provider prompt cache.
+ * By write time a new topic always lands last, and demotion to the archive
+ * moves only the index line, never the topic file, so it reorders nothing.
+ * The summary budget is spent in the same order, so a new entry never takes a
+ * summary away from an earlier one. */
 export function buildExistingIndexSummary(resolved: ResolveResult): string {
   const lines: string[] = [];
   // Both sides of the ownership test are canonicalized: entry.filePath comes
@@ -613,7 +638,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
         let summaryChars = 0;
         let trimmed = 0;
         let external = 0;
-        for (const entry of parsed.entries) {
+        for (const entry of byWriteTime(parsed.entries, (e) => e.filePath)) {
           if (!isOwnedBy(entry.filePath, dir)) {
             external++;
             continue;
@@ -652,7 +677,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
         } else {
           // No parseable index: list every file stem, so identities stay
           // complete. (This too was capped at 50, hiding files outright.)
-          for (const f of files) {
+          for (const f of byWriteTime(files, (name) => join(dir.dir, name))) {
             lines.push(`- ${f.replace(/\.md$/, "")}`);
           }
         }
