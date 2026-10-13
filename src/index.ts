@@ -44,7 +44,8 @@ import type { ResolveResult } from "./types.js";
 // is recomputed from disk at exactly two points, matching Claude Code, which
 // refreshes auto memory only at session start and after compaction:
 //
-//   - session_start (and a cwd change, which is a different store);
+//   - session_start (and a cwd change, which is a different store), except a
+//     /reload, which restores the text this session already sent (below);
 //   - session_compact, after a compaction has actually happened. Compaction
 //     already rewrites the conversation prefix, so the cache is lost anyway
 //     and the refresh costs nothing extra.
@@ -54,6 +55,13 @@ import type { ResolveResult } from "./types.js";
 // prompt cache for the whole conversation. The model already has the new fact
 // from the conversation (it just wrote it, or can recall_memory it), and the
 // store on disk is current for find/recall, which resolve fresh on every call.
+//
+// /reload also fires session_start, and re-imports this module, so in-memory
+// state cannot carry the frozen text across it. Each freeze is therefore
+// recorded in the session with appendEntry, and a reload restores the latest
+// record since the last compaction. Re-rendering instead would pick up topics
+// written earlier in the session and change the prompt mid-session. Other
+// session starts (startup, new, resume, fork) still render fresh.
 // ---------------------------------------------------------------------------
 
 /** Frozen injection text + resolve result for the current session. */
@@ -67,6 +75,18 @@ interface FrozenInjection {
 }
 
 let frozenInjection: FrozenInjection | null = null;
+
+/** Custom session entry type recording each frozen injection. */
+const INJECTION_ENTRY_TYPE = "pi-claude-memory.injection";
+
+/** Data of an INJECTION_ENTRY_TYPE entry. */
+interface InjectionRecord {
+  cwd: string;
+  text: string;
+}
+
+/** pi.appendEntry, captured at registration; null where the host lacks it. */
+let appendSessionEntry: ((customType: string, data: InjectionRecord) => void) | null = null;
 
 // Loaded config (debugLog, autoLearn, reviewIntervalTurns, etc.)
 let config: PiClaudeMemoryConfig = loadConfig();
@@ -176,6 +196,10 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 
 export default function piClaudeMemory(pi: ExtensionAPI): void {
   config = loadConfig();
+  appendSessionEntry =
+    typeof pi.appendEntry === "function"
+      ? (customType, data) => pi.appendEntry(customType, data)
+      : null;
 
   debugLog("extension.register", {
     debugLog: config.debugLog,
@@ -230,9 +254,9 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
   pi.on("session_compact", handleSessionCompact);
 
   // Reset caches on session lifecycle events
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     currentSessionId = getSessionId(ctx);
-    frozenInjection = null;
+    frozenInjection = event.reason === "reload" ? restoreInjection(ctx) : null;
     turnCount = 0;
     toolCallCount = 0;
     toolResultChunk = "";
@@ -256,7 +280,12 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     withDebugLogContext(
       { enabled: config.debugLog, cwd: ctx.cwd, sessionId: getSessionId(ctx) },
       () => {
-        debugLog("session.start", { cwd: ctx.cwd, sessionId: getSessionId(ctx) });
+        debugLog("session.start", {
+          cwd: ctx.cwd,
+          sessionId: getSessionId(ctx),
+          reason: event.reason,
+          restoredInjection: frozenInjection !== null,
+        });
       },
     );
   });
@@ -567,6 +596,7 @@ async function handleBeforeAgentStart(
           event.systemPromptOptions.selectedTools?.includes("ctx_search") ?? false;
         frozen = computeInjection(cwd, hasCtxSearch);
         frozenInjection = frozen;
+        recordInjection(frozen);
         debugLog("injector.freeze", {
           cwd,
           textLength: frozen.text.length,
@@ -583,6 +613,38 @@ async function handleBeforeAgentStart(
       };
     },
   );
+}
+
+/** Record a frozen injection in the session so a /reload can restore it. */
+function recordInjection(frozen: FrozenInjection): void {
+  if (!appendSessionEntry) return;
+  try {
+    appendSessionEntry(INJECTION_ENTRY_TYPE, { cwd: frozen.cwd, text: frozen.text });
+  } catch (err) {
+    debugLog("injector.record_failed", { error: String(err) });
+  }
+}
+
+/** The latest recorded injection on the current branch since the last
+ * compaction, or null. A compaction refreshes the injection, so a record from
+ * before it is stale. */
+function restoreInjection(ctx: ExtensionContext): FrozenInjection | null {
+  let entries: SessionEntry[];
+  try {
+    entries = ctx.sessionManager.getBranch();
+  } catch {
+    return null;
+  }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.type === "compaction") return null;
+    if (entry?.type === "custom" && entry.customType === INJECTION_ENTRY_TYPE) {
+      const data = entry.data as Partial<InjectionRecord> | undefined;
+      if (typeof data?.cwd !== "string" || typeof data.text !== "string") return null;
+      return { cwd: data.cwd, text: data.text, resolved: resolveMemoryDirs(data.cwd) };
+    }
+  }
+  return null;
 }
 
 /** Compute and freeze the injection text for a cwd. */

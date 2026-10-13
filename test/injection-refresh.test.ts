@@ -41,11 +41,17 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
+/** A session branch shared across loads, as pi keeps it across /reload. */
+type Branch = { type: string; customType?: string; data?: unknown }[];
+
 /** Load the extension against a fake API and return a small driver. */
-function loadExtension(cwd: string) {
+function loadExtension(cwd: string, branch: Branch = []) {
   const handlers = new Map<string, Handler[]>();
   const tools: Tool[] = [];
   piClaudeMemory({
+    appendEntry: (customType: string, data: unknown) => {
+      branch.push({ type: "custom", customType, data });
+    },
     on: (name: string, h: Handler) => {
       const list = handlers.get(name) ?? [];
       list.push(h);
@@ -56,7 +62,7 @@ function loadExtension(cwd: string) {
     },
   } as never);
 
-  const ctx = { cwd };
+  const ctx = { cwd, sessionManager: { getBranch: () => [...branch] } };
   const fire = async (name: string, event: unknown) => {
     let last: unknown;
     for (const h of handlers.get(name) ?? []) last = await h(event, ctx);
@@ -80,15 +86,17 @@ function loadExtension(cwd: string) {
       if (!res) throw new Error("before_agent_start injected nothing");
       return res.systemPrompt;
     },
-    sessionStart: () => fire("session_start", { type: "session_start", reason: "startup" }),
-    compacted: () =>
-      fire("session_compact", {
+    sessionStart: (reason = "startup") => fire("session_start", { type: "session_start", reason }),
+    compacted: () => {
+      branch.push({ type: "compaction" });
+      return fire("session_compact", {
         type: "session_compact",
         compactionEntry: {},
         fromExtension: false,
         reason: "manual",
         willRetry: false,
-      }),
+      });
+    },
     write: (name: string, description: string) =>
       tool("write_memory").execute(
         "w1",
@@ -199,5 +207,64 @@ describe("the injected MEMORY.md is refreshed at the Claude Code points", () => 
     const after = await ext.prompt();
     expect(after).toContain("omega.md");
     expect(after).not.toContain("alpha.md");
+  });
+});
+
+describe("/reload keeps the injected MEMORY.md", () => {
+  // /reload re-imports the extension and fires session_start with reason
+  // "reload". Re-rendering there picked up topics written earlier in the
+  // session, changing the system prompt mid-session.
+  it("restores the exact text sent before the reload", async () => {
+    const cwd = join(tmpHome, "work", "reload");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    const branch: Branch = [];
+    const ext = loadExtension(cwd, branch);
+    await ext.sessionStart();
+    const before = await ext.prompt();
+    await ext.write("beta-entry", "written mid-session");
+
+    const reloaded = loadExtension(cwd, branch);
+    await reloaded.sessionStart("reload");
+
+    const after = await reloaded.prompt();
+    expect(after).toBe(before);
+    expect(after).not.toContain("beta-entry.md");
+  });
+
+  it("renders fresh on a reload after a compaction", async () => {
+    const cwd = join(tmpHome, "work", "reload-compacted");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    const branch: Branch = [];
+    const ext = loadExtension(cwd, branch);
+    await ext.sessionStart();
+    await ext.prompt();
+    await ext.write("beta-entry", "written mid-session");
+    await ext.compacted();
+
+    const reloaded = loadExtension(cwd, branch);
+    await reloaded.sessionStart("reload");
+
+    expect(await reloaded.prompt()).toContain("beta-entry.md");
+  });
+
+  it("renders fresh on resume", async () => {
+    const cwd = join(tmpHome, "work", "resume");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    const branch: Branch = [];
+    const ext = loadExtension(cwd, branch);
+    await ext.sessionStart();
+    await ext.prompt();
+    await ext.write("beta-entry", "written mid-session");
+
+    const resumed = loadExtension(cwd, branch);
+    await resumed.sessionStart("resume");
+
+    expect(await resumed.prompt()).toContain("beta-entry.md");
   });
 });
