@@ -2,7 +2,15 @@
 // The LLM call itself is not tested here (requires a live model); the parsing
 // and validation logic is the part that matters.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +20,7 @@ import {
   parseCandidates,
   snapshotMtimes,
 } from "../src/auto-learn.js";
+import { writeMemory } from "../src/memory-writer.js";
 import { createProjectMemoryDir, encodePath, resolveMemoryDirs } from "../src/resolver.js";
 import type { MemoryDir as MemoryDirType, ResolveResult } from "../src/types.js";
 
@@ -108,6 +117,56 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).toContain("prefer-jq:");
     expect(summary).toContain("Use jq for JSON processing");
     expect(summary).not.toContain("Prefer jq");
+  });
+
+  it("appends a new entry at the end in a store with an Archive section", () => {
+    // The writer inserts a new index line just above `## Archive`. Listed in
+    // file order, that put the new entry mid-list and changed the extraction
+    // prompt from there on, which misses the provider prompt cache.
+    const dir = join(tmpDir, "store-with-archive");
+    mkdirSync(dir, { recursive: true });
+    const topics = ["live-one", "live-two", "archived-one", "archived-two"];
+    topics.forEach((stem, i) => {
+      const file = join(dir, `${stem}.md`);
+      writeFileSync(file, `---\nname: ${stem}\n---\nbody`);
+      const t = new Date(Date.UTC(2026, 0, 1 + i));
+      utimesSync(file, t, t);
+    });
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      [
+        "- [Live one](live-one.md) — first live entry",
+        "- [Live two](live-two.md) — second live entry",
+        "",
+        "## Archive",
+        "",
+        "- [Archived one](archived-one.md) — first archived entry",
+        "- [Archived two](archived-two.md) — second archived entry",
+        "",
+      ].join("\n"),
+    );
+    const resolved: ResolveResult = {
+      project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "test" },
+      warnings: [],
+    };
+
+    const before = buildExistingIndexSummary(resolved);
+    const written = writeMemory(resolved.project as MemoryDirType, {
+      name: "brand-new",
+      description: "a new entry",
+      type: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    expect(written.ok).toBe(true);
+    // The writer did put the line mid-file, above the Archive heading.
+    const index = readFileSync(join(dir, "MEMORY.md"), "utf8");
+    expect(index.indexOf("brand-new.md")).toBeLessThan(index.indexOf("## Archive"));
+
+    const after = buildExistingIndexSummary(resolved);
+    expect(after.startsWith(before)).toBe(true);
+    expect(after.slice(before.length)).toBe("\n- brand-new: a new entry");
   });
 });
 
