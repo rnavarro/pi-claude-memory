@@ -74,17 +74,30 @@ function loadExtension(cwd: string, branch: Branch = []) {
     return t;
   };
 
+  /** Run before_agent_start the way pi 1.2.0 does: handlers may edit the
+   * shared systemPromptOptions (sections included) or return a forced prompt.
+   * `legacyHost` omits sections, as hosts before pi 0.86 did. */
+  const startTurn = async (legacyHost = false) => {
+    const sections: Record<string, string> = {};
+    const res = (await fire("before_agent_start", {
+      type: "before_agent_start",
+      prompt: "hi",
+      systemPrompt: "BASE PROMPT\n",
+      systemPromptOptions: legacyHost ? { selectedTools: [] } : { selectedTools: [], sections },
+    })) as { systemPrompt?: string } | undefined;
+    return { res, sections };
+  };
+
   return {
-    /** Run before_agent_start and return the system prompt it produces. */
+    startTurn,
+    /** Run before_agent_start and return the system prompt it produces,
+     * rendering named sections in pi's tag-wrapped form. */
     async prompt(): Promise<string> {
-      const res = (await fire("before_agent_start", {
-        type: "before_agent_start",
-        prompt: "hi",
-        systemPrompt: "BASE PROMPT\n",
-        systemPromptOptions: { selectedTools: [] },
-      })) as { systemPrompt: string } | undefined;
-      if (!res) throw new Error("before_agent_start injected nothing");
-      return res.systemPrompt;
+      const { res, sections } = await startTurn();
+      if (res?.systemPrompt !== undefined) return res.systemPrompt;
+      const rendered = Object.entries(sections).map(([k, v]) => `<${k}>\n${v}\n</${k}>`);
+      if (rendered.length === 0) throw new Error("before_agent_start injected nothing");
+      return `BASE PROMPT\n${rendered.join("\n\n")}`;
     },
     sessionStart: (reason = "startup") => fire("session_start", { type: "session_start", reason }),
     compacted: () => {
@@ -266,5 +279,40 @@ describe("/reload keeps the injected MEMORY.md", () => {
     await resumed.sessionStart("resume");
 
     expect(await resumed.prompt()).toContain("beta-entry.md");
+  });
+});
+
+describe("the memory block is a named prompt section", () => {
+  // Returning a whole forced systemPrompt left handlers that run later unable
+  // to adjust their own parts of the prompt.
+  it("adds a memory section and forces no prompt", async () => {
+    const cwd = join(tmpHome, "work", "section");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    const ext = loadExtension(cwd);
+    await ext.sessionStart();
+
+    const { res, sections } = await ext.startTurn();
+
+    expect(res).toBeUndefined();
+    expect(Object.keys(sections)).toEqual(["memory"]);
+    expect(sections.memory).toContain("<memory-index>");
+    expect(sections.memory).toContain("alpha.md");
+    expect(sections.memory).toBe(sections.memory?.trim());
+  });
+
+  it("appends to the prompt on a host without sections", async () => {
+    const cwd = join(tmpHome, "work", "section-legacy");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    const ext = loadExtension(cwd);
+    await ext.sessionStart();
+
+    const { res } = await ext.startTurn(true);
+
+    expect(res?.systemPrompt?.startsWith("BASE PROMPT\n")).toBe(true);
+    expect(res?.systemPrompt).toContain("alpha.md");
   });
 });

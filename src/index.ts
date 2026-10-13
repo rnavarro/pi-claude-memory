@@ -76,6 +76,10 @@ interface FrozenInjection {
 
 let frozenInjection: FrozenInjection | null = null;
 
+/** Name of the system prompt section that carries the memory block. pi wraps
+ * it in a tag of the same name. */
+const MEMORY_SECTION = "memory";
+
 /** Custom session entry type recording each frozen injection. */
 const INJECTION_ENTRY_TYPE = "pi-claude-memory.injection";
 
@@ -608,6 +612,17 @@ async function handleBeforeAgentStart(
         return;
       }
 
+      // Add the block as its own named section rather than returning a whole
+      // forced systemPrompt. A forced prompt is opaque: handlers that run
+      // after this one can no longer adjust their own parts of it, and any
+      // prompt change shows up as a change to the whole thing. pi rebuilds
+      // sections from its base options every run, so nothing goes stale.
+      // Hosts older than pi 0.86 have no sections; they get the old append.
+      const sections = event.systemPromptOptions.sections as Record<string, string> | undefined;
+      if (sections) {
+        sections[MEMORY_SECTION] = frozen.text.trim();
+        return;
+      }
       return {
         systemPrompt: event.systemPrompt + frozen.text,
       };
