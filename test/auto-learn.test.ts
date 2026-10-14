@@ -170,6 +170,77 @@ describe("buildExistingIndexSummary", () => {
   });
 });
 
+describe("buildExistingIndexSummary spends the summary budget on relevance", () => {
+  /** 120 entries with ~100-char summaries, oldest first by mtime, so the
+   *  6000-char budget describes only the oldest ~60 without a chunk. The last
+   *  one is about the topic the chunk discusses. */
+  function bigStore(): ResolveResult {
+    const dir = join(tmpDir, "store");
+    mkdirSync(dir, { recursive: true });
+    const lines = ["# Index"];
+    const base = Date.now() / 1000 - 10_000;
+    for (let i = 0; i < 120; i++) {
+      const stem = i === 119 ? "flmd0-hold-low-on-power-cycle" : `filler-${i}`;
+      const summary =
+        i === 119
+          ? `FLMD0 must be held low before a power cycle or the chip boots into the flash loader ${"z".repeat(20)}`
+          : `ordinary unrelated fact number ${i} ${"y".repeat(70)}`;
+      const file = join(dir, `${stem}.md`);
+      writeFileSync(file, `---\nname: ${stem}\n---\nbody`);
+      utimesSync(file, base + i, base + i);
+      lines.push(`- [${stem}](${stem}.md) — ${summary}`);
+    }
+    writeFileSync(join(dir, "MEMORY.md"), `${lines.join("\n")}\n`);
+    return {
+      project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "test" },
+      warnings: [],
+    };
+  }
+
+  const describedStems = (summary: string) =>
+    summary
+      .split("\n")
+      .filter((l) => /^- [^:]+: /.test(l))
+      .map((l) => l.slice(2, l.indexOf(":")));
+
+  it("without a chunk, the newest entry is a bare slug (oldest first)", () => {
+    const summary = buildExistingIndexSummary(bigStore());
+    expect(summary).toContain("- flmd0-hold-low-on-power-cycle\n");
+    expect(describedStems(summary)).toContain("filler-0");
+  });
+
+  it("with a chunk about it, the newest entry is described", () => {
+    const summary = buildExistingIndexSummary(
+      bigStore(),
+      "user: the board will not boot after the power cycle; is FLMD0 still held high?",
+    );
+    expect(describedStems(summary)).toContain("flmd0-hold-low-on-power-cycle");
+    expect(summary).toContain("the ones shown are those most related to this conversation");
+  });
+
+  it("relevance changes which entries are described, never the identity order", () => {
+    const stems = (s: string) =>
+      s
+        .split("\n")
+        .filter((l) => l.startsWith("- "))
+        .map((l) => l.slice(2).split(":")[0]);
+    const plain = buildExistingIndexSummary(bigStore());
+    const ranked = buildExistingIndexSummary(bigStore(), "FLMD0 power cycle flash loader");
+    expect(stems(ranked)).toEqual(stems(plain));
+    expect(stems(ranked)).toHaveLength(120);
+  });
+
+  it("an unmatched chunk falls back to oldest first", () => {
+    const store = bigStore();
+    expect(buildExistingIndexSummary(store, "qqqq wwww")).toBe(
+      buildExistingIndexSummary(store).replace(
+        "; every identifier",
+        "; the ones shown are those most related to this conversation; every identifier",
+      ),
+    );
+  });
+});
+
 describe("resolveMemoryDirs is exact for reads and mutations alike", () => {
   it("does not adopt a foreign same-basename store; it reports it as an orphan", () => {
     // Simulate cwd /work/customer-b/app whose exact project store does not
