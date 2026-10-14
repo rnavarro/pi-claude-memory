@@ -8,10 +8,13 @@
 import { describe, expect, it } from "vitest";
 import {
   ARCHIVE_HEADING,
+  clusterKey,
   excerptBytes,
   fitIndexToExcerpt,
   fitsExcerpt,
+  isClusterSignpost,
   isPinnedIndexLine,
+  parseLinkLine,
 } from "../src/index-parser.js";
 
 const link = (n: number) => `- [E${n}](e${n}.md) — s${n}`;
@@ -147,5 +150,126 @@ describe("fitIndexToExcerpt", () => {
 
     expect(fit.demoted).toEqual([]);
     expect(fit.lines).toContain(archiveTopic);
+  });
+});
+
+describe("cluster-first, rule-protected demotion", () => {
+  const entry = (stem: string) => `- [${stem}](${stem}.md) — about ${stem}`;
+  const cluster = (key: string, n: number) =>
+    Array.from({ length: n }, (_, i) => entry(`${key}-part${i}`));
+  /** Recency from a fixed table: higher is newer; unknown files are oldest. */
+  const recencyFrom = (order: string[]) => (file: string) => {
+    const at = order.indexOf(file.replace(/\.md$/, ""));
+    return at < 0 ? 1 : 1000 + at;
+  };
+  const stemsOf = (lines: string[]) =>
+    lines.flatMap((l) => {
+      const m = l.match(/\]\(([^)]+)\.md\)/);
+      return m ? [m[1]] : [];
+    });
+
+  it("demotes a big cluster before an older lone feedback rule, and signposts it", () => {
+    const input = [entry("feedback-old-rule"), ...cluster("hp-78k0", 6), entry("lone-fact"), ""];
+    const order = [
+      "feedback-old-rule",
+      "lone-fact",
+      ...stemsOf(input).filter((s) => s.startsWith("hp-")),
+    ];
+    const fit = fitIndexToExcerpt(input, { maxLines: 4, recencyAt: recencyFrom(order) });
+    const live = liveOf(fit.lines);
+    expect(stemsOf(live)).toContain("feedback-old-rule");
+    expect(stemsOf(live)).toContain("lone-fact");
+    const signposts = live.filter(isClusterSignpost);
+    expect(signposts).toHaveLength(1);
+    expect(signposts[0]).toMatch(
+      /^- hp-78k0-\* — \d+ more entries listed below the Archive heading/,
+    );
+    expect(fit.cannotFit).toBe(false);
+  });
+
+  it("never loses or duplicates a link, and the signpost is not an entry", () => {
+    const input = [...cluster("hp-78k0", 8), ...links(5), ""];
+    const fit = fitIndexToExcerpt(input, { maxLines: 6, recencyAt: () => 0 });
+    expect(stemsOf(fit.lines).sort()).toEqual(stemsOf(input).sort());
+    for (const line of fit.lines.filter(isClusterSignpost)) {
+      expect(parseLinkLine(line)).toBeNull();
+    }
+  });
+
+  it("a second pass is byte-identical", () => {
+    const input = [...cluster("hp-78k0", 8), ...cluster("esp-modbus", 5), ...links(5), ""];
+    // Real recency, as the writer always supplies: promotion without a signal
+    // is the documented degraded mode and is not expected to be stable.
+    const opts = { maxLines: 8, recencyAt: recencyFrom(stemsOf(input)) };
+    const once = fitIndexToExcerpt(input, opts);
+    const twice = fitIndexToExcerpt(once.lines, opts);
+    expect(twice.lines).toEqual(once.lines);
+    expect(once.lines.filter(isClusterSignpost).length).toBeGreaterThan(0);
+  });
+
+  it("drops a signpost once its cluster has no archived member", () => {
+    const input = [...cluster("hp-78k0", 6), ...links(2), ""];
+    const recencyAt = recencyFrom(stemsOf(input));
+    const fit = fitIndexToExcerpt(input, { maxLines: 4, recencyAt });
+    expect(fit.lines.some(isClusterSignpost)).toBe(true);
+    // The archived members are removed by hand (remove_memory edits lines).
+    const pruned = fit.lines.filter(
+      (l) => !/hp-78k0-part/.test(l) || liveOf(fit.lines).includes(l),
+    );
+    const refit = fitIndexToExcerpt(pruned, { maxLines: 4, recencyAt });
+    expect(refit.lines.some(isClusterSignpost)).toBe(false);
+  });
+
+  it("folds a new cluster member in on the next overflow and updates the count", () => {
+    const input = [...cluster("hp-78k0", 6), ...links(2), ""];
+    // The fresh member is the newest write.
+    const opts = { maxLines: 5, recencyAt: recencyFrom([...stemsOf(input), "hp-78k0-fresh"]) };
+    const first = fitIndexToExcerpt(input, opts);
+    const count = (lines: string[]) =>
+      Number(lines.find(isClusterSignpost)?.match(/ (\d+) more /)?.[1] ?? 0);
+    // The writer inserts a new line just above the Archive heading.
+    const at = first.lines.indexOf(ARCHIVE_HEADING);
+    const withNew = [...first.lines.slice(0, at), entry("hp-78k0-fresh"), ...first.lines.slice(at)];
+    const second = fitIndexToExcerpt(withNew, opts);
+    // The cluster absorbs the growth: its OLDEST live member moves out, the
+    // fresh one stays, and the signpost count goes up by one.
+    expect(liveOf(second.lines).some((l) => l.includes("hp-78k0-fresh.md"))).toBe(true);
+    expect(liveOf(second.lines).some((l) => l.includes("hp-78k0-part4.md"))).toBe(false);
+    expect(liveOf(second.lines).filter((l) => l.includes("(e"))).toHaveLength(2);
+    expect(count(second.lines)).toBe(count(first.lines) + 1);
+  });
+
+  it("rules hold back only while they fit within half the byte bound", () => {
+    const rules = Array.from({ length: 8 }, (_, i) => entry(`feedback-rule-number-${i}`));
+    const fact = entry("plain-fact");
+    const input = [...rules, fact, ""];
+    // Rules are oldest; the fact is newest.
+    const order = [...rules.map((_, i) => `feedback-rule-number-${i}`), "plain-fact"];
+    const bound = excerptBytes([...rules.slice(0, 6), fact]);
+    const fit = fitIndexToExcerpt(input, { maxBytes: bound, recencyAt: recencyFrom(order) });
+    // Rules fill far more than half the bound, so the oldest rules leave and
+    // the newer fact stays.
+    expect(stemsOf(liveOf(fit.lines))).toContain("plain-fact");
+    expect(stemsOf(liveOf(fit.lines))).not.toContain("feedback-rule-number-0");
+  });
+
+  it("the isRule callback overrides the slug convention", () => {
+    const input = [entry("deploy-rule-a"), ...cluster("hp-78k0", 5), entry("lone-fact"), ""];
+    const fit = fitIndexToExcerpt(input, {
+      maxLines: 3,
+      recencyAt: () => 0,
+      isRule: (f) => f === "deploy-rule-a.md",
+    });
+    expect(stemsOf(liveOf(fit.lines))).toContain("deploy-rule-a");
+  });
+
+  it("clusters need clusterMin members", () => {
+    expect(clusterKey("hp-78k0-flmd0.md")).toBe("hp-78k0");
+    expect(clusterKey("single.md")).toBeNull();
+    const fit = fitIndexToExcerpt([...cluster("hp-78k0", 4), ...links(4), ""], {
+      maxLines: 6,
+      recencyAt: () => 0,
+    });
+    expect(fit.lines.some(isClusterSignpost)).toBe(false);
   });
 });

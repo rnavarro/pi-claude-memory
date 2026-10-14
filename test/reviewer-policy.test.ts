@@ -3,7 +3,15 @@
 // topics per review are capped, and `supersedes` routes a candidate onto the
 // existing entry it replaces.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -258,5 +266,31 @@ describe("reviewer writes demote like tool writes", () => {
     const { dir, resolved } = overflowingStore();
     writeCandidates([cand({ name: "fresh" })], resolved, new Map(), tmpDir);
     expect(readFileSync(dir.indexPath, "utf8")).not.toMatch(/^## Archive$/m);
+  });
+});
+
+describe("the writer ranks standing rules by frontmatter type", () => {
+  it("keeps a feedback-typed topic live even without a feedback slug", () => {
+    const { dir, resolved } = mkStore();
+    // The rule is the OLDEST line, and its slug does not say "feedback".
+    writeFileSync(
+      join(dir.dir, "deploy-checklist.md"),
+      "---\nname: deploy-checklist\ndescription: d\nmetadata:\n  type: feedback\n---\nbody\n",
+    );
+    utimesSync(join(dir.dir, "deploy-checklist.md"), 1000, 1000);
+    const lines = ["# Index", "- [Deploy checklist](deploy-checklist.md) — run the gate first"];
+    for (let i = 0; i < 230; i++) {
+      writeFileSync(join(dir.dir, `old${i}.md`), `---\nname: old${i}\n---\nbody\n`);
+      utimesSync(join(dir.dir, `old${i}.md`), 2000 + i, 2000 + i);
+      lines.push(`- [Old ${i}](old${i}.md) — entry ${i}`);
+    }
+    writeFileSync(dir.indexPath, `${lines.join("\n")}\n`);
+    writeCandidates([cand({ name: "fresh" })], resolved, new Map(), tmpDir, undefined, {
+      demoteIndexOverflow: true,
+    });
+    const index = readFileSync(dir.indexPath, "utf8");
+    const live = index.slice(0, index.search(/^## Archive$/m));
+    expect(live).toContain("(deploy-checklist.md)");
+    expect(live).not.toContain("(old0.md)");
   });
 });
