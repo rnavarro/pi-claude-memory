@@ -21,7 +21,8 @@ export interface PiClaudeMemoryConfig {
   debugLog: boolean;
   /** Enable background auto-learning. */
   autoLearn: boolean;
-  /** Move the oldest non-pinned index lines below an `## Archive` heading when
+  /** Move non-pinned index lines (big topic clusters first, standing rules
+   * last) below an `## Archive` heading when
    * MEMORY.md grows past Claude Code's startup excerpt, so the live index stays
    * injectable. Off by default: it rewrites a shared, human-readable file on a
    * write that breaches the limit.

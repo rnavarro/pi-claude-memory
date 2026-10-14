@@ -131,8 +131,13 @@ no digits.
 so a busy store eventually pushes every new entry past it: the facts a session
 just learned are exactly the ones the next session cannot see, and an invisible
 entry is also an undiscoverable one. With `demoteIndexOverflow` enabled, a write
-that breaches the limit moves the oldest non-pinned entries below an
-`## Archive` heading in the same file. It deletes nothing — the topic files are
+that breaches the limit moves non-pinned entries below an `## Archive` heading
+in the same file: members of large topic clusters first (5+ entries sharing a
+two-word slug prefix, such as `hp-78k0-*`), then ordinary entries, and
+feedback/user rules last while they fill at most half the excerpt, oldest
+first within each. A cluster with archived members keeps one generated line in
+the live region (`- hp-78k0-* — 117 more entries listed below the Archive
+heading …`), regenerated on every pass. It deletes nothing — the topic files are
 untouched, `recall_memory` and `find_memory` still resolve them by name, and
 moving a line back is the undo. The live region is refitted on every write,
 including an overwrite, so an entry Claude Code appends at the end of the file
@@ -193,7 +198,7 @@ Every field is optional.
 | --- | --- | --- |
 | `debugLog` | `true` | Write structured NDJSON to `~/.pi/agent/pi-claude-memory/debug/<sessionId>.ndjson` (rotated at 10 MB) |
 | `autoLearn` | `true` | Run the background reviewer at all |
-| `demoteIndexOverflow` | `false` | Move the oldest non-pinned index lines below an `## Archive` heading when `MEMORY.md` outgrows the 200-line / 25 KB excerpt, so the live index stays injectable. Deletes nothing; see above |
+| `demoteIndexOverflow` | `false` | Move non-pinned index lines below an `## Archive` heading when `MEMORY.md` outgrows the 200-line / 25 KB excerpt, so the live index stays injectable. Order: members of topic clusters (5+ entries sharing a two-word slug prefix) first, then ordinary entries, then feedback/user rules while they fill at most half the excerpt; oldest first within each. Each cluster with archived members keeps a one-line signpost in the live region. Deletes nothing; see above |
 | `reviewIntervalTurns` | `10` | Turns between periodic reviews |
 | `injectTokenCap` | — | **Removed.** The bounded-index contract dropped body preloading, so there is no budget left to configure; the key is ignored if still present. |
 | `reviewModel` | session model | Model used for reviews. Unset, each review runs on the session's current model. Set it as `{ "provider": ..., "id": ... }` to pin a cheaper or faster model; if that model is not in the registry, reviews fail (debug-logged) rather than fall back |

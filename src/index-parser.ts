@@ -489,6 +489,14 @@ export interface IndexFitOptions {
    * which file position stops being a faithful rank.
    */
   recencyAt?: (filename: string) => number;
+  /**
+   * Whether a topic is a standing rule (feedback or user type). Rules are
+   * demoted last while they fit within RULE_SHARE of the byte bound. Defaults
+   * to the slug convention when the caller cannot read frontmatter.
+   */
+  isRule?: (filename: string) => boolean;
+  /** Members a slug-prefix cluster needs to be demoted first (default 5). */
+  clusterMin?: number;
 }
 
 export interface IndexFitResult {
@@ -503,8 +511,17 @@ export interface IndexFitResult {
   cannotFit: boolean;
 }
 
-/** Move the oldest non-pinned link lines below an `## Archive` heading until the
- * live region fits inside Claude Code's startup excerpt.
+/** Move non-pinned link lines below an `## Archive` heading until the live
+ * region fits inside Claude Code's startup excerpt.
+ *
+ * Order, oldest first within each step: members of a big slug-prefix cluster
+ * (CLUSTER_MIN_MEMBERS or more, standing rules excluded), then ordinary
+ * entries, then standing rules (feedback or user type) while they fill at most
+ * RULE_SHARE of the byte bound. A cluster with archived members keeps one
+ * generated prose signpost in the live region, so its topic stays findable.
+ * Recency alone evicted standing rules to make room for a single cluster: one
+ * hvac-control session minted 95 hp-78k0-* entries, and the rules that apply
+ * in every session were the ones demoted.
  *
  * Why this is not destruction: the topic file is never touched, recall_memory
  * resolves names against the directory rather than the index, and the parser
@@ -543,9 +560,13 @@ export function fitIndexToExcerpt(
   const maxLines = options.maxLines ?? INDEX_STARTUP_MAX_LINES;
   const maxBytes = options.maxBytes ?? INDEX_STARTUP_MAX_BYTES;
   const recencyAt = options.recencyAt;
+  const isRule = options.isRule ?? isRuleBySlug;
+  const clusterMin = options.clusterMin ?? CLUSTER_MIN_MEMBERS;
   const promote = recencyAt !== undefined;
 
-  const lines = [...input];
+  // Signposts are derived, never authored: strip every one up front and
+  // regenerate them at the end, so a pass is a pure function of the links.
+  const lines = input.filter((line) => !isClusterSignpost(line));
   // A trailing empty element is the file's final newline, not a line. Hold it
   // aside so rebuilding cannot consume it or double it.
   const trailing = lines.at(-1) === "" ? lines.pop() : undefined;
@@ -563,44 +584,127 @@ export function fitIndexToExcerpt(
   const archivedLinks: string[] = promote ? [] : [...alreadyArchived];
   const demoted: string[] = [];
 
-  const assemble = (fits: boolean): IndexFitResult => {
-    const out = [...live];
+  const fileOf = (line: string): string | null => {
+    const link = parseLinkLine(line);
+    return link ? basename(link.href) : null;
+  };
+  const ruleCache = new Map<string, boolean>();
+  const ruleOf = (file: string): boolean => {
+    let known = ruleCache.get(file);
+    if (known === undefined) {
+      known = isRule(file);
+      ruleCache.set(file, known);
+    }
+    return known;
+  };
+  /** The cluster a line belongs to, or null for a rule, a pin, a singleton
+   *  prefix, or prose. Rules are never clustered: a run of feedback slugs
+   *  sharing two words ("feedback-dont-*") is a set of distinct rules, not a
+   *  topic one pointer can stand in for. */
+  const clusterOfFile = (file: string): string | null => {
+    if (ruleOf(file)) return null;
+    return clusterKey(file);
+  };
+
+  // Cluster sizes over the WHOLE index, so a cluster mostly archived already
+  // still counts as one.
+  const clusterSize = new Map<string, number>();
+  for (const line of [...live, ...archivedLinks]) {
+    const file = fileOf(line);
+    const key = file ? clusterOfFile(file) : null;
+    if (key) clusterSize.set(key, (clusterSize.get(key) ?? 0) + 1);
+  }
+  const bigClusters = [...clusterSize]
+    .filter(([, n]) => n >= clusterMin)
+    .map(([key]) => key)
+    .sort();
+  const big = new Set(bigClusters);
+
+  // Room for the signposts is reserved before fitting, at their largest
+  // possible size, so adding them afterwards can never push the live region
+  // back over the bound.
+  const reserveLines = bigClusters.length;
+  const reserveBytes = bigClusters.reduce(
+    (sum, key) =>
+      sum + Buffer.byteLength(clusterSignpost(key, clusterSize.get(key) ?? 0), "utf8") + 1,
+    0,
+  );
+  const fitLines = Math.max(0, maxLines - reserveLines);
+  const fitBytes = Math.max(0, maxBytes - reserveBytes);
+
+  const assemble = (): IndexFitResult => {
+    const archivedCount = new Map<string, number>();
+    for (const line of archivedLinks) {
+      const file = fileOf(line);
+      const key = file ? clusterOfFile(file) : null;
+      if (key && big.has(key)) archivedCount.set(key, (archivedCount.get(key) ?? 0) + 1);
+    }
+    const signposts = bigClusters
+      .filter((key) => (archivedCount.get(key) ?? 0) > 0)
+      .map((key) => clusterSignpost(key, archivedCount.get(key) ?? 0));
+    const liveOut = [...live, ...signposts];
+    const out = [...liveOut];
     if (hadMarker || archivedLinks.length > 0 || parked.length > 0) {
       out.push(ARCHIVE_HEADING, ...parked, ...archivedLinks);
     }
     if (trailing !== undefined) out.push(trailing);
-    return { lines: out, demoted, cannotFit: !fits };
+    return { lines: out, demoted, cannotFit: !fitsExcerpt(liveOut, maxLines, maxBytes) };
   };
 
-  if (fitsExcerpt(live, maxLines, maxBytes)) return assemble(true);
+  if (fitsExcerpt(live, fitLines, fitBytes)) return assemble();
 
   // A link that was already archived and gets re-demoted is not news: the steady
   // state re-demotes the same lines on every write, and reporting them would
   // make every write look like it changed something.
   const previouslyArchived = new Set(
     alreadyArchived.flatMap((line) => {
-      const link = parseLinkLine(line);
-      return link ? [basename(link.href).toLowerCase()] : [];
+      const file = fileOf(line);
+      return file ? [file.toLowerCase()] : [];
     }),
   );
   // Ages are computed once against the pre-splice positions and spliced in step
   // with `live`, so the positional fallback does not drift as lines leave.
   const ages = live.map((line, at) => {
-    const link = parseLinkLine(line);
+    const file = fileOf(line);
     // Prose and headings are never victims, so their age never decides anything.
-    if (link === null) return Number.POSITIVE_INFINITY;
-    const known = recencyAt ? recencyAt(basename(link.href)) : 0;
+    if (file === null) return Number.POSITIVE_INFINITY;
+    const known = recencyAt ? recencyAt(file) : 0;
     return known > 0 ? known : at;
   });
 
-  while (!fitsExcerpt(live, maxLines, maxBytes)) {
+  // Standing rules are held back only while they fill at most RULE_SHARE of the
+  // byte bound. Past that, the oldest of them compete with ordinary entries, so
+  // a flood of reviewer-minted rules cannot push everything else out.
+  const ruleBudget = maxBytes * RULE_SHARE;
+  let ruleBytes = 0;
+  for (const line of live) {
+    const file = fileOf(line);
+    if (file && isDemotableLinkLine(line) && ruleOf(file)) {
+      ruleBytes += Buffer.byteLength(line, "utf8") + 1;
+    }
+  }
+
+  /** Demotion order: 0 = member of a big cluster (its signpost stands in for
+   *  it), 1 = ordinary entry, 2 = standing rule while rules are within budget. */
+  const tierOf = (line: string): number => {
+    const file = fileOf(line);
+    if (file === null) return Number.POSITIVE_INFINITY;
+    if (ruleOf(file)) return ruleBytes > ruleBudget ? 1 : 2;
+    const key = clusterOfFile(file);
+    return key && big.has(key) ? 0 : 1;
+  };
+
+  while (!fitsExcerpt(live, fitLines, fitBytes)) {
     let victimIdx = -1;
+    let victimTier = Number.POSITIVE_INFINITY;
     let victimAge = Number.POSITIVE_INFINITY;
     for (let i = 0; i < live.length; i++) {
       const line = live[i];
       if (line === undefined || !isDemotableLinkLine(line)) continue;
+      const tier = tierOf(line);
       const age = ages[i] ?? Number.POSITIVE_INFINITY;
-      if (age < victimAge) {
+      if (tier < victimTier || (tier === victimTier && age < victimAge)) {
+        victimTier = tier;
         victimAge = age;
         victimIdx = i;
       }
@@ -614,11 +718,50 @@ export function fitIndexToExcerpt(
     const moved = live.splice(victimIdx, 1)[0];
     ages.splice(victimIdx, 1);
     if (moved === undefined) continue;
-    const link = parseLinkLine(moved);
-    const name = link ? basename(link.href) : moved;
+    const name = fileOf(moved) ?? moved;
+    if (ruleOf(name)) ruleBytes -= Buffer.byteLength(moved, "utf8") + 1;
     if (!previouslyArchived.has(name.toLowerCase())) demoted.push(name);
     archivedLinks.push(moved);
   }
 
-  return assemble(fitsExcerpt(live, maxLines, maxBytes));
+  return assemble();
+}
+
+/** Members a slug-prefix cluster needs before its lines are demoted first. */
+export const CLUSTER_MIN_MEMBERS = 5;
+
+/** Share of the byte bound standing rules may hold before they compete with
+ *  ordinary entries for the live region. */
+export const RULE_SHARE = 0.5;
+
+/** A topic's cluster: the first two words of its stem ("hp-78k0" for
+ *  "hp-78k0-flmd0-hold.md"), or null for a one-word stem. */
+export function clusterKey(file: string): string | null {
+  const words = file
+    .replace(/\.md$/i, "")
+    .toLowerCase()
+    .split(/[-_]+/)
+    .filter((w) => w.length > 0);
+  return words.length >= 2 ? `${words[0]}-${words[1]}` : null;
+}
+
+/** Fallback rule test when the caller cannot read frontmatter: the store's
+ *  slug conventions ("feedback-…", "feedback_…", "user-…"). */
+function isRuleBySlug(file: string): boolean {
+  return /^(feedback|user)[-_]/i.test(file);
+}
+
+/** The generated line that stands in for a cluster's archived members. Prose,
+ *  not a link, so the parser never counts it as an entry and demotion never
+ *  moves it. Tool-neutral up front because Claude Code reads this file too. */
+export function clusterSignpost(key: string, archivedCount: number): string {
+  const noun = archivedCount === 1 ? "entry" : "entries";
+  return `- ${key}-* — ${archivedCount} more ${noun} listed below the Archive heading (find_memory "${key}")`;
+}
+
+/** True for a line clusterSignpost generated. */
+export function isClusterSignpost(line: string): boolean {
+  return /^- [a-z0-9]+-[a-z0-9]+-\* — \d+ more entr(?:y|ies) listed below the Archive heading \(find_memory "[a-z0-9]+-[a-z0-9]+"\)$/.test(
+    line,
+  );
 }

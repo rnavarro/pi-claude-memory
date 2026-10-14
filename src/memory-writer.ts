@@ -64,6 +64,23 @@ export interface WriteMemoryRequest {
   allowOverwrite: boolean;
 }
 
+/** Whether a topic is a standing rule (frontmatter type feedback or user),
+ * for the fit planner's demotion order. Reads only a plain regular file of
+ * modest size inside the store (lstat, so a symlink is never followed); on any
+ * doubt it falls back to the slug convention the planner uses itself. */
+function topicIsRule(dir: MemoryDir, filename: string): boolean {
+  const bySlug = /^(feedback|user)[-_]/i.test(filename);
+  const p = join(dir.dir, basename(filename));
+  try {
+    const st = lstatSync(p);
+    if (!st.isFile() || st.size > 64 * 1024) return bySlug;
+    const type = parseMemoryContent(readFileSync(p, "utf8"), basename(filename), st.mtimeMs).type;
+    return type === null ? bySlug : type === "feedback" || type === "user";
+  } catch {
+    return bySlug;
+  }
+}
+
 /** A remove-memory request. */
 export interface RemoveMemoryRequest {
   /** Entry name or filename to remove. */
@@ -799,6 +816,7 @@ function patchIndexAppend(
               return 0;
             }
           },
+          isRule: (filename) => topicIsRule(dir, filename),
         })
       : null;
     return (lastFit ? lastFit.lines : lines).join("\n");
