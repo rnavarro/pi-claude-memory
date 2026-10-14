@@ -316,3 +316,51 @@ describe("the memory block is a named prompt section", () => {
     expect(res?.systemPrompt).toContain("alpha.md");
   });
 });
+
+describe("subagent sessions get a smaller index and their own reviewer sentence", () => {
+  /** An index whose entries run well past the subagent bound but stay inside
+   *  the 25KB startup limit, so only the subagent view truncates. */
+  function bigIndex(): string {
+    const lines = ["# P"];
+    for (let i = 0; i < 120; i++) {
+      lines.push(`- [Entry ${i}](entry-${i}.md) — ${"x".repeat(100)}`);
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  async function promptFor(cwd: string, child: boolean): Promise<string> {
+    const orig = process.env.PI_SUBAGENT_CHILD;
+    if (child) process.env.PI_SUBAGENT_CHILD = "1";
+    else delete process.env.PI_SUBAGENT_CHILD;
+    try {
+      const ext = loadExtension(cwd);
+      await ext.sessionStart();
+      return await ext.prompt();
+    } finally {
+      if (orig === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = orig;
+    }
+  }
+
+  it("a subagent sees the head of the index, cut at 8000 bytes", async () => {
+    const cwd = join(tmpHome, "work", "child");
+    makeStore(cwd, bigIndex());
+    const text = await promptFor(cwd, true);
+    expect(text).toContain("entry-0.md");
+    expect(text).not.toContain("entry-119.md");
+    expect(text).toContain("Index truncated at 8000 bytes");
+    expect(text).toContain("This is a subagent session");
+    expect(text).not.toContain("write_memory is the only way a fact survives");
+    expect(text).not.toContain("A background reviewer sweeps");
+  });
+
+  it("a top-level session still sees the full startup excerpt", async () => {
+    const cwd = join(tmpHome, "work", "parent");
+    makeStore(cwd, bigIndex());
+    const text = await promptFor(cwd, false);
+    expect(text).toContain("entry-119.md");
+    expect(text).not.toContain("Index truncated");
+    expect(text).not.toContain("This is a subagent session");
+    expect(text).toContain("A background reviewer sweeps");
+  });
+});

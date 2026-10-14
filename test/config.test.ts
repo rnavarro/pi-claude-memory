@@ -98,6 +98,25 @@ describe("correction and tool-call trigger settings", () => {
     }
   }
 
+  it("subagent defaults: no reviewer, 8000-byte index", async () => {
+    const { DEFAULT_CONFIG } = await import("../src/config.js");
+    expect(DEFAULT_CONFIG.subagentAutoLearn).toBe(false);
+    expect(DEFAULT_CONFIG.subagentIndexMaxBytes).toBe(8000);
+  });
+
+  it("subagentIndexMaxBytes above the 25KB startup limit falls back loudly", async () => {
+    const { cfg, msgs } = await loadWith({ subagentIndexMaxBytes: 30000 });
+    expect(cfg.subagentIndexMaxBytes).toBe(8000);
+    expect(msgs.some((m) => m.includes("subagentIndexMaxBytes"))).toBe(true);
+  });
+
+  it("isSubagentProcess reads PI_SUBAGENT_CHILD=1 only", async () => {
+    const { isSubagentProcess } = await import("../src/config.js");
+    expect(isSubagentProcess({ PI_SUBAGENT_CHILD: "1" })).toBe(true);
+    expect(isSubagentProcess({ PI_SUBAGENT_CHILD: "0" })).toBe(false);
+    expect(isSubagentProcess({})).toBe(false);
+  });
+
   it("defaults: corrections on, 25 tool calls, 60 s debounce", async () => {
     const { DEFAULT_CONFIG } = await import("../src/config.js");
     expect(DEFAULT_CONFIG.reviewOnCorrection).toBe(true);

@@ -60,8 +60,24 @@ export const MEMORY_ROUTING_ANCHOR_EMPTY = `pi-claude-memory active. No memories
 User correction, stated preference, or verified fix → write_memory.{{REVIEWER}}
 Never store ephemeral state, TODOs, or commit hashes.`;
 
-/** Describe the reviewer honestly for the current config. */
-export function reviewerClause(autoLearn: boolean, reviewIntervalTurns: number): string {
+/** Describe the reviewer honestly for the current config.
+ *
+ * A subagent gets its own sentence. The generic no-reviewer line ("write_memory
+ * is the only way a fact survives") is true of a top-level session with
+ * autoLearn off, but in a subagent it pushes every child to write: the
+ * parent's reviewer already sees what the child reports back, so the child
+ * should report, not record. */
+export function reviewerClause(
+  autoLearn: boolean,
+  reviewIntervalTurns: number,
+  subagent = false,
+): string {
+  if (subagent && !autoLearn) {
+    return (
+      " This is a subagent session: put findings in your report — the parent session decides what to remember." +
+      " write_memory only for a durable fact the report cannot carry."
+    );
+  }
   if (!autoLearn) {
     return " Nothing sweeps this conversation automatically — write_memory is the only way a fact survives.";
   }
@@ -69,8 +85,13 @@ export function reviewerClause(autoLearn: boolean, reviewIntervalTurns: number):
 }
 
 /** Fill in the reviewer sentence for the resolved config. */
-function withReviewer(template: string, autoLearn: boolean, reviewIntervalTurns: number): string {
-  return template.replace("{{REVIEWER}}", reviewerClause(autoLearn, reviewIntervalTurns));
+function withReviewer(
+  template: string,
+  autoLearn: boolean,
+  reviewIntervalTurns: number,
+  subagent: boolean,
+): string {
+  return template.replace("{{REVIEWER}}", reviewerClause(autoLearn, reviewIntervalTurns, subagent));
 }
 
 /** Injection options. An object rather than positional arguments: the removed
@@ -85,6 +106,12 @@ export interface InjectionOptions {
   autoLearn?: boolean;
   /** Interval stated in the anchor when autoLearn is on. */
   reviewIntervalTurns?: number;
+  /** Whether this is a subagent session. Selects the subagent reviewer
+   *  sentence when autoLearn is off. */
+  subagent?: boolean;
+  /** Byte bound on the injected index excerpt; defaults to (and can never
+   *  exceed) the 25KB startup limit. */
+  indexMaxBytes?: number;
 }
 
 /**
@@ -97,12 +124,18 @@ export function buildMemoryInjection(
   project: MemoryDir | null,
   options: InjectionOptions = {},
 ): { text: string; warnings: string[] } {
-  const { hasCtxSearch = true, autoLearn = true, reviewIntervalTurns = 10 } = options;
+  const {
+    hasCtxSearch = true,
+    autoLearn = true,
+    reviewIntervalTurns = 10,
+    subagent = false,
+    indexMaxBytes = INDEX_STARTUP_MAX_BYTES,
+  } = options;
   const warnings: string[] = [];
   const blocks: string[] = [];
 
   const projectIndex = project
-    ? buildProjectIndexBlock(project, warnings)
+    ? buildProjectIndexBlock(project, warnings, indexMaxBytes)
     : { block: null, rejectedReason: null };
   if (projectIndex.block) blocks.push(projectIndex.block);
 
@@ -114,6 +147,7 @@ export function buildMemoryInjection(
     hasAnyEntries ? MEMORY_ROUTING_ANCHOR : MEMORY_ROUTING_ANCHOR_EMPTY,
     autoLearn,
     reviewIntervalTurns,
+    subagent,
   );
 
   // Gate the ctx_search clause when the tool isn't registered.
@@ -223,7 +257,11 @@ interface ProjectIndexBlock {
 
 /** Build the project tier block: the bounded index excerpt plus the routing
  *  guidance that only makes sense for the entries actually shown. */
-function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): ProjectIndexBlock {
+function buildProjectIndexBlock(
+  project: MemoryDir,
+  warnings: string[],
+  indexMaxBytes: number,
+): ProjectIndexBlock {
   // Reconcile against the FULL index, never the bounded excerpt: a topic whose
   // link sits below the 200-line cut is still indexed, so reporting it as
   // unindexed would be a lie. This is also the only signal that a topic file
@@ -254,7 +292,7 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): Project
     });
   }
 
-  const bounded = readBoundedIndex(project);
+  const bounded = readBoundedIndex(project, indexMaxBytes);
   // No index file at all: not a warning, just a store without an index yet.
   if (!bounded) return { block: null, rejectedReason: null };
   if (!bounded.ok) {
@@ -281,7 +319,7 @@ function buildProjectIndexBlock(project: MemoryDir, warnings: string[]): Project
     const kept = bounded.content.split("\n").length;
     const bound =
       bounded.limitedBy === "bytes"
-        ? `${INDEX_STARTUP_MAX_BYTES} bytes`
+        ? `${Math.min(indexMaxBytes, INDEX_STARTUP_MAX_BYTES)} bytes`
         : `${INDEX_STARTUP_MAX_LINES} lines`;
     parts.push(
       `Index truncated at ${bound} (${kept} of ${bounded.totalLines} lines shown). ` +

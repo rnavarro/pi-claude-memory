@@ -27,7 +27,7 @@ import type {
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { type AutoLearnConfig, runAutoLearn } from "./auto-learn.js";
-import { loadConfig, type PiClaudeMemoryConfig } from "./config.js";
+import { isSubagentProcess, loadConfig, type PiClaudeMemoryConfig } from "./config.js";
 import { detectCorrectionPattern } from "./correction.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
 import { buildMemoryInjection } from "./injector.js";
@@ -94,6 +94,10 @@ let appendSessionEntry: ((customType: string, data: InjectionRecord) => void) | 
 
 // Loaded config (debugLog, autoLearn, reviewIntervalTurns, etc.)
 let config: PiClaudeMemoryConfig = loadConfig();
+// Whether this process hosts a pi-subagents child (see isSubagentProcess).
+// Fixed for the process lifetime: the runner sets the marker before any child
+// session starts.
+let subagentSession = false;
 
 // Turn counter for auto-learning. Incremented on turn_end, checked on agent_settled.
 let turnCount = 0;
@@ -200,6 +204,16 @@ function getSessionId(ctx: ExtensionContext): string | undefined {
 
 export default function piClaudeMemory(pi: ExtensionAPI): void {
   config = loadConfig();
+  subagentSession = isSubagentProcess();
+  // A subagent reviews nothing on its own unless configured to. Turning
+  // autoLearn off here (rather than gating each trigger) removes every review
+  // path at once: periodic, tool-call, correction, compact, and shutdown. The
+  // correction trigger matters most: in a child the "user" is the parent's
+  // task prompt, so phrasing like "actually" or "use X instead" fired it on
+  // nearly every child in a measured hvac-control session.
+  if (subagentSession && !config.subagentAutoLearn) {
+    config = { ...config, autoLearn: false };
+  }
   appendSessionEntry =
     typeof pi.appendEntry === "function"
       ? (customType, data) => pi.appendEntry(customType, data)
@@ -207,6 +221,7 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
 
   debugLog("extension.register", {
     debugLog: config.debugLog,
+    subagent: subagentSession,
     autoLearn: config.autoLearn,
     reviewIntervalTurns: config.reviewIntervalTurns,
     reviewModel: config.reviewModel
@@ -670,6 +685,8 @@ function computeInjection(cwd: string, hasCtxSearch: boolean): FrozenInjection {
     hasCtxSearch,
     autoLearn: config.autoLearn,
     reviewIntervalTurns: config.reviewIntervalTurns,
+    subagent: subagentSession,
+    ...(subagentSession ? { indexMaxBytes: config.subagentIndexMaxBytes } : {}),
   });
 
   if (warnings.length > 0) {

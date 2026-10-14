@@ -14,6 +14,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { INDEX_STARTUP_MAX_BYTES } from "./types.js";
 
 export interface PiClaudeMemoryConfig {
   /** Enable NDJSON debug logging to ~/.pi/agent/pi-claude-memory/debug/. */
@@ -62,6 +63,17 @@ export interface PiClaudeMemoryConfig {
   /** Minimum seconds between two TRIGGERED reviews (correction or tool-call
    * count). The periodic turn trigger is not debounced. 0 disables. */
   reviewTriggerDebounceSeconds: number;
+  /** Run the background reviewer inside a subagent (see isSubagentProcess).
+   * Off by default: a subagent's "user" is its parent, so the correction
+   * trigger fires on task prompts, and the parent's own reviewer already sees
+   * what the subagent reports back. Every subagent reviewing on its own is one
+   * more LLM call and one more concurrent MEMORY.md writer per child. */
+  subagentAutoLearn: boolean;
+  /** Byte bound on the index excerpt injected into a subagent. A subagent
+   * starts from a task brief, not the project's history, so it gets the head
+   * of the index (where the standing rules sit) rather than the full 25KB
+   * startup excerpt. recall_memory and find_memory still reach the rest. */
+  subagentIndexMaxBytes: number;
 }
 
 export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
@@ -79,6 +91,8 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   reviewOnCorrection: true,
   reviewEveryToolCalls: 25,
   reviewTriggerDebounceSeconds: 60,
+  subagentAutoLearn: false,
+  subagentIndexMaxBytes: 8000,
 };
 
 const SETTINGS_KEY = "pi-claude-memory";
@@ -216,10 +230,36 @@ export function loadConfig(): PiClaudeMemoryConfig {
             ),
           }
         : {}),
+      ...(typeof n.subagentAutoLearn === "boolean"
+        ? { subagentAutoLearn: n.subagentAutoLearn }
+        : {}),
+      ...(n.subagentIndexMaxBytes !== undefined
+        ? {
+            subagentIndexMaxBytes: num(
+              n.subagentIndexMaxBytes,
+              "subagentIndexMaxBytes",
+              DEFAULT_CONFIG.subagentIndexMaxBytes,
+              0,
+              INDEX_STARTUP_MAX_BYTES,
+            ),
+          }
+        : {}),
     };
   } catch {
     return { ...DEFAULT_CONFIG };
   }
+}
+
+/** Whether this process hosts a pi-subagents child session.
+ *
+ * pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 at module load
+ * (runs/shared/child-runtime-config.ts names it; runs/background/
+ * subagent-runner.ts sets it). That is the only place this extension can run
+ * in a child: a foreground child is built in the parent process with ambient
+ * extensions disabled (child-launch.ts: ambientExtensions requires
+ * host === "runner"), so it never loads pi-claude-memory at all. */
+export function isSubagentProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PI_SUBAGENT_CHILD === "1";
 }
 
 function isModelObj(v: unknown): v is { provider: string; id: string } {

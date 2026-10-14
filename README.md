@@ -207,6 +207,8 @@ Every field is optional.
 | `reviewOnCorrection` | `true` | Review early when your message reads as a correction |
 | `reviewEveryToolCalls` | `25` | Also review after this many tool results since the last review, checked when the agent settles; `0` disables |
 | `reviewTriggerDebounceSeconds` | `60` | Minimum seconds between two correction- or tool-call-triggered reviews; `0` disables |
+| `subagentAutoLearn` | `false` | Run the background reviewer inside a pi-subagents child (detected by `PI_SUBAGENT_CHILD=1`). Off because the parent's reviewer already sees what a child reports, and in a child the correction trigger fires on the parent's task prompt |
+| `subagentIndexMaxBytes` | `8000` | Byte bound on the index excerpt a subagent is shown, at most the 25 KB startup limit; `recall_memory` and `find_memory` still reach the rest |
 
 Values that are present but invalid (wrong type, or a number out of range) fall
 back to the default and produce a warning, rather than being silently accepted.
