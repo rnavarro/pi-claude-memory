@@ -308,6 +308,55 @@ describe("config off-switches", () => {
   });
 });
 
+describe("subagent mode", () => {
+  const REVIEW_EVENTS = [
+    "turn_end",
+    "tool_result",
+    "agent_settled",
+    "input",
+    "session_before_compact",
+    "session_shutdown",
+  ];
+
+  async function loadChild(settings: Record<string, unknown>) {
+    const orig = process.env.PI_SUBAGENT_CHILD;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    try {
+      return await load(settings);
+    } finally {
+      if (orig === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = orig;
+    }
+  }
+
+  it("registers no review handler, so a task prompt that reads as a correction reviews nothing", async () => {
+    const d = await loadChild({});
+    for (const name of REVIEW_EVENTS) expect(d.handlers.has(name)).toBe(false);
+    await d.say("actually, use the ansible key instead");
+    await d.turn(30);
+    await d.settle();
+    await d.shutdown();
+    expect(fake.launches).toHaveLength(0);
+  });
+
+  it("subagentAutoLearn: true restores the reviewer in a subagent", async () => {
+    const d = await loadChild({ subagentAutoLearn: true });
+    await d.say("no, use pnpm");
+    await d.turn();
+    await d.settle();
+    expect(fake.launches).toHaveLength(1);
+  });
+
+  it("a top-level session is unaffected by the subagent settings", async () => {
+    const d = await load({ subagentAutoLearn: false });
+    expect(d.handlers.has("input")).toBe(true);
+    await d.say("no, use pnpm");
+    await d.turn();
+    await d.settle();
+    expect(fake.launches).toHaveLength(1);
+  });
+});
+
 describe("shutdown revision gate after a triggered review", () => {
   it("skips the shutdown review when the triggered review covered everything", async () => {
     const d = await load({});

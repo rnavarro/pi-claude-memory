@@ -169,8 +169,16 @@ export type BoundedIndex =
  *
  * Returns null when no index file exists. Guard failures (symlinked,
  * non-regular, past INDEX_MAX_BYTES, unreadable) are reported as ok:false so
- * the caller can warn rather than silently inject nothing. */
-export function readBoundedIndex(dir: MemoryDir): BoundedIndex | null {
+ * the caller can warn rather than silently inject nothing.
+ *
+ * maxBytes narrows the byte limit for a smaller view (a subagent's). It never
+ * widens it: the startup limit is Claude Code's, and both harnesses must agree
+ * on what the model is shown by default. */
+export function readBoundedIndex(
+  dir: MemoryDir,
+  maxBytes: number = INDEX_STARTUP_MAX_BYTES,
+): BoundedIndex | null {
+  const byteLimit = Math.min(maxBytes, INDEX_STARTUP_MAX_BYTES);
   let st: import("node:fs").Stats;
   try {
     st = lstatSync(dir.indexPath);
@@ -199,7 +207,7 @@ export function readBoundedIndex(dir: MemoryDir): BoundedIndex | null {
     // previous one, so the excerpt measures the same on disk and in the prompt.
     // Whole lines are kept, so a multi-byte character is never split.
     const lineBytes = Buffer.byteLength(line, "utf8") + (kept.length > 0 ? 1 : 0);
-    if (bytes + lineBytes > INDEX_STARTUP_MAX_BYTES) {
+    if (bytes + lineBytes > byteLimit) {
       limitedBy = "bytes";
       break;
     }
