@@ -16,6 +16,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findContentIssues, scanMemoryCandidate } from "./content-scan.js";
 import { debugLog } from "./debug-log.js";
+import { parseMemoryFile } from "./frontmatter.js";
 import { parseIndexFile } from "./index-parser.js";
 import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
@@ -33,24 +34,44 @@ export interface AutoLearnConfig {
   thinking: "off" | "minimal" | "low" | "medium" | "high";
   /** Max output tokens for the review call. */
   maxOutputTokens: number;
+  /** Max NEW topic files one review may create. Supersessions of an existing
+   * entry do not count. Optional so existing callers keep the default. */
+  maxNewPerReview?: number;
 }
+
+/** Default cap on new topic files per review. */
+export const DEFAULT_MAX_NEW_PER_REVIEW = 3;
 
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
   thinking: "off",
   maxOutputTokens: 2048,
+  maxNewPerReview: DEFAULT_MAX_NEW_PER_REVIEW,
 };
 
-const SYSTEM_PROMPT = `You are a memory extraction agent. Your job is to read a recent conversation chunk and extract durable facts worth remembering across sessions.
+/** The reviewer's instructions, with the per-review cap stated.
+ *
+ * Pins and priority are no longer asked for. A pin exempts an index line from
+ * demotion, and a no-thinking reviewer pinned liberally: in one hvac-control
+ * session it pinned 41 entries, the live region's pins went from 24 to 53, and
+ * the oldest unpinned feedback rules were demoted to make room for them. Pins
+ * now come only from an explicit write_memory call.
+ *
+ * `supersedes` replaces the old overwrite flag as the field the model fills
+ * in, so every candidate carries an explicit answer to "which existing entry
+ * does this replace?". A store with hundreds of entries otherwise collects
+ * one-fact siblings (95 new hp-78k0-* slugs in that session). */
+export function buildSystemPrompt(maxNew: number): string {
+  return `You are a memory extraction agent. Your job is to read a recent conversation chunk and extract durable facts worth remembering across sessions.
 
-You return a JSON array of memory candidates. Each candidate has:
-- name: short slug (kebab-case, e.g. "prefer-jq-for-json") — match existing entry name for supersession
+You return a JSON array of memory candidates, MOST DURABLE FIRST. Each candidate has:
+- name: short slug (kebab-case, e.g. "prefer-jq-for-json")
 - description: one-line summary
 - type: one of "feedback" (behavioral rule), "reference" (lookup material), "project" (project-specific fact), "user" (user preference)
 - body: markdown body, 1-10 lines
-- pinned: boolean (true only for critical behavioral rules)
-- overwrite: boolean (true if this supersedes/replaces an existing entry — see SUPERSESSION below)
-- priority: optional integer 1-5 (5=highest). Stored as metadata; under the bounded-index contract it no longer affects injection order, because no bodies are preloaded.
+- supersedes: the slug of the existing entry this replaces or extends, or null for a genuinely new topic
+
+At most ${maxNew} candidates may have supersedes: null. Superseding candidates do not count toward that limit.
 
 What to extract:
 - User preferences and conventions explicitly stated
@@ -59,30 +80,36 @@ What to extract:
 - Corrections of earlier mistakes
 
 What NOT to extract:
-- Ephemeral state, TODOs, debugging steps
-- Git history, commit hashes, or transient file paths
+- Ephemeral state, TODOs, debugging steps, progress tallies
+- Git history, commit hashes, MR/PR/issue numbers, or transient file paths
 - Code patterns that are obvious from the code itself
 - Anything already covered by existing memory entries
 
 SUPERSESSION:
-If a candidate contradicts or supersedes an existing entry (e.g. a bug fix that
-resolves an earlier "unproven" note, or a corrected fact), return it with the
-SAME slug as the existing entry so it replaces the old content. Do NOT create a
-new entry under a different slug — that creates duplicates. Match the existing
-entry's slug exactly: use the identifier before the colon in the existing index
-(that is the existing file's filename stem, e.g. "prefer-jq" — NOT the
-description).
+Prefer extending an existing entry over creating a sibling. If a candidate
+corrects, updates, or adds detail to an existing entry in the same area, set
+supersedes to that entry's slug and write a body that covers BOTH the old
+content still true and the new detail: the body replaces the old one. Use the
+identifier before the colon in the existing index (the existing file's
+filename stem, e.g. "prefer-jq" — NOT the description).
 
 If there is nothing worth extracting, return an empty array: []
 
 Return ONLY the JSON array. No prose, no code fence.`;
+}
 
 export interface MemoryCandidate {
   name: string;
   description: string;
   type: "feedback" | "reference" | "project" | "user";
   body: string;
-  pinned: boolean;
+  /** Ignored on write: a reviewer never pins (see buildSystemPrompt). Still
+   * accepted so a model that emits it is not rejected. */
+  pinned?: boolean;
+  /** Slug of the existing entry this candidate replaces, or null/absent for a
+   * new topic. A non-empty value is folded into name + overwrite by
+   * normalizeCandidate before writing. */
+  supersedes?: string | null;
   /** If true, overwrite an existing entry with the same slug (supersession).
    * The LLM sets this when a candidate contradicts/replaces an existing entry. */
   overwrite?: boolean;
@@ -145,7 +172,7 @@ ${chunk}
 Extract durable memories worth persisting. Return ONLY a JSON array.`;
 
   const context: Context = {
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt: buildSystemPrompt(cfg.maxNewPerReview ?? DEFAULT_MAX_NEW_PER_REVIEW),
     messages: [
       {
         role: "user",
@@ -230,7 +257,14 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     return 0;
   }
 
-  return writeCandidates(candidates, resolved, mtimes, cwd, signal);
+  return writeCandidates(
+    candidates,
+    resolved,
+    mtimes,
+    cwd,
+    signal,
+    cfg.maxNewPerReview ?? DEFAULT_MAX_NEW_PER_REVIEW,
+  );
 }
 
 /**
@@ -282,13 +316,17 @@ function resolveReviewModel(
  * for injection and invisible characters only (see scanWriteToolInput).
  */
 export function writeCandidates(
-  candidates: MemoryCandidate[],
+  rawCandidates: MemoryCandidate[],
   resolved: ResolveResult,
   mtimes: Map<string, number>,
   cwd: string,
   signal?: AbortSignal,
+  maxNew: number = Number.POSITIVE_INFINITY,
 ): number {
+  const candidates = rawCandidates.map(normalizeCandidate);
   let written = 0;
+  let newWritten = 0;
+  const capped: string[] = [];
   for (const c of candidates) {
     // Abort between candidates: a shutdown-timeout abort raised mid-loop
     // must stop the remaining fs writes as soon as possible.
@@ -353,6 +391,13 @@ export function writeCandidates(
         continue;
       }
     }
+    // New-topic cap. Candidates arrive most durable first, so the ones past
+    // the cap are the least durable. Supersessions are never capped: they
+    // refine the store without growing it.
+    if (c.overwrite !== true && newWritten >= maxNew) {
+      capped.push(logSafeName(c.name));
+      continue;
+    }
     // Per-candidate try/catch: one bad candidate (fs error, portability
     // throw) must not drop the rest of the batch — a thrown error here
     // would otherwise reject runAutoLearn and lose all remaining writes.
@@ -362,24 +407,56 @@ export function writeCandidates(
         description: c.description,
         type: c.type,
         body: c.body,
-        pinned: c.pinned,
+        // A reviewer never pins, but it must not unpin either: the writer
+        // drops pinned:true on an overwrite that passes false, so a
+        // supersession keeps whatever pin the target already carries.
+        pinned: c.overwrite === true && existingPinned(dir, c.name),
         priority: c.priority ?? null,
         // Auto-learn overwrites only when the LLM signals supersession
         allowOverwrite: c.overwrite === true,
       });
-      if (result.ok) written++;
+      if (result.ok) {
+        written++;
+        if (c.overwrite !== true) newWritten++;
+      }
     } catch (err) {
       debugLog("auto_learn.write_error", { name: c.name, tier: dir.tier, error: String(err) });
     }
+  }
+
+  if (capped.length > 0) {
+    debugLog("auto_learn.candidates_capped", { maxNew, capped });
   }
 
   debugLog("auto_learn.complete", {
     candidates: candidates.length,
     written,
     skipped: candidates.length - written,
+    capped: capped.length,
   });
 
   return written;
+}
+
+/** Fold a non-empty `supersedes` into the name and overwrite flag the write
+ *  loop keys on. An empty or null value leaves the candidate as proposed. */
+export function normalizeCandidate(c: MemoryCandidate): MemoryCandidate {
+  if (typeof c.supersedes === "string" && c.supersedes.trim() !== "") {
+    return { ...c, name: c.supersedes.trim(), overwrite: true };
+  }
+  return c;
+}
+
+/** Whether the existing topic a supersession targets is pinned. A missing or
+ *  unreadable file reads as unpinned; the write loop's own guards decide
+ *  whether the write may proceed at all. */
+function existingPinned(dir: MemoryDir, name: string): boolean {
+  const target = resolveWriteTarget(dir, name);
+  try {
+    return parseMemoryFile(join(dir.dir, target), target).pinned;
+  } catch {
+    return false;
+  }
 }
 
 /** A candidate name as it may appear in the debug log: withheld whole when
@@ -452,7 +529,10 @@ function isValidCandidate(v: unknown): v is MemoryCandidate {
     // rejected rather than quietly re-homed into the project store — a silent
     // relocation would put a fact somewhere the model did not choose.
     (c.tier === undefined || c.tier === "project") &&
-    typeof c.pinned === "boolean" &&
+    // pinned is optional and ignored on write (a reviewer never pins)
+    (c.pinned === undefined || typeof c.pinned === "boolean") &&
+    // supersedes is optional: a slug, or null for a new topic
+    (c.supersedes === undefined || c.supersedes === null || typeof c.supersedes === "string") &&
     // overwrite is optional (defaults to false)
     (c.overwrite === undefined || typeof c.overwrite === "boolean") &&
     // priority is optional (defaults to type-derived value); if present it

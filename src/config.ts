@@ -39,6 +39,9 @@ export interface PiClaudeMemoryConfig {
   reviewThinking: "off" | "minimal" | "low" | "medium" | "high";
   /** Max output tokens for auto-learn LLM call. */
   reviewMaxOutputTokens: number;
+  /** Max NEW topic files one review may create. Supersessions of an existing
+   * entry are not counted. 0 lets a review only refine existing entries. */
+  reviewMaxNewEntries: number;
   /** Max chars of conversation to send to auto-learn. */
   reviewMaxChunkChars: number;
   /** Fire auto-learn on session shutdown (catches short sessions). */
@@ -83,6 +86,7 @@ export const DEFAULT_CONFIG: PiClaudeMemoryConfig = {
   reviewIntervalTurns: 10,
   reviewThinking: "off",
   reviewMaxOutputTokens: 2048,
+  reviewMaxNewEntries: 3,
   reviewMaxChunkChars: 50000,
   reviewOnShutdown: true,
   shutdownMinChunkChars: 1000,
@@ -167,6 +171,17 @@ export function loadConfig(): PiClaudeMemoryConfig {
               DEFAULT_CONFIG.reviewMaxOutputTokens,
               1,
               200000,
+            ),
+          }
+        : {}),
+      ...(n.reviewMaxNewEntries !== undefined
+        ? {
+            reviewMaxNewEntries: num(
+              n.reviewMaxNewEntries,
+              "reviewMaxNewEntries",
+              DEFAULT_CONFIG.reviewMaxNewEntries,
+              0,
+              50,
             ),
           }
         : {}),
