@@ -3,7 +3,7 @@
 // topics per review are capped, and `supersedes` routes a candidate onto the
 // existing entry it replaces.
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -149,7 +149,7 @@ describe("new topics per review are capped", () => {
         new Map(),
         tmpDir,
         undefined,
-        3,
+        { maxNew: 3 },
       ),
     ).toBe(3);
     expect(names.map((n) => existsSync(join(dir.dir, `${n}.md`)))).toEqual([
@@ -182,7 +182,7 @@ describe("new topics per review are capped", () => {
         mtimes,
         tmpDir,
         undefined,
-        1,
+        { maxNew: 1 },
       ),
     ).toBe(3);
     expect(existsSync(join(dir.dir, "new-1.md"))).toBe(true);
@@ -194,7 +194,9 @@ describe("new topics per review are capped", () => {
   it("a cap of 0 lets a review only refine existing entries", () => {
     const { dir, resolved } = mkStore();
     expect(
-      writeCandidates([cand({ name: "nope" })], resolved, new Map(), tmpDir, undefined, 0),
+      writeCandidates([cand({ name: "nope" })], resolved, new Map(), tmpDir, undefined, {
+        maxNew: 0,
+      }),
     ).toBe(0);
     expect(existsSync(join(dir.dir, "nope.md"))).toBe(false);
   });
@@ -228,5 +230,33 @@ describe("candidate schema", () => {
     expect(prompt).toContain("MOST DURABLE FIRST");
     expect(prompt).not.toMatch(/^- pinned:/m);
     expect(prompt).not.toMatch(/^- priority:/m);
+  });
+});
+
+describe("reviewer writes demote like tool writes", () => {
+  /** A store whose index is past the 200-line startup cut. */
+  function overflowingStore(): { dir: MemoryDir; resolved: ResolveResult } {
+    const store = mkStore();
+    const lines = ["# Index"];
+    for (let i = 0; i < 230; i++) {
+      writeFileSync(join(store.dir.dir, `old-${i}.md`), `---\nname: old-${i}\n---\nbody\n`);
+      lines.push(`- [Old ${i}](old-${i}.md) — entry ${i}`);
+    }
+    writeFileSync(store.dir.indexPath, `${lines.join("\n")}\n`);
+    return store;
+  }
+
+  it("demotes the overflow when demoteIndexOverflow is on", () => {
+    const { dir, resolved } = overflowingStore();
+    writeCandidates([cand({ name: "fresh" })], resolved, new Map(), tmpDir, undefined, {
+      demoteIndexOverflow: true,
+    });
+    expect(readFileSync(dir.indexPath, "utf8")).toMatch(/^## Archive$/m);
+  });
+
+  it("leaves the index alone when it is off", () => {
+    const { dir, resolved } = overflowingStore();
+    writeCandidates([cand({ name: "fresh" })], resolved, new Map(), tmpDir);
+    expect(readFileSync(dir.indexPath, "utf8")).not.toMatch(/^## Archive$/m);
   });
 });

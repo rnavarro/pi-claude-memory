@@ -38,6 +38,9 @@ export interface AutoLearnConfig {
   /** Max NEW topic files one review may create. Supersessions of an existing
    * entry do not count. Optional so existing callers keep the default. */
   maxNewPerReview?: number;
+  /** Pass the store's demoteIndexOverflow setting through to writeMemory.
+   * Optional so existing callers keep the writer's default (off). */
+  demoteIndexOverflow?: boolean;
 }
 
 /** Default cap on new topic files per review. */
@@ -258,14 +261,10 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     return 0;
   }
 
-  return writeCandidates(
-    candidates,
-    resolved,
-    mtimes,
-    cwd,
-    signal,
-    cfg.maxNewPerReview ?? DEFAULT_MAX_NEW_PER_REVIEW,
-  );
+  return writeCandidates(candidates, resolved, mtimes, cwd, signal, {
+    maxNew: cfg.maxNewPerReview ?? DEFAULT_MAX_NEW_PER_REVIEW,
+    demoteIndexOverflow: cfg.demoteIndexOverflow === true,
+  });
 }
 
 /**
@@ -322,8 +321,9 @@ export function writeCandidates(
   mtimes: Map<string, number>,
   cwd: string,
   signal?: AbortSignal,
-  maxNew: number = Number.POSITIVE_INFINITY,
+  options: { maxNew?: number; demoteIndexOverflow?: boolean } = {},
 ): number {
+  const maxNew = options.maxNew ?? Number.POSITIVE_INFINITY;
   const candidates = rawCandidates.map(normalizeCandidate);
   let written = 0;
   let newWritten = 0;
@@ -403,19 +403,27 @@ export function writeCandidates(
     // throw) must not drop the rest of the batch — a thrown error here
     // would otherwise reject runAutoLearn and lose all remaining writes.
     try {
-      const result = writeMemory(dir, {
-        name: c.name,
-        description: c.description,
-        type: c.type,
-        body: c.body,
-        // A reviewer never pins, but it must not unpin either: the writer
-        // drops pinned:true on an overwrite that passes false, so a
-        // supersession keeps whatever pin the target already carries.
-        pinned: c.overwrite === true && existingPinned(dir, c.name),
-        priority: c.priority ?? null,
-        // Auto-learn overwrites only when the LLM signals supersession
-        allowOverwrite: c.overwrite === true,
-      });
+      const result = writeMemory(
+        dir,
+        {
+          name: c.name,
+          description: c.description,
+          type: c.type,
+          body: c.body,
+          // A reviewer never pins, but it must not unpin either: the writer
+          // drops pinned:true on an overwrite that passes false, so a
+          // supersession keeps whatever pin the target already carries.
+          pinned: c.overwrite === true && existingPinned(dir, c.name),
+          priority: c.priority ?? null,
+          // Auto-learn overwrites only when the LLM signals supersession
+          allowOverwrite: c.overwrite === true,
+        },
+        // Reviewer writes must demote like tool writes do. Before this they
+        // passed nothing, so a store whose writes are mostly the reviewer's
+        // (438 of 460 in one hvac-control session) never demoted on them and
+        // the live index sat permanently past the injection cut.
+        { demoteIndexOverflow: options.demoteIndexOverflow === true },
+      );
       if (result.ok) {
         written++;
         if (c.overwrite !== true) newWritten++;
