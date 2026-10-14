@@ -80,6 +80,10 @@ export interface RankResult {
  * store being searched. */
 export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
   const terms = queryTerms(query);
+  // A Set for the per-token membership test: a review chunk used as the query
+  // carries thousands of terms, and a linear scan per token made ranking a
+  // large store quadratic in practice.
+  const termSet = new Set(terms);
   const phrase = query.toLowerCase().trim().replace(/\s+/g, " ");
   const fieldsOf = (e: RankInput): [FindField, string][] => {
     const out: [FindField, string][] = [
@@ -105,7 +109,7 @@ export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
       length += w * tokens.length;
       let hit = false;
       for (const tok of tokens) {
-        if (!terms.includes(tok)) continue;
+        if (!termSet.has(tok)) continue;
         tf.set(tok, (tf.get(tok) ?? 0) + w);
         hit = true;
       }

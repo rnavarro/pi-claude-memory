@@ -16,6 +16,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { findContentIssues, scanMemoryCandidate } from "./content-scan.js";
 import { debugLog } from "./debug-log.js";
+import { rankEntries } from "./find-rank.js";
 import { parseMemoryFile } from "./frontmatter.js";
 import { parseIndexFile } from "./index-parser.js";
 import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
@@ -157,7 +158,7 @@ export async function runAutoLearn(
   // store via a fuzzy match. For a new project this yields project=null and
   // the project tier is created on first write below.
   const resolved = resolveMemoryDirs(cwd);
-  const existingIndex = buildExistingIndexSummary(resolved);
+  const existingIndex = buildExistingIndexSummary(resolved, chunk);
   // Snapshot existing file mtimes BEFORE the LLM call so overwrite candidates
   // can be skipped if a user/Claude edit lands during the (1-3s) call — avoids
   // silently clobbering a newer edit with a stale review decision.
@@ -620,6 +621,38 @@ export function applyStemKeys(
  * the review prompt without bound. */
 const SUMMARY_BUDGET_CHARS = 6000;
 
+/** Pick which entries (by index into `owned`, oldest write first) get their
+ * summary within SUMMARY_BUDGET_CHARS.
+ *
+ * With a chunk, entries are taken by relevance to it first (score descending,
+ * ties to the older entry), then the unmatched remainder oldest first. Without
+ * one, oldest first only, which is the stable order the review prompt had
+ * before relevance selection. An entry whose summary does not fit is skipped
+ * rather than ending the pass, so shorter ones later in the order still fit. */
+function chooseDescribed(
+  owned: ReadonlyArray<{ stem: string; summary: string; title: string }>,
+  chunk: string | undefined,
+): Set<number> {
+  let order = owned.map((_, i) => i);
+  if (chunk?.trim()) {
+    const scores = rankEntries(
+      chunk,
+      owned.map((e) => ({ title: e.title, summary: e.summary, filename: e.stem, body: null })),
+    ).map((r) => r.score);
+    order = [...order].sort((a, b) => scores[b] - scores[a] || a - b);
+  }
+  const described = new Set<number>();
+  let used = 0;
+  for (const i of order) {
+    const len = owned[i].summary.length;
+    if (used + len <= SUMMARY_BUDGET_CHARS) {
+      described.add(i);
+      used += len;
+    }
+  }
+  return described;
+}
+
 /** Order items oldest write first by the mtime of the file each names.
  * A missing or unreadable file sorts first; ties keep their input order. */
 function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
@@ -656,9 +689,19 @@ function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
  * extraction prompt from that point on and missing the provider prompt cache.
  * By write time a new topic always lands last, and demotion to the archive
  * moves only the index line, never the topic file, so it reorders nothing.
- * The summary budget is spent in the same order, so a new entry never takes a
- * summary away from an earlier one. */
-export function buildExistingIndexSummary(resolved: ResolveResult): string {
+ *
+ * Which entries carry a SUMMARY is a separate choice from the listing order.
+ * Without a chunk the budget is spent oldest first, so a new entry never takes
+ * a summary away from an earlier one. With a chunk it is spent on the entries
+ * most related to that chunk (BM25F over title, summary and filename, the
+ * ranker find_memory uses), and only then oldest first. Oldest-first alone
+ * described ~91 of 832 entries in a real store and left every recent cluster
+ * as bare slugs (all 120 hp-78k0-* entries), and those are exactly the topics
+ * the conversation under review re-derives; the reviewer could not see what
+ * they covered and minted siblings instead of superseding. This gives up a
+ * stable review prompt, which bought little: the user message already changes
+ * with every chunk. */
+export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: string): string {
   const lines: string[] = [];
   // Both sides of the ownership test are canonicalized: entry.filePath comes
   // from resolveHref, which realpath's the target, while MemoryDir.dir is built
@@ -715,9 +758,8 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
         // accumulated as duplicates. Identities are what supersession keys on,
         // so they are never dropped; only the SUMMARIES are budgeted, which
         // bounds prompt size without losing matchability.
-        let summaryChars = 0;
-        let trimmed = 0;
         let external = 0;
+        const owned: Array<{ stem: string; summary: string; title: string }> = [];
         for (const entry of byWriteTime(parsed.entries, (e) => e.filePath)) {
           if (!isOwnedBy(entry.filePath, dir)) {
             external++;
@@ -727,11 +769,15 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
           // targets on slugify(candidate.name), so the model must return THIS
           // slug to supersede.
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
-          if (summaryChars + entry.summary.length <= SUMMARY_BUDGET_CHARS) {
-            lines.push(`- ${stem}: ${entry.summary}`);
-            summaryChars += entry.summary.length;
+          owned.push({ stem, summary: entry.summary, title: entry.title });
+        }
+        const described = chooseDescribed(owned, chunk);
+        let trimmed = 0;
+        for (const [i, e] of owned.entries()) {
+          if (described.has(i)) {
+            lines.push(`- ${e.stem}: ${e.summary}`);
           } else {
-            lines.push(`- ${stem}`);
+            lines.push(`- ${e.stem}`);
             trimmed++;
           }
         }
@@ -743,8 +789,11 @@ export function buildExistingIndexSummary(resolved: ResolveResult): string {
         }
         if (trimmed > 0) {
           lines.push(
-            `(summaries omitted for ${trimmed} of ${parsed.entries.length} entries to bound size; ` +
-              "every identifier is listed above, so supersede by matching one)",
+            `(summaries omitted for ${trimmed} of ${parsed.entries.length} entries to bound size` +
+              (chunk?.trim()
+                ? "; the ones shown are those most related to this conversation"
+                : "") +
+              "; every identifier is listed above, so supersede by matching one)",
           );
         }
       } else {
