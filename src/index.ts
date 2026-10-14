@@ -378,6 +378,7 @@ function handleSessionBeforeCompact(event: SessionBeforeCompactEvent, ctx: Exten
         model: config.reviewModel,
         thinking: config.reviewThinking,
         maxOutputTokens: config.reviewMaxOutputTokens,
+        maxNewPerReview: config.reviewMaxNewEntries,
       };
 
       // Fire-and-forget: must not block compaction. Do not await. If a review
@@ -564,6 +565,7 @@ async function handleSessionShutdown(
         model: config.reviewModel,
         thinking: config.reviewThinking,
         maxOutputTokens: config.reviewMaxOutputTokens,
+        maxNewPerReview: config.reviewMaxNewEntries,
       };
 
       // Final review. Own an AbortController (not just a timed signal) so
@@ -874,6 +876,7 @@ function launchSettleReview(ctx: ExtensionContext, reason: SettleReason): void {
     model: config.reviewModel,
     thinking: config.reviewThinking,
     maxOutputTokens: config.reviewMaxOutputTokens,
+    maxNewPerReview: config.reviewMaxNewEntries,
   };
 
   // Fire-and-forget: never block the user's next turn.

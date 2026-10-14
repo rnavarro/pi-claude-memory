@@ -199,6 +199,7 @@ Every field is optional.
 | `reviewModel` | session model | Model used for reviews. Unset, each review runs on the session's current model. Set it as `{ "provider": ..., "id": ... }` to pin a cheaper or faster model; if that model is not in the registry, reviews fail (debug-logged) rather than fall back |
 | `reviewThinking` | `off` | Reasoning effort for the reviewer |
 | `reviewMaxOutputTokens` | `2048` | Reviewer output cap |
+| `reviewMaxNewEntries` | `3` | Most new topic files one review may create; superseding an existing entry does not count, and `0` lets reviews only refine existing entries. Reviewer output is never pinned: pins come only from `write_memory` |
 | `reviewMaxChunkChars` | `50000` | Conversation characters sent per review |
 | `reviewOnShutdown` | `true` | Review once when the session ends |
 | `shutdownMinChunkChars` | `1000` | Do not review tiny shutdown chunks |

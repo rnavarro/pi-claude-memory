@@ -98,6 +98,15 @@ describe("correction and tool-call trigger settings", () => {
     }
   }
 
+  it("reviewMaxNewEntries: default 3, accepts 0, rejects above 50", async () => {
+    const { DEFAULT_CONFIG } = await import("../src/config.js");
+    expect(DEFAULT_CONFIG.reviewMaxNewEntries).toBe(3);
+    expect((await loadWith({ reviewMaxNewEntries: 0 })).cfg.reviewMaxNewEntries).toBe(0);
+    const bad = await loadWith({ reviewMaxNewEntries: 51 });
+    expect(bad.cfg.reviewMaxNewEntries).toBe(3);
+    expect(bad.msgs.some((m) => m.includes("reviewMaxNewEntries"))).toBe(true);
+  });
+
   it("subagent defaults: no reviewer, 8000-byte index", async () => {
     const { DEFAULT_CONFIG } = await import("../src/config.js");
     expect(DEFAULT_CONFIG.subagentAutoLearn).toBe(false);
