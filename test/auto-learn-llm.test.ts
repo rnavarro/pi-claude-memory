@@ -12,16 +12,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const compatCalls = vi.hoisted(() => ({ count: 0 }));
+const compatCalls = vi.hoisted(() => ({ count: 0, options: [] as unknown[] }));
 vi.mock("@earendil-works/pi-ai/compat", () => ({
-  completeSimple: () => {
+  completeSimple: (_model: unknown, _context: unknown, options: unknown) => {
     compatCalls.count++;
+    compatCalls.options.push(options);
     throw new Error("compat completeSimple must not be reached in this test");
   },
 }));
 
 import { type Context, getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
-import { DEFAULT_AUTOLEARN_CONFIG, runAutoLearn } from "../src/auto-learn.js";
+import { DEFAULT_AUTOLEARN_CONFIG, REVIEW_STREAM_TAG, runAutoLearn } from "../src/auto-learn.js";
 import { encodePath } from "../src/resolver.js";
 
 let tmpHome: string;
@@ -32,6 +33,7 @@ beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), "pcm-autolearn-llm-"));
   process.env.HOME = tmpHome;
   compatCalls.count = 0;
+  compatCalls.options = [];
 });
 
 afterEach(() => {
@@ -80,10 +82,11 @@ function fakeCtx(
   const find = vi.fn((provider: string, id: string) =>
     (opts.registry ?? []).find((m) => m.provider === provider && m.id === id),
   );
+  const streamedOptions: { headers?: Record<string, string> }[] = [];
   const getApiKeyAndHeaders = vi.fn(async (_model: FakeModel) => ({
     ok: true,
     apiKey: "test-key",
-    headers: {},
+    headers: { "X-Auth-Extra": "kept" },
   }));
   const answer = () => ({
     result: async () => ({ content: [{ type: "text", text: reply }] }),
@@ -93,24 +96,32 @@ function fakeCtx(
         streamSimple: (
           model: FakeModel,
           context: { systemPrompt?: string; messages: FakeMessage[] },
+          options: { headers?: Record<string, string> },
         ) => {
           streamedModels.push(model);
+          streamedOptions.push(options);
           systemPrompts.push(context.systemPrompt ?? "");
           prompts.push(lastUserText(context.messages));
           return answer();
         },
       }
     : {
-        streamSimple: (model: FakeModel, context: { messages: FakeMessage[] }) => {
+        streamSimple: (
+          model: FakeModel,
+          context: { messages: FakeMessage[] },
+          options: { headers?: Record<string, string> },
+        ) => {
           streamedModels.push(model);
+          streamedOptions.push(options);
           systemPrompts.push(getCurrentSystemPrompt(context.messages as never));
           prompts.push(lastUserText(context.messages));
           return answer();
         },
       };
   const getProvider = vi.fn(() => provider);
-  const registryStreamSimple = vi.fn((model: FakeModel, context: Context) =>
-    provider.streamSimple(model, normalizeContext(context) as never),
+  const registryStreamSimple = vi.fn(
+    (model: FakeModel, context: Context, options: { headers?: Record<string, string> }) =>
+      provider.streamSimple(model, normalizeContext(context) as never, options),
   );
   const ctx = {
     signal: undefined,
@@ -124,6 +135,7 @@ function fakeCtx(
     prompts,
     systemPrompts,
     streamedModels,
+    streamedOptions,
     find,
     getApiKeyAndHeaders,
     getProvider,
@@ -220,6 +232,55 @@ describe("runAutoLearn system prompt delivery", () => {
     expect(getProvider).toHaveBeenCalledWith(SESSION_MODEL.provider);
     expect(systemPrompts).toHaveLength(1);
     expect(systemPrompts[0]).toContain("You are a memory extraction agent");
+  });
+});
+
+describe("runAutoLearn stream tag header", () => {
+  const reply = JSON.stringify([candidate({})]);
+  const expectTagged = (options: { headers?: Record<string, string> } | undefined) =>
+    expect(options?.headers).toEqual({ "X-Auth-Extra": "kept", "X-Pi-Stream": "memory-review" });
+
+  it("uses a value llm-proxy accepts", () => {
+    expect(REVIEW_STREAM_TAG).toMatch(/^[a-z0-9][a-z0-9._-]{0,63}$/);
+  });
+
+  it("tags the registry streamSimple call on pi >= 0.86, keeping auth headers", async () => {
+    const cwd = join(tmpHome, "work", "tag-current");
+    const { ctx, streamedOptions } = fakeCtx(reply);
+
+    await runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, cwd, "user: use jq");
+
+    expect(streamedOptions).toHaveLength(1);
+    expectTagged(streamedOptions[0]);
+  });
+
+  it("tags the getProvider call on pi < 0.86", async () => {
+    const cwd = join(tmpHome, "work", "tag-legacy");
+    const { ctx, streamedOptions } = fakeCtx(reply, {
+      sessionModel: SESSION_MODEL,
+      legacyHost: true,
+    });
+
+    await runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, cwd, "user: use jq");
+
+    expect(streamedOptions).toHaveLength(1);
+    expectTagged(streamedOptions[0]);
+  });
+
+  it("tags the compat completeSimple fallback", async () => {
+    const cwd = join(tmpHome, "work", "tag-compat");
+    const { ctx, getProvider } = fakeCtx(reply, {
+      sessionModel: SESSION_MODEL,
+      legacyHost: true,
+    });
+    getProvider.mockReturnValue(undefined as never);
+
+    const written = await runAutoLearn(ctx, DEFAULT_AUTOLEARN_CONFIG, cwd, "user: use jq");
+
+    // The compat mock throws after recording, so the review fails closed.
+    expect(written).toBe(-1);
+    expect(compatCalls.count).toBe(1);
+    expectTagged(compatCalls.options[0] as { headers?: Record<string, string> });
   });
 });
 
