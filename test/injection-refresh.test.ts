@@ -201,7 +201,7 @@ describe("the injected MEMORY.md is refreshed at the Claude Code points", () => 
     expect(after).toContain("alpha.md");
   });
 
-  it("session_start still recomputes from disk", async () => {
+  it("a new session recomputes from disk", async () => {
     const cwd = join(tmpHome, "work", "restart");
     const indexPath = makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
       "alpha.md": topic("first entry"),
@@ -215,9 +215,10 @@ describe("the injected MEMORY.md is refreshed at the Claude Code points", () => 
     writeFileSync(indexPath.replace("MEMORY.md", "omega.md"), topic("edited elsewhere"));
     expect(await ext.prompt()).toBe(before);
 
-    await ext.sessionStart();
+    const next = loadExtension(cwd);
+    await next.sessionStart("new");
 
-    const after = await ext.prompt();
+    const after = await next.prompt();
     expect(after).toContain("omega.md");
     expect(after).not.toContain("alpha.md");
   });
@@ -264,21 +265,63 @@ describe("/reload keeps the injected MEMORY.md", () => {
     expect(await reloaded.prompt()).toContain("beta-entry.md");
   });
 
-  it("renders fresh on resume", async () => {
-    const cwd = join(tmpHome, "work", "resume");
+  // A relaunch onto an existing session fires reason "startup"; an in-process
+  // /resume fires "resume". Both restore what the session already sent.
+  for (const reason of ["startup", "resume", "fork"]) {
+    it(`restores the exact text on ${reason} of a session that sent one`, async () => {
+      const cwd = join(tmpHome, "work", `restore-${reason}`);
+      makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+        "alpha.md": topic("first entry"),
+      });
+      const branch: Branch = [];
+      const ext = loadExtension(cwd, branch);
+      await ext.sessionStart();
+      const before = await ext.prompt();
+      await ext.write("beta-entry", "written mid-session");
+
+      const restarted = loadExtension(cwd, branch);
+      await restarted.sessionStart(reason);
+
+      const after = await restarted.prompt();
+      expect(after).toBe(before);
+      expect(after).not.toContain("beta-entry.md");
+    });
+  }
+
+  it("renders fresh on a new session", async () => {
+    const cwd = join(tmpHome, "work", "new-session");
     makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
       "alpha.md": topic("first entry"),
+    });
+    const ext = loadExtension(cwd, []);
+    await ext.sessionStart();
+    await ext.prompt();
+    await ext.write("beta-entry", "written mid-session");
+
+    const fresh = loadExtension(cwd, []);
+    await fresh.sessionStart("new");
+
+    expect(await fresh.prompt()).toContain("beta-entry.md");
+  });
+
+  it("renders fresh after a cwd change on restore", async () => {
+    const cwd = join(tmpHome, "work", "restore-cwd-a");
+    const other = join(tmpHome, "work", "restore-cwd-b");
+    makeStore(cwd, "# P\n- [Alpha](alpha.md) — first entry\n", {
+      "alpha.md": topic("first entry"),
+    });
+    makeStore(other, "# P\n- [Gamma](gamma.md) — other store\n", {
+      "gamma.md": topic("other store"),
     });
     const branch: Branch = [];
     const ext = loadExtension(cwd, branch);
     await ext.sessionStart();
     await ext.prompt();
-    await ext.write("beta-entry", "written mid-session");
 
-    const resumed = loadExtension(cwd, branch);
-    await resumed.sessionStart("resume");
+    const moved = loadExtension(other, branch);
+    await moved.sessionStart("startup");
 
-    expect(await resumed.prompt()).toContain("beta-entry.md");
+    expect(await moved.prompt()).toContain("gamma.md");
   });
 });
 

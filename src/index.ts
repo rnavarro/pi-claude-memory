@@ -41,14 +41,17 @@ import type { ResolveResult } from "./types.js";
 // Pi rebuilds the system prompt from scratch every turn. To keep the prompt
 // cache prefix stable, we freeze the injection text at the first
 // before_agent_start and reuse the exact same bytes every turn. The frozen text
-// is recomputed from disk at exactly two points, matching Claude Code, which
-// refreshes auto memory only at session start and after compaction:
+// is recomputed from disk at exactly two points:
 //
-//   - session_start (and a cwd change, which is a different store), except a
-//     /reload, which restores the text this session already sent (below);
+//   - the first turn of a session with no earlier injection on its branch
+//     (and a cwd change, which is a different store);
 //   - session_compact, after a compaction has actually happened. Compaction
 //     already rewrites the conversation prefix, so the cache is lost anyway
 //     and the refresh costs nothing extra.
+//
+// Claude Code also refreshes at every session start. This extension does not
+// for a session that already sent an index, because the refresh would change
+// the system prompt and void the whole cached conversation on every restart.
 //
 // No write refreshes it: not write_memory, not remove_memory, not auto-learn.
 // A mid-session write would otherwise change the system prompt and void the
@@ -56,12 +59,13 @@ import type { ResolveResult } from "./types.js";
 // from the conversation (it just wrote it, or can recall_memory it), and the
 // store on disk is current for find/recall, which resolve fresh on every call.
 //
-// /reload also fires session_start, and re-imports this module, so in-memory
-// state cannot carry the frozen text across it. Each freeze is therefore
-// recorded in the session with appendEntry, and a reload restores the latest
-// record since the last compaction. Re-rendering instead would pick up topics
-// written earlier in the session and change the prompt mid-session. Other
-// session starts (startup, new, resume, fork) still render fresh.
+// A /reload re-imports this module and a restart starts a new process, so
+// in-memory state cannot carry the frozen text across either. Each freeze is
+// therefore recorded in the session with appendEntry, and every session_start
+// restores the latest record on the branch since the last compaction. That
+// covers /reload, a relaunch onto an existing session (reason "startup"),
+// /resume and /fork. Re-rendering instead would pick up topics written since
+// and change the prompt. A new session has no record, so it renders fresh.
 // ---------------------------------------------------------------------------
 
 /** Frozen injection text + resolve result for the current session. */
@@ -275,7 +279,7 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
   // Reset caches on session lifecycle events
   pi.on("session_start", (event, ctx) => {
     currentSessionId = getSessionId(ctx);
-    frozenInjection = event.reason === "reload" ? restoreInjection(ctx) : null;
+    frozenInjection = restoreInjection(ctx);
     turnCount = 0;
     toolCallCount = 0;
     toolResultChunk = "";
