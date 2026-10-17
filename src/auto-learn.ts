@@ -46,6 +46,12 @@ export interface AutoLearnConfig {
 /** Default cap on new topic files per review. */
 export const DEFAULT_MAX_NEW_PER_REVIEW = 3;
 
+/** Sent as X-Pi-Stream on every review call. llm-proxy groups spend and
+ * cache analysis by (session_id, stream); an untagged review call is counted
+ * with the session's main loop. Must match ^[a-z0-9][a-z0-9._-]{0,63}$ or the
+ * proxy stores it as NULL. */
+export const REVIEW_STREAM_TAG = "memory-review";
+
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
   thinking: "off",
@@ -218,7 +224,7 @@ Extract durable memories worth persisting. Return ONLY a JSON array.`;
     const doComplete = streamFn ?? completeSimple;
     const reply = await doComplete(model, context, {
       apiKey: auth.apiKey,
-      headers: auth.headers,
+      headers: { ...(auth.headers ?? {}), "X-Pi-Stream": REVIEW_STREAM_TAG },
       ...reasoningOption,
       maxTokens: cfg.maxOutputTokens,
       temperature: 0,
