@@ -238,7 +238,7 @@ describe("runAutoLearn system prompt delivery", () => {
 describe("runAutoLearn stream tag header", () => {
   const reply = JSON.stringify([candidate({})]);
   const expectTagged = (options: { headers?: Record<string, string> } | undefined) =>
-    expect(options?.headers).toEqual({ "X-Auth-Extra": "kept", "X-Pi-Stream": "memory-review" });
+    expect(options?.headers).toEqual({ "X-Auth-Extra": "kept", "X-Pi-Stream": "pi-claude-memory" });
 
   it("uses a value llm-proxy accepts", () => {
     expect(REVIEW_STREAM_TAG).toMatch(/^[a-z0-9][a-z0-9._-]{0,63}$/);
