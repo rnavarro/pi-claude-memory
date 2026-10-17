@@ -50,7 +50,7 @@ export const DEFAULT_MAX_NEW_PER_REVIEW = 3;
  * cache analysis by (session_id, stream); an untagged review call is counted
  * with the session's main loop. Must match ^[a-z0-9][a-z0-9._-]{0,63}$ or the
  * proxy stores it as NULL. */
-export const REVIEW_STREAM_TAG = "memory-review";
+export const REVIEW_STREAM_TAG = "pi-claude-memory";
 
 export const DEFAULT_AUTOLEARN_CONFIG: AutoLearnConfig = {
   everyTurns: 10,
