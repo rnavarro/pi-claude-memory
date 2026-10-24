@@ -119,16 +119,15 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).not.toContain("Prefer jq");
   });
 
-  it("appends a new entry at the live tail and moves no identity line on a supersede", () => {
+  it("lists identities sorted, and a new stem inserts at its sorted slot", () => {
     // Prompt-cache stability: the identity block is re-sent on every review, so
-    // its order may change only by appending. The writer replaces a superseded
-    // entry's MEMORY.md line IN PLACE and splices a new one at the end of the
-    // live region (just above `## Archive`), so file order is append-only for
-    // both operations. Listing by topic-file mtime instead moved a superseded
-    // entry to the tail and broke the prefix at its old slot.
+    // it must change only at the point a genuinely new stem belongs. Sorting is
+    // what buys that — MEMORY.md's own order is recomputed by
+    // fitIndexToExcerpt on every write when demoteIndexOverflow is on, so it is
+    // not an insertion order at all (see the demotion test below).
     const dir = join(tmpDir, "store-with-archive");
     mkdirSync(dir, { recursive: true });
-    const topics = ["live-one", "live-two", "archived-one", "archived-two"];
+    const topics = ["live-two", "live-one", "archived-two", "archived-one"];
     topics.forEach((stem, i) => {
       const file = join(dir, `${stem}.md`);
       writeFileSync(file, `---\nname: ${stem}\n---\nbody`);
@@ -138,13 +137,13 @@ describe("buildExistingIndexSummary", () => {
     writeFileSync(
       join(dir, "MEMORY.md"),
       [
-        "- [Live one](live-one.md) — first live entry",
         "- [Live two](live-two.md) — second live entry",
+        "- [Live one](live-one.md) — first live entry",
         "",
         "## Archive",
         "",
-        "- [Archived one](archived-one.md) — first archived entry",
         "- [Archived two](archived-two.md) — second archived entry",
+        "- [Archived one](archived-one.md) — first archived entry",
         "",
       ].join("\n"),
     );
@@ -154,9 +153,17 @@ describe("buildExistingIndexSummary", () => {
     };
 
     const identity = (s: string) => s.split(/^SUMMARIES/m)[0];
-    const before = buildExistingIndexSummary(resolved);
+    const before = identity(buildExistingIndexSummary(resolved)).split("\n");
+    // Deliberately written out of order in MEMORY.md; emitted sorted.
+    expect(before.filter((l) => l.startsWith("- "))).toEqual([
+      "- archived-one",
+      "- archived-two",
+      "- live-one",
+      "- live-two",
+    ]);
+
     const written = writeMemory(resolved.project as MemoryDirType, {
-      name: "brand-new",
+      name: "m-new",
       description: "a new entry",
       type: "project",
       body: "body",
@@ -164,33 +171,116 @@ describe("buildExistingIndexSummary", () => {
       allowOverwrite: false,
     });
     expect(written.ok).toBe(true);
-    // The writer did put the line mid-file, above the Archive heading.
+    // The writer still puts the link above the Archive heading in the file.
     const index = readFileSync(join(dir, "MEMORY.md"), "utf8");
-    expect(index.indexOf("brand-new.md")).toBeLessThan(index.indexOf("## Archive"));
+    expect(index.indexOf("m-new.md")).toBeLessThan(index.indexOf("## Archive"));
 
-    const after = buildExistingIndexSummary(resolved);
-    const linesBefore = identity(before).split("\n");
-    const linesAfter = identity(after).split("\n");
-    // Exactly one insertion, at the live tail: every line before it is
-    // byte-identical and every line after it keeps its order.
-    expect(linesAfter).toEqual([
-      ...linesBefore.slice(0, 3),
-      "- brand-new",
-      ...linesBefore.slice(3),
-    ]);
+    const after = identity(buildExistingIndexSummary(resolved)).split("\n");
+    const stemsOf = (ls: string[]) => ls.filter((l) => l.startsWith("- "));
+    // Exactly one line added, at its sorted position; nothing else moves.
+    expect(stemsOf(after)).toEqual(
+      [...stemsOf(before), "- m-new"].sort((a, b) => (a.slice(2) < b.slice(2) ? -1 : 1)),
+    );
+    expect(after.filter((l) => !l.startsWith("- "))).toEqual(
+      before.filter((l) => !l.startsWith("- ")),
+    );
+    // And the prefix up to the insertion point is byte-identical (which is what
+    // the provider cache actually reuses).
+    const at = after.indexOf("- m-new");
+    expect(after.slice(0, at)).toEqual(before.slice(0, at));
+  });
+});
 
-    // A supersede rewrites the description in place, so the identity block must
-    // not change at all — this is the operation the reviewer performs most.
-    const superseded = writeMemory(resolved.project as MemoryDirType, {
-      name: "live-one",
-      description: "a rewritten description",
-      type: "project",
-      body: "new body",
-      pinned: false,
-      allowOverwrite: true,
-    });
-    expect(superseded.ok).toBe(true);
-    expect(identity(buildExistingIndexSummary(resolved))).toBe(identity(after));
+describe("identity block survives the production demotion path", () => {
+  /** Store over the 200-line / 25KB live-excerpt bound, so every write with
+   *  demoteIndexOverflow on refits: it promotes every archived link back into
+   *  the live list and re-demotes by topic mtime. This is the operator's real
+   *  configuration (settings.json `demoteIndexOverflow: true`), and it is why
+   *  the block is sorted rather than in file order. */
+  function overBudgetStore(): ResolveResult {
+    const dir = join(tmpDir, "store-demoted");
+    mkdirSync(dir, { recursive: true });
+    const lines: string[] = [];
+    const base = Date.now() / 1000 - 100_000;
+    const stems: string[] = [];
+    for (let i = 0; i < 260; i++) {
+      const stem = `topic-${String(i).padStart(3, "0")}`;
+      stems.push(stem);
+      const file = join(dir, `${stem}.md`);
+      writeFileSync(file, `---\nname: ${stem}\n---\nbody`);
+      utimesSync(file, base + i, base + i);
+      lines.push(`- [${stem}](${stem}.md) — fact number ${i}`);
+    }
+    // Archive the first 40 the way a previous demotion pass left them.
+    const live = lines.slice(40);
+    const archived = lines.slice(0, 40);
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      [...live, "", "## Archive", "", ...archived, ""].join("\n"),
+    );
+    return {
+      project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "test" },
+      warnings: [],
+    };
+  }
+
+  const identity = (r: ResolveResult, chunk?: string) =>
+    buildExistingIndexSummary(r, chunk).split(/^SUMMARIES/m)[0];
+
+  it("a supersede of a live entry moves no identity line", () => {
+    const resolved = overBudgetStore();
+    const before = identity(resolved, "some unrelated chunk");
+    const res = writeMemory(
+      resolved.project as MemoryDirType,
+      {
+        name: "topic-100",
+        description: "a rewritten live fact",
+        type: "project",
+        body: "new body",
+        pinned: false,
+        allowOverwrite: true,
+      },
+      { demoteIndexOverflow: true },
+    );
+    expect(res.ok).toBe(true);
+    expect(identity(resolved, "some unrelated chunk")).toBe(before);
+  });
+
+  it("a supersede of an archived entry moves no identity line", () => {
+    const resolved = overBudgetStore();
+    const before = identity(resolved);
+    const res = writeMemory(
+      resolved.project as MemoryDirType,
+      {
+        name: "topic-005",
+        description: "a rewritten archived fact",
+        type: "project",
+        body: "new body",
+        pinned: false,
+        allowOverwrite: true,
+      },
+      { demoteIndexOverflow: true },
+    );
+    expect(res.ok).toBe(true);
+    expect(identity(resolved)).toBe(before);
+  });
+
+  it("still lists every identity after a refit", () => {
+    const resolved = overBudgetStore();
+    const res = writeMemory(
+      resolved.project as MemoryDirType,
+      {
+        name: "topic-200",
+        description: "rewritten",
+        type: "project",
+        body: "body",
+        pinned: false,
+        allowOverwrite: true,
+      },
+      { demoteIndexOverflow: true },
+    );
+    expect(res.ok).toBe(true);
+    expect(identity(resolved).match(/^- topic-/gm)).toHaveLength(260);
   });
 });
 
