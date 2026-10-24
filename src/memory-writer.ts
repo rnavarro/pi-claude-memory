@@ -515,6 +515,19 @@ export function writeMemory(
     }
   }
 
+  // Create-only identity stamp. The reviewer orders the identity list it sends
+  // to the model by (created, stem), so a newly added entry always sorts last
+  // and can never displace an existing line - that ordering is the whole reason
+  // the list is cacheable across reviews, and every process has to agree on it,
+  // so it cannot live in per-process memory. `created` is not a field this
+  // writer owns, so buildFrontmatterYaml spreads it straight back out of
+  // preservedMetadata on every later overwrite: set once, here, and it survives
+  // supersession forever. Entries created by another writer (Claude Code's own
+  // memory tool) carry no stamp and are ordered by stem instead, in a block
+  // ahead of these - which is today's behaviour, not a regression.
+  if (!wasExisting) {
+    preservedMetadata.created = modified;
+  }
   const frontmatterYaml = buildFrontmatterYaml(req, modified, preservedMetadata);
 
   if (!roundTripValidate(frontmatterYaml, req)) {

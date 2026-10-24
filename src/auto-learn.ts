@@ -10,7 +10,7 @@
 // recorded in the debug log.
 
 import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { Api, Context, Model, TranscriptContext } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -667,45 +667,46 @@ function chooseDescribed(
   return described;
 }
 
-/** Order in which stems are emitted to the reviewer, per store, for THIS
- * process. Append-only by construction: see applyStableOrder. */
-const indexOrderBaseline = new Map<string, readonly string[]>();
+/** Creation time of a topic, or null when it has none.
+ *
+ * The reviewer orders its identity list by (created, stem). That is the only
+ * ordering that is both append-only (a new entry always sorts last, so it can
+ * never displace a line the provider has already cached) and identical in every
+ * process (so two sessions reviewing the same store agree and can reuse each
+ * other's cached prefix). Sorting by stem alone fails the first property - a new
+ * stem lands wherever it falls alphabetically - and remembering the order in
+ * memory fixes that only for the process that remembers it.
+ *
+ * Memoized by path, and not re-read: `created` is written once at creation and
+ * no code path ever changes it, so a stamp read here stays true for the life of
+ * the process. Re-reading the store every 2-5 minutes would cost a stat per topic
+ * (2,000+ of them) on every review for a value that cannot have moved. The only
+ * stale case is a topic deleted and re-created under the same name, which would
+ * inherit the old stamp - an ordering detail, never membership, which still comes
+ * from the index. */
+const createdCache = new Map<string, number | null>();
 
-/** Drop every remembered order. Called on session_start so a fresh session
- * starts from the store's current (sorted) order rather than inheriting a
- * baseline captured in a previous conversation. */
-export function resetIndexOrderBaseline(): void {
-  indexOrderBaseline.clear();
-}
-
-/** Reorder stems so that an added entry never moves an existing line.
- *
- * Sorting alone is not append-only: a new stem slots in wherever it falls
- * alphabetically, and on a 2,000-entry store that is a random point in the
- * identity block. Each added entry therefore cost the whole tail of the
- * cacheable prefix - measured at 9-50% of the block depending on where the
- * stem landed, and on roughly half of all reviews.
- *
- * So the FIRST review of a store in this process records the order it saw
- * (sorted), and every later review emits that remembered order followed by any
- * stems it did not know about, themselves sorted. New entries then appear at
- * the tail, where they cost nothing, and the accumulated order is remembered
- * so the next addition appends after them too.
- *
- * The baseline is an ORDER, never a membership list: it is filtered against the
- * current stems on every call, so a deleted entry disappears immediately and a
- * stem only the baseline knows about can never be shown to the model. It is
- * in-memory only - a restart simply re-captures the current order, which costs
- * one cache miss and no correctness. */
-function applyStableOrder(key: string, sorted: readonly string[]): readonly string[] {
-  const current = new Set(sorted);
-  const baseline = indexOrderBaseline.get(key);
-  const present = baseline?.filter((stem) => current.has(stem));
-  const known = new Set(present ?? []);
-  const added = sorted.filter((stem) => !known.has(stem));
-  const order = [...(present ?? []), ...added];
-  indexOrderBaseline.set(key, order);
-  return order;
+function topicCreatedAt(filePath: string): number | null {
+  const cached = createdCache.get(filePath);
+  if (cached !== undefined) return cached;
+  let created: number | null = null;
+  try {
+    const meta = parseMemoryFile(filePath, basename(filePath)).raw?.metadata as
+      | Record<string, unknown>
+      | undefined;
+    const stamp = meta?.created;
+    if (typeof stamp === "string") {
+      const parsed = Date.parse(stamp);
+      created = Number.isNaN(parsed) ? null : parsed;
+    } else if (typeof stamp === "number" && Number.isFinite(stamp)) {
+      created = stamp;
+    }
+  } catch {
+    // Unreadable or unparseable: treat as unstamped rather than failing the
+    // review. It sorts into the stem-ordered head, which is always safe.
+  }
+  createdCache.set(filePath, created);
+  return created;
 }
 
 /** Build a compact summary of the existing memory index for the LLM.
@@ -813,7 +814,12 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         // so they are never dropped; only the SUMMARIES are budgeted, which
         // bounds prompt size without losing matchability.
         let external = 0;
-        const owned: Array<{ stem: string; summary: string; title: string }> = [];
+        const owned: Array<{
+          stem: string;
+          summary: string;
+          title: string;
+          created: number | null;
+        }> = [];
         for (const entry of parsed.entries) {
           if (!isOwnedBy(entry.filePath, dir)) {
             external++;
@@ -823,30 +829,32 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
           // targets on slugify(candidate.name), so the model must return THIS
           // slug to supersede.
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
-          owned.push({ stem, summary: entry.summary, title: entry.title });
+          owned.push({
+            stem,
+            summary: entry.summary,
+            title: entry.title,
+            created: topicCreatedAt(entry.filePath),
+          });
         }
-        // Lexicographic, NOT file order. The index is refitted on every write
-        // with `demoteIndexOverflow` on (the default here): fitIndexToExcerpt
-        // promotes every archived link back into the live list and re-demotes
-        // by topic mtime, so MEMORY.md's order after any write - including a
-        // plain in-place supersede - is a freshly computed age order, not an
-        // insertion order. Measured on this machine's 2033-entry store, a
-        // single supersede moved the file-order prefix from 100% to 0%.
-        // Sorting by stem is invariant under supersede, demotion and
-        // archiving; only a genuinely new stem shifts anything, and then only
-        // from its own sorted position (deletion shifts the tail once - see
-        // the docblock). Order carries no meaning for the model.
-        owned.sort((a, b) => (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0));
+        // Unstamped entries (everything written before the stamp existed, plus
+        // anything another writer creates) form a head in stem order - exactly
+        // the order this list had before, so the change costs no cache entry
+        // that already exists. Stamped entries follow, oldest first. A new entry
+        // therefore always lands at the tail.
+        owned.sort((a, b) => {
+          if (a.created === null && b.created === null) {
+            return a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0;
+          }
+          if (a.created === null) return -1;
+          if (b.created === null) return 1;
+          if (a.created !== b.created) return a.created - b.created;
+          return a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0;
+        });
         const described = chooseDescribed(owned, chunk);
-        // Identity block: bare stems, in this process's remembered order (see
-        // applyStableOrder), so an added entry appends instead of displacing
-        // the tail. Nothing here depends on the chunk or on the store's own
-        // line order.
-        const order = applyStableOrder(
-          canonicalDir(dir),
-          owned.map((e) => e.stem),
-        );
-        for (const stem of order) lines.push(`- ${stem}`);
+        // Identity block: bare stems, ordered by (created, stem) so an added
+        // entry appends instead of displacing the tail, and so every process
+        // emits the same list for the same store.
+        for (const e of owned) lines.push(`- ${e.stem}`);
         if (external > 0) {
           lines.push(
             `(${external} index entr${external === 1 ? "y" : "ies"} point outside this store and are ` +

@@ -563,6 +563,37 @@ describe("mutation guards", () => {
 });
 
 describe("index concurrency primitives", () => {
+  it("stamps created on create only, and preserves it across a supersede", () => {
+    // The reviewer orders its identity list by (created, stem): that is what makes
+    // a new entry sort last in every process. A stamp that moved on overwrite
+    // would reorder the list on every supersede, which is the whole thing the
+    // ordering exists to prevent.
+    const created = writeMemory(dir, {
+      name: "stamped-entry",
+      description: "first",
+      type: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    expect(created.ok).toBe(true);
+    const first = readFileSync(join(dir.dir, "stamped-entry.md"), "utf8");
+    const firstStamp = /created: (\S+)/.exec(first)?.[1];
+    expect(firstStamp).toBeTruthy();
+
+    const superseded = writeMemory(dir, {
+      name: "stamped-entry",
+      description: "second",
+      type: "project",
+      body: "new body",
+      pinned: false,
+      allowOverwrite: true,
+    });
+    expect(superseded.ok).toBe(true);
+    const second = readFileSync(join(dir.dir, "stamped-entry.md"), "utf8");
+    expect(/created: (\S+)/.exec(second)?.[1]).toBe(firstStamp);
+  });
+
   it("atomicWriteFileNoClobber refuses to destroy a concurrently created file", () => {
     const target = join(dir.dir, "race.md");
     // First publication wins
