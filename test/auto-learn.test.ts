@@ -176,7 +176,7 @@ describe("buildExistingIndexSummary", () => {
     expect(index.indexOf("m-new.md")).toBeLessThan(index.indexOf("## Archive"));
 
     const after = identity(buildExistingIndexSummary(resolved)).split("\n");
-    const stemsOf = (ls: string[]) => ls.filter((l) => l.startsWith("- "));
+    const stemsOf = (ls: string[]) => ls.filter((l) => /^- [^:]+$/.test(l));
     // Exactly one line added, at its sorted position; nothing else moves.
     expect(stemsOf(after)).toEqual(
       [...stemsOf(before), "- m-new"].sort((a, b) => (a.slice(2) < b.slice(2) ? -1 : 1)),
@@ -189,6 +189,67 @@ describe("buildExistingIndexSummary", () => {
     const at = after.indexOf("- m-new");
     expect(after.slice(0, at)).toEqual(before.slice(0, at));
   });
+});
+
+it("puts the store label after the identities, never inside the shared prefix", () => {
+  // The label is derived from the launch cwd's basename, so two sessions that
+  // resolve the same store from different directories would otherwise differ on
+  // the first line and share nothing.
+  const dir = join(tmpDir, "store-label");
+  mkdirSync(dir, { recursive: true });
+  for (const stem of ["alpha", "beta"]) {
+    writeFileSync(join(dir, `${stem}.md`), `---\nname: ${stem}\n---\nbody`);
+  }
+  writeFileSync(
+    join(dir, "MEMORY.md"),
+    ["- [Alpha](alpha.md) — a", "- [Beta](beta.md) — b", ""].join("\n"),
+  );
+  const resolved: ResolveResult = {
+    project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "some-cwd" },
+    warnings: [],
+  };
+  const body = buildExistingIndexSummary(resolved);
+  const lines = body.split("\n");
+  // The preamble is added by the caller; this function starts with identities.
+  expect(lines[0]).toBe("- alpha");
+  expect(lines.indexOf("## some-cwd")).toBeGreaterThan(lines.indexOf("- beta"));
+});
+
+it("a deletion is not prefix-safe, and is documented as such", () => {
+  // Identity order is invariant under supersede/demotion/archiving, but NOT
+  // under deletion: dropping a stem shifts every line after it. Keeping the
+  // deleted stem to protect the cache would be wrong, so this test pins the
+  // accepted behaviour rather than a regression.
+  const dir = join(tmpDir, "store-delete");
+  mkdirSync(dir, { recursive: true });
+  const stems = ["aaa", "bbb", "ccc", "ddd"];
+  for (const stem of stems) {
+    writeFileSync(join(dir, `${stem}.md`), `---\nname: ${stem}\n---\nbody`);
+  }
+  writeFileSync(
+    join(dir, "MEMORY.md"),
+    [...stems.map((s) => `- [${s}](${s}.md) — e`), ""].join("\n"),
+  );
+  const resolved: ResolveResult = {
+    project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "t" },
+    warnings: [],
+  };
+  const before = buildExistingIndexSummary(resolved).split("\n");
+  const after = (() => {
+    rmSync(join(dir, "bbb.md"));
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      ["- [aaa](aaa.md) — e", "- [ccc](ccc.md) — e", "- [ddd](ddd.md) — e", ""].join("\n"),
+    );
+    return buildExistingIndexSummary(resolved).split("\n");
+  })();
+  const stemsOf = (ls: string[]) => ls.filter((l) => /^- [^:]+$/.test(l));
+  expect(stemsOf(before)).toEqual(["- aaa", "- bbb", "- ccc", "- ddd"]);
+  expect(stemsOf(after)).toEqual(["- aaa", "- ccc", "- ddd"]);
+  // Only the head ahead of the removed stem is still a shared prefix; every
+  // line after it moved, which is the accepted cost of a deletion.
+  expect(after[0]).toBe(before[0]);
+  expect(after[1]).not.toBe(before[1]);
 });
 
 describe("identity block survives the production demotion path", () => {
