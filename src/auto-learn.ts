@@ -667,6 +667,47 @@ function chooseDescribed(
   return described;
 }
 
+/** Order in which stems are emitted to the reviewer, per store, for THIS
+ * process. Append-only by construction: see applyStableOrder. */
+const indexOrderBaseline = new Map<string, readonly string[]>();
+
+/** Drop every remembered order. Called on session_start so a fresh session
+ * starts from the store's current (sorted) order rather than inheriting a
+ * baseline captured in a previous conversation. */
+export function resetIndexOrderBaseline(): void {
+  indexOrderBaseline.clear();
+}
+
+/** Reorder stems so that an added entry never moves an existing line.
+ *
+ * Sorting alone is not append-only: a new stem slots in wherever it falls
+ * alphabetically, and on a 2,000-entry store that is a random point in the
+ * identity block. Each added entry therefore cost the whole tail of the
+ * cacheable prefix - measured at 9-50% of the block depending on where the
+ * stem landed, and on roughly half of all reviews.
+ *
+ * So the FIRST review of a store in this process records the order it saw
+ * (sorted), and every later review emits that remembered order followed by any
+ * stems it did not know about, themselves sorted. New entries then appear at
+ * the tail, where they cost nothing, and the accumulated order is remembered
+ * so the next addition appends after them too.
+ *
+ * The baseline is an ORDER, never a membership list: it is filtered against the
+ * current stems on every call, so a deleted entry disappears immediately and a
+ * stem only the baseline knows about can never be shown to the model. It is
+ * in-memory only - a restart simply re-captures the current order, which costs
+ * one cache miss and no correctness. */
+function applyStableOrder(key: string, sorted: readonly string[]): readonly string[] {
+  const current = new Set(sorted);
+  const baseline = indexOrderBaseline.get(key);
+  const present = baseline?.filter((stem) => current.has(stem));
+  const known = new Set(present ?? []);
+  const added = sorted.filter((stem) => !known.has(stem));
+  const order = [...(present ?? []), ...added];
+  indexOrderBaseline.set(key, order);
+  return order;
+}
+
 /** Build a compact summary of the existing memory index for the LLM.
  *
  * Parses MEMORY.md (not a raw readdir) so the LLM sees entry descriptions,
@@ -797,10 +838,15 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         // the docblock). Order carries no meaning for the model.
         owned.sort((a, b) => (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0));
         const described = chooseDescribed(owned, chunk);
-        // Identity block: bare stems only, sorted. Nothing here depends on the
-        // chunk or on the store's own line order, so it is byte-stable across
-        // reviews unless a topic is added (then only from its sorted slot).
-        for (const e of owned) lines.push(`- ${e.stem}`);
+        // Identity block: bare stems, in this process's remembered order (see
+        // applyStableOrder), so an added entry appends instead of displacing
+        // the tail. Nothing here depends on the chunk or on the store's own
+        // line order.
+        const order = applyStableOrder(
+          canonicalDir(dir),
+          owned.map((e) => e.stem),
+        );
+        for (const stem of order) lines.push(`- ${stem}`);
         if (external > 0) {
           lines.push(
             `(${external} index entr${external === 1 ? "y" : "ies"} point outside this store and are ` +

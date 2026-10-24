@@ -26,7 +26,7 @@ import type {
   ToolResultEvent,
   TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
-import { type AutoLearnConfig, runAutoLearn } from "./auto-learn.js";
+import { type AutoLearnConfig, resetIndexOrderBaseline, runAutoLearn } from "./auto-learn.js";
 import { isSubagentProcess, loadConfig, type PiClaudeMemoryConfig } from "./config.js";
 import { detectCorrectionPattern } from "./correction.js";
 import { debugLog, withDebugLogContext } from "./debug-log.js";
@@ -287,6 +287,10 @@ export default function piClaudeMemory(pi: ExtensionAPI): void {
     pendingCorrection = null;
     correctionText = null;
     lastTriggeredReviewAt = Number.NEGATIVE_INFINITY;
+    // The reviewer's identity ordering is remembered per store for this
+    // process so additions append at the tail; a new session starts from the
+    // store's current order rather than a baseline from a previous conversation.
+    resetIndexOrderBaseline();
     // A fresh session means fresh unreviewed material: revision state must
     // not leak the previous branch's "already reviewed" conclusion.
     materialRevision = 0;
