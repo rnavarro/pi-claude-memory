@@ -18,7 +18,6 @@ import {
   applyStemKeys,
   buildExistingIndexSummary,
   parseCandidates,
-  resetIndexOrderBaseline,
   snapshotMtimes,
 } from "../src/auto-learn.js";
 import { writeMemory } from "../src/memory-writer.js";
@@ -126,7 +125,6 @@ describe("buildExistingIndexSummary", () => {
     // slots in wherever it falls alphabetically, which on a real store is a
     // random point in the block. So the first review of a store in this process
     // records the order, and later additions append after it (applyStableOrder).
-    resetIndexOrderBaseline();
     const dir = join(tmpDir, "store-with-archive");
     mkdirSync(dir, { recursive: true });
     const topics = ["live-two", "live-one", "archived-two", "archived-one"];
@@ -232,8 +230,63 @@ describe("buildExistingIndexSummary", () => {
     ]);
   });
 
-  it("drops a deleted stem from the remembered order and re-captures after a reset", () => {
-    resetIndexOrderBaseline();
+  it("orders identically in every process and puts unstamped entries in the head", () => {
+    // Cross-process agreement is the property that lets two sessions reviewing the
+    // same store reuse each other's cached prefix. The order is a pure function of
+    // the files, so two independent builds must agree - there is no memory to
+    // inherit and nothing to reset.
+    const dir = join(tmpDir, "store-crossproc");
+    mkdirSync(dir, { recursive: true });
+    // A legacy entry: written by hand, no frontmatter, no stamp.
+    writeFileSync(join(dir, "zzz-legacy.md"), "# legacy\nbody");
+    writeFileSync(join(dir, "MEMORY.md"), ["- [Legacy](zzz-legacy.md) — old", ""].join("\n"));
+    const resolved: ResolveResult = {
+      project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "t" },
+      warnings: [],
+    };
+    const stemsOf = (s: string) =>
+      s
+        .split(/^SUMMARIES/m)[0]
+        .split("\n")
+        .filter((l) => /^- [^:]+$/.test(l));
+
+    // A stamped entry created through the writer, sorted FIRST alphabetically.
+    const res = writeMemory(resolved.project as MemoryDirType, {
+      name: "aaa-stamped",
+      description: "new",
+      type: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    expect(res.ok).toBe(true);
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- zzz-legacy", "- aaa-stamped"]);
+    // Same answer on a second, independent build - nothing is remembered between
+    // calls that could make one process disagree with another.
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- zzz-legacy", "- aaa-stamped"]);
+
+    // An entry another writer dropped in without a stamp lands in the stem-ordered
+    // head, ahead of the stamped tail. That is a known limit of the scheme: the
+    // Claude Code memory writer does not stamp, and an unstamped arrival therefore
+    // does insert mid-list.
+    writeFileSync(join(dir, "mmm-foreign.md"), `---\nmetadata:\n  node_type: memory\n---\nbody`);
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      [
+        "- [Legacy](zzz-legacy.md) — old",
+        "- [Stamped](aaa-stamped.md) — new",
+        "- [Foreign](mmm-foreign.md) — x",
+        "",
+      ].join("\n"),
+    );
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual([
+      "- mmm-foreign",
+      "- zzz-legacy",
+      "- aaa-stamped",
+    ]);
+  });
+
+  it("drops a deleted stem from the remembered order and leases a deleted stem out of the order", () => {
     const dir = join(tmpDir, "store-delete-order");
     mkdirSync(dir, { recursive: true });
     const stems = ["aaa", "bbb", "ccc"];
@@ -264,7 +317,6 @@ describe("buildExistingIndexSummary", () => {
     expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- aaa", "- ccc"]);
 
     // A reset re-captures from the store, so a later addition appends from there.
-    resetIndexOrderBaseline();
     expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- aaa", "- ccc"]);
   });
 });
