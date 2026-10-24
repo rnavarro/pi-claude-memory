@@ -635,7 +635,7 @@ export function applyStemKeys(
  * the review prompt without bound. */
 const SUMMARY_BUDGET_CHARS = 6000;
 
-/** Pick which entries (by index into `owned`, oldest write first) get their
+/** Pick which entries (by index into `owned`, in MEMORY.md order) get their
  * summary within SUMMARY_BUDGET_CHARS.
  *
  * With a chunk, entries are taken by relevance to it first (score descending,
@@ -697,24 +697,34 @@ function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
  * here, so advertising it would invite overwriting an unrelated local file whose
  * stem happens to match.
  *
- * Entries are listed oldest write first (topic file mtime), not in MEMORY.md
- * order. The writer inserts a new line just above `## Archive`, so file order
- * put each new entry mid-list in a store with an Archive section, changing the
- * extraction prompt from that point on and missing the provider prompt cache.
- * By write time a new topic always lands last, and demotion to the archive
- * moves only the index line, never the topic file, so it reorders nothing.
+ * The prompt is laid out for the provider's prefix cache, because the whole
+ * ~78K-char index is re-sent on every review (every 2-5 minutes in a live
+ * session) and a shared prefix is charged at the cache-read rate instead of
+ * input. Two blocks achieve that:
  *
- * Which entries carry a SUMMARY is a separate choice from the listing order.
+ * 1. EVERY stem, bare, in MEMORY.md order. Order matters: the writer replaces
+ *    a superseded entry's line IN PLACE and splices a new one at the end of the
+ *    live region (just above `## Archive`), so file order changes only by an
+ *    append at the live tail. Ordering by topic-file mtime instead — what this
+ *    did before — moved the entry to the tail on every overwrite, breaking the
+ *    prefix at its OLD position, which for an old entry is early in the list.
+ *    Supersession is the operation this reviewer performs most, so mtime order
+ *    churned the prefix on nearly every call.
+ * 2. A trailing block of SUMMARIES for the entries most related to the current
+ *    chunk (BM25F over title, summary and filename, the ranker find_memory
+ *    uses), keyed by the same stems. That set is genuinely chunk-dependent, so
+ *    it can never be stable; isolating it keeps its churn out of the identity
+ *    block. Previously the summaries were spliced INLINE, so the first described
+ *    entry — ~2.8K chars into a 108K prompt — broke the prefix for everything
+ *    after it, and the measured cache-read rate was 2.4%.
+ *
  * Without a chunk the budget is spent oldest first, so a new entry never takes
- * a summary away from an earlier one. With a chunk it is spent on the entries
- * most related to that chunk (BM25F over title, summary and filename, the
- * ranker find_memory uses), and only then oldest first. Oldest-first alone
- * described ~91 of 832 entries in a real store and left every recent cluster
- * as bare slugs (all 120 hp-78k0-* entries), and those are exactly the topics
- * the conversation under review re-derives; the reviewer could not see what
- * they covered and minted siblings instead of superseding. This gives up a
- * stable review prompt, which bought little: the user message already changes
- * with every chunk. */
+ * a summary away from an earlier one. Oldest-first alone described ~91 of 832
+ * entries in a real store and left every recent cluster as bare slugs (all 120
+ * hp-78k0-* entries), and those are exactly the topics the conversation under
+ * review re-derives; the reviewer could not see what they covered and minted
+ * siblings instead of superseding. All identities stay listed either way, so
+ * supersession is never blocked by the budget. */
 export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: string): string {
   const lines: string[] = [];
   // Both sides of the ownership test are canonicalized: entry.filePath comes
@@ -774,7 +784,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         // bounds prompt size without losing matchability.
         let external = 0;
         const owned: Array<{ stem: string; summary: string; title: string }> = [];
-        for (const entry of byWriteTime(parsed.entries, (e) => e.filePath)) {
+        for (const entry of parsed.entries) {
           if (!isOwnedBy(entry.filePath, dir)) {
             external++;
             continue;
@@ -786,20 +796,30 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
           owned.push({ stem, summary: entry.summary, title: entry.title });
         }
         const described = chooseDescribed(owned, chunk);
-        let trimmed = 0;
-        for (const [i, e] of owned.entries()) {
-          if (described.has(i)) {
-            lines.push(`- ${e.stem}: ${e.summary}`);
-          } else {
-            lines.push(`- ${e.stem}`);
-            trimmed++;
-          }
-        }
+        // Identity block: bare stems only, in MEMORY.md order. Nothing here
+        // depends on the chunk, so it is byte-stable across reviews unless a
+        // topic is added (appended at the live tail) or demoted to the archive.
+        for (const e of owned) lines.push(`- ${e.stem}`);
         if (external > 0) {
           lines.push(
             `(${external} index entr${external === 1 ? "y" : "ies"} point outside this store and are ` +
               "not listed: they are not addressable by name here)",
           );
+        }
+        const trimmed = owned.length - described.size;
+        // Trailing summaries block: the chunk-dependent part, kept after the
+        // identity block so its churn cannot invalidate the cached prefix.
+        if (described.size > 0) {
+          lines.push("");
+          lines.push(
+            chunk?.trim()
+              ? "SUMMARIES FOR ENTRIES MOST RELATED TO THIS CONVERSATION:"
+              : "SUMMARIES (oldest entries first, within the size budget):",
+          );
+          for (const [i, e] of owned.entries()) {
+            if (!described.has(i)) continue;
+            lines.push(`- ${e.stem}: ${e.summary}`);
+          }
         }
         if (trimmed > 0) {
           lines.push(

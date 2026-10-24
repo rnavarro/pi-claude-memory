@@ -119,10 +119,13 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).not.toContain("Prefer jq");
   });
 
-  it("appends a new entry at the end in a store with an Archive section", () => {
-    // The writer inserts a new index line just above `## Archive`. Listed in
-    // file order, that put the new entry mid-list and changed the extraction
-    // prompt from there on, which misses the provider prompt cache.
+  it("appends a new entry at the live tail and moves no identity line on a supersede", () => {
+    // Prompt-cache stability: the identity block is re-sent on every review, so
+    // its order may change only by appending. The writer replaces a superseded
+    // entry's MEMORY.md line IN PLACE and splices a new one at the end of the
+    // live region (just above `## Archive`), so file order is append-only for
+    // both operations. Listing by topic-file mtime instead moved a superseded
+    // entry to the tail and broke the prefix at its old slot.
     const dir = join(tmpDir, "store-with-archive");
     mkdirSync(dir, { recursive: true });
     const topics = ["live-one", "live-two", "archived-one", "archived-two"];
@@ -150,6 +153,7 @@ describe("buildExistingIndexSummary", () => {
       warnings: [],
     };
 
+    const identity = (s: string) => s.split(/^SUMMARIES/m)[0];
     const before = buildExistingIndexSummary(resolved);
     const written = writeMemory(resolved.project as MemoryDirType, {
       name: "brand-new",
@@ -165,8 +169,28 @@ describe("buildExistingIndexSummary", () => {
     expect(index.indexOf("brand-new.md")).toBeLessThan(index.indexOf("## Archive"));
 
     const after = buildExistingIndexSummary(resolved);
-    expect(after.startsWith(before)).toBe(true);
-    expect(after.slice(before.length)).toBe("\n- brand-new: a new entry");
+    const linesBefore = identity(before).split("\n");
+    const linesAfter = identity(after).split("\n");
+    // Exactly one insertion, at the live tail: every line before it is
+    // byte-identical and every line after it keeps its order.
+    expect(linesAfter).toEqual([
+      ...linesBefore.slice(0, 3),
+      "- brand-new",
+      ...linesBefore.slice(3),
+    ]);
+
+    // A supersede rewrites the description in place, so the identity block must
+    // not change at all — this is the operation the reviewer performs most.
+    const superseded = writeMemory(resolved.project as MemoryDirType, {
+      name: "live-one",
+      description: "a rewritten description",
+      type: "project",
+      body: "new body",
+      pinned: false,
+      allowOverwrite: true,
+    });
+    expect(superseded.ok).toBe(true);
+    expect(identity(buildExistingIndexSummary(resolved))).toBe(identity(after));
   });
 });
 
@@ -218,26 +242,28 @@ describe("buildExistingIndexSummary spends the summary budget on relevance", () 
     expect(summary).toContain("the ones shown are those most related to this conversation");
   });
 
-  it("relevance changes which entries are described, never the identity order", () => {
-    const stems = (s: string) =>
-      s
-        .split("\n")
-        .filter((l) => l.startsWith("- "))
-        .map((l) => l.slice(2).split(":")[0]);
+  it("relevance changes which entries are described, never the identity block", () => {
+    const identity = (s: string) => s.split(/^SUMMARIES/m)[0];
     const plain = buildExistingIndexSummary(bigStore());
     const ranked = buildExistingIndexSummary(bigStore(), "FLMD0 power cycle flash loader");
-    expect(stems(ranked)).toEqual(stems(plain));
-    expect(stems(ranked)).toHaveLength(120);
+    // The cacheable prefix is identical under both rankings; only the trailing
+    // summaries block differs.
+    expect(identity(ranked)).toBe(identity(plain));
+    expect(
+      identity(ranked)
+        .split("\n")
+        .filter((l) => l.startsWith("- ")),
+    ).toHaveLength(120);
+    expect(describedStems(ranked)).not.toEqual(describedStems(plain));
   });
 
   it("an unmatched chunk falls back to oldest first", () => {
     const store = bigStore();
-    expect(buildExistingIndexSummary(store, "qqqq wwww")).toBe(
-      buildExistingIndexSummary(store).replace(
-        "; every identifier",
-        "; the ones shown are those most related to this conversation; every identifier",
-      ),
-    );
+    const plain = buildExistingIndexSummary(store);
+    const unmatched = buildExistingIndexSummary(store, "qqqq wwww");
+    expect(describedStems(unmatched)).toEqual(describedStems(plain));
+    expect(unmatched).toContain("the ones shown are those most related to this conversation");
+    expect(unmatched.split(/^SUMMARIES/m)[0]).toBe(plain.split(/^SUMMARIES/m)[0]);
   });
 });
 
