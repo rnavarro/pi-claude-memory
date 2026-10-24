@@ -99,9 +99,9 @@ SUPERSESSION:
 Prefer extending an existing entry over creating a sibling. If a candidate
 corrects, updates, or adds detail to an existing entry in the same area, set
 supersedes to that entry's slug and write a body that covers BOTH the old
-content still true and the new detail: the body replaces the old one. Use the
-identifier before the colon in the existing index (the existing file's
-filename stem, e.g. "prefer-jq" — NOT the description).
+content still true and the new detail: the body replaces the old one. The
+identifiers listed below are bare filename stems (e.g. "prefer-jq" - NOT the
+description); the summaries that follow some of them use the same stems.
 
 If there is nothing worth extracting, return an empty array: []
 
@@ -699,6 +699,11 @@ function chooseDescribed(
  *    to 0%. Sorted order is invariant under supersede, demotion, archiving and
  *    deletion; only a genuinely new stem shifts anything, and then only from its
  *    own sorted position. The model does not use the order, only the stems.
+ *    One exception: DELETION is not prefix-safe. Dropping a stem shifts every
+ *    line after it, so a review that follows a deletion loses the tail of the
+ *    block. Nothing can be done about that without keeping deleted identities
+ *    in the prompt, which would be wrong - the list is a membership list, not a
+ *    cache artefact - so it is accepted.
  * 2. A trailing block of SUMMARIES for the entries most related to the current
  *    chunk (BM25F over title, summary and filename, the ranker find_memory
  *    uses), keyed by the same stems. That set is genuinely chunk-dependent, so
@@ -754,11 +759,6 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
 
   const dir = resolved.project;
   if (dir) {
-    const headerIndex = lines.length;
-    // The header is the store's label (the project basename), stated for
-    // context only; the candidate schema carries no tier token any more.
-    lines.push(`## ${dir.label}`);
-    const before = lines.length;
     try {
       const parsed = parseIndexFile(dir);
       if (parsed && parsed.entries.length > 0) {
@@ -791,9 +791,10 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         // plain in-place supersede - is a freshly computed age order, not an
         // insertion order. Measured on this machine's 2033-entry store, a
         // single supersede moved the file-order prefix from 100% to 0%.
-        // Sorting by stem is invariant under supersede, demotion, archiving and
-        // deletion; only a genuinely new stem shifts anything, and then only
-        // from its own sorted position. Order carries no meaning for the model.
+        // Sorting by stem is invariant under supersede, demotion and
+        // archiving; only a genuinely new stem shifts anything, and then only
+        // from its own sorted position (deletion shifts the tail once - see
+        // the docblock). Order carries no meaning for the model.
         owned.sort((a, b) => (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0));
         const described = chooseDescribed(owned, chunk);
         // Identity block: bare stems only, sorted. Nothing here depends on the
@@ -806,6 +807,12 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
               "not listed: they are not addressable by name here)",
           );
         }
+        // The store's label sits AFTER the identities. It is derived from the
+        // launch cwd's basename, so two sessions that resolve the same store
+        // from different directories would otherwise differ on the very first
+        // line and lose the entire shared prefix. It stays in the prompt for
+        // context; it is simply not part of the cacheable prefix any more.
+        lines.push(`## ${dir.label}`);
         const trimmed = owned.length - described.size;
         // Trailing summaries block: the chunk-dependent part, kept after the
         // identity block so its churn cannot invalidate the cached prefix.
@@ -814,7 +821,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
           lines.push(
             chunk?.trim()
               ? "SUMMARIES FOR ENTRIES MOST RELATED TO THIS CONVERSATION:"
-              : "SUMMARIES (oldest entries first, within the size budget):",
+              : "SUMMARIES (alphabetical order, within the size budget):",
           );
           for (const [i, e] of owned.entries()) {
             if (!described.has(i)) continue;
@@ -843,15 +850,11 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
           for (const f of files.map((name: string) => name.replace(/\.md$/, "")).sort()) {
             lines.push(`- ${f}`);
           }
+          lines.push(`## ${dir.label}`);
         }
       }
     } catch {
       lines.push("(unreadable)");
-    }
-    // Drop a header with no entries under it, so the model is not handed a
-    // section implying ownership of something we could not list.
-    if (lines.length === before && headerIndex < lines.length) {
-      lines.length = headerIndex;
     }
   }
   return lines.join("\n");
