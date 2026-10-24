@@ -18,6 +18,7 @@ import {
   applyStemKeys,
   buildExistingIndexSummary,
   parseCandidates,
+  resetIndexOrderBaseline,
   snapshotMtimes,
 } from "../src/auto-learn.js";
 import { writeMemory } from "../src/memory-writer.js";
@@ -119,12 +120,13 @@ describe("buildExistingIndexSummary", () => {
     expect(summary).not.toContain("Prefer jq");
   });
 
-  it("lists identities sorted, and a new stem inserts at its sorted slot", () => {
+  it("emits identities sorted on the first review, then appends new stems at the tail", () => {
     // Prompt-cache stability: the identity block is re-sent on every review, so
-    // it must change only at the point a genuinely new stem belongs. Sorting is
-    // what buys that — MEMORY.md's own order is recomputed by
-    // fitIndexToExcerpt on every write when demoteIndexOverflow is on, so it is
-    // not an insertion order at all (see the demotion test below).
+    // it must change only by appending. Sorting alone is not enough - a new stem
+    // slots in wherever it falls alphabetically, which on a real store is a
+    // random point in the block. So the first review of a store in this process
+    // records the order, and later additions append after it (applyStableOrder).
+    resetIndexOrderBaseline();
     const dir = join(tmpDir, "store-with-archive");
     mkdirSync(dir, { recursive: true });
     const topics = ["live-two", "live-one", "archived-two", "archived-one"];
@@ -153,17 +155,20 @@ describe("buildExistingIndexSummary", () => {
     };
 
     const identity = (s: string) => s.split(/^SUMMARIES/m)[0];
+    const stemsOf = (ls: string[]) => ls.filter((l) => /^- [^:]+$/.test(l));
     const before = identity(buildExistingIndexSummary(resolved)).split("\n");
-    // Deliberately written out of order in MEMORY.md; emitted sorted.
-    expect(before.filter((l) => l.startsWith("- "))).toEqual([
+    // Written out of order in MEMORY.md; the first review sorts it.
+    expect(stemsOf(before)).toEqual([
       "- archived-one",
       "- archived-two",
       "- live-one",
       "- live-two",
     ]);
 
+    // A stem that sorts FIRST alphabetically. Under plain sorting it would land
+    // at the top and invalidate everything below it.
     const written = writeMemory(resolved.project as MemoryDirType, {
-      name: "m-new",
+      name: "aaa-new",
       description: "a new entry",
       type: "project",
       body: "body",
@@ -171,85 +176,97 @@ describe("buildExistingIndexSummary", () => {
       allowOverwrite: false,
     });
     expect(written.ok).toBe(true);
-    // The writer still puts the link above the Archive heading in the file.
     const index = readFileSync(join(dir, "MEMORY.md"), "utf8");
-    expect(index.indexOf("m-new.md")).toBeLessThan(index.indexOf("## Archive"));
+    expect(index.indexOf("aaa-new.md")).toBeLessThan(index.indexOf("## Archive"));
 
     const after = identity(buildExistingIndexSummary(resolved)).split("\n");
-    const stemsOf = (ls: string[]) => ls.filter((l) => /^- [^:]+$/.test(l));
-    // Exactly one line added, at its sorted position; nothing else moves.
-    expect(stemsOf(after)).toEqual(
-      [...stemsOf(before), "- m-new"].sort((a, b) => (a.slice(2) < b.slice(2) ? -1 : 1)),
-    );
-    expect(after.filter((l) => !l.startsWith("- "))).toEqual(
-      before.filter((l) => !l.startsWith("- ")),
-    );
-    // And the prefix up to the insertion point is byte-identical (which is what
-    // the provider cache actually reuses).
-    const at = after.indexOf("- m-new");
-    expect(after.slice(0, at)).toEqual(before.slice(0, at));
+    expect(stemsOf(after)).toEqual([
+      "- archived-one",
+      "- archived-two",
+      "- live-one",
+      "- live-two",
+      "- aaa-new",
+    ]);
+    // Appended at the tail of the identity list, ahead of the label: every line
+    // before it is byte-identical, which is the prefix the cache can reuse.
+    const labelAt = before.indexOf("## test");
+    expect(after).toEqual([...before.slice(0, labelAt), "- aaa-new", ...before.slice(labelAt)]);
+
+    // A second addition appends after the first, rather than sorting into the
+    // delta it already knows.
+    const second = writeMemory(resolved.project as MemoryDirType, {
+      name: "aab-second",
+      description: "another new entry",
+      type: "project",
+      body: "body",
+      pinned: false,
+      allowOverwrite: false,
+    });
+    expect(second.ok).toBe(true);
+    expect(stemsOf(identity(buildExistingIndexSummary(resolved)).split("\n")).slice(-2)).toEqual([
+      "- aaa-new",
+      "- aab-second",
+    ]);
+
+    // A supersede of a long-standing entry moves nothing.
+    const superseded = writeMemory(resolved.project as MemoryDirType, {
+      name: "live-one",
+      description: "a rewritten description",
+      type: "project",
+      body: "new body",
+      pinned: false,
+      allowOverwrite: true,
+    });
+    expect(superseded.ok).toBe(true);
+    expect(
+      identity(buildExistingIndexSummary(resolved))
+        .split("\n")
+        .filter((l) => /^- [^:]+$/.test(l)),
+    ).toEqual([
+      "- archived-one",
+      "- archived-two",
+      "- live-one",
+      "- live-two",
+      "- aaa-new",
+      "- aab-second",
+    ]);
   });
-});
 
-it("puts the store label after the identities, never inside the shared prefix", () => {
-  // The label is derived from the launch cwd's basename, so two sessions that
-  // resolve the same store from different directories would otherwise differ on
-  // the first line and share nothing.
-  const dir = join(tmpDir, "store-label");
-  mkdirSync(dir, { recursive: true });
-  for (const stem of ["alpha", "beta"]) {
-    writeFileSync(join(dir, `${stem}.md`), `---\nname: ${stem}\n---\nbody`);
-  }
-  writeFileSync(
-    join(dir, "MEMORY.md"),
-    ["- [Alpha](alpha.md) — a", "- [Beta](beta.md) — b", ""].join("\n"),
-  );
-  const resolved: ResolveResult = {
-    project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "some-cwd" },
-    warnings: [],
-  };
-  const body = buildExistingIndexSummary(resolved);
-  const lines = body.split("\n");
-  // The preamble is added by the caller; this function starts with identities.
-  expect(lines[0]).toBe("- alpha");
-  expect(lines.indexOf("## some-cwd")).toBeGreaterThan(lines.indexOf("- beta"));
-});
+  it("drops a deleted stem from the remembered order and re-captures after a reset", () => {
+    resetIndexOrderBaseline();
+    const dir = join(tmpDir, "store-delete-order");
+    mkdirSync(dir, { recursive: true });
+    const stems = ["aaa", "bbb", "ccc"];
+    for (const stem of stems) {
+      writeFileSync(join(dir, `${stem}.md`), `---\nname: ${stem}\n---\nbody`);
+    }
+    writeFileSync(
+      join(dir, "MEMORY.md"),
+      [...stems.map((s) => `- [${s}](${s}.md) — e`), ""].join("\n"),
+    );
+    const resolved: ResolveResult = {
+      project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "t" },
+      warnings: [],
+    };
+    const stemsOf = (s: string) =>
+      s
+        .split(/^SUMMARIES/m)[0]
+        .split("\n")
+        .filter((l) => /^- [^:]+$/.test(l));
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- aaa", "- bbb", "- ccc"]);
 
-it("a deletion is not prefix-safe, and is documented as such", () => {
-  // Identity order is invariant under supersede/demotion/archiving, but NOT
-  // under deletion: dropping a stem shifts every line after it. Keeping the
-  // deleted stem to protect the cache would be wrong, so this test pins the
-  // accepted behaviour rather than a regression.
-  const dir = join(tmpDir, "store-delete");
-  mkdirSync(dir, { recursive: true });
-  const stems = ["aaa", "bbb", "ccc", "ddd"];
-  for (const stem of stems) {
-    writeFileSync(join(dir, `${stem}.md`), `---\nname: ${stem}\n---\nbody`);
-  }
-  writeFileSync(
-    join(dir, "MEMORY.md"),
-    [...stems.map((s) => `- [${s}](${s}.md) — e`), ""].join("\n"),
-  );
-  const resolved: ResolveResult = {
-    project: { tier: "project", dir, indexPath: join(dir, "MEMORY.md"), label: "t" },
-    warnings: [],
-  };
-  const before = buildExistingIndexSummary(resolved).split("\n");
-  const after = (() => {
+    // Delete the middle entry: the remembered order must not resurrect it.
     rmSync(join(dir, "bbb.md"));
     writeFileSync(
       join(dir, "MEMORY.md"),
-      ["- [aaa](aaa.md) — e", "- [ccc](ccc.md) — e", "- [ddd](ddd.md) — e", ""].join("\n"),
+      ["- [aaa](aaa.md) — e", "- [ccc](ccc.md) — e", ""].join("\n"),
     );
-    return buildExistingIndexSummary(resolved).split("\n");
-  })();
-  const stemsOf = (ls: string[]) => ls.filter((l) => /^- [^:]+$/.test(l));
-  expect(stemsOf(before)).toEqual(["- aaa", "- bbb", "- ccc", "- ddd"]);
-  expect(stemsOf(after)).toEqual(["- aaa", "- ccc", "- ddd"]);
-  // Only the head ahead of the removed stem is still a shared prefix; every
-  // line after it moved, which is the accepted cost of a deletion.
-  expect(after[0]).toBe(before[0]);
-  expect(after[1]).not.toBe(before[1]);
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- aaa", "- ccc"]);
+
+    // A reset re-captures from the store, so a later addition appends from there.
+    resetIndexOrderBaseline();
+    expect(stemsOf(buildExistingIndexSummary(resolved))).toEqual(["- aaa", "- ccc"]);
+  });
 });
 
 describe("identity block survives the production demotion path", () => {
