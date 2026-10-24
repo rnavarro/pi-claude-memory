@@ -667,22 +667,6 @@ function chooseDescribed(
   return described;
 }
 
-/** Order items oldest write first by the mtime of the file each names.
- * A missing or unreadable file sorts first; ties keep their input order. */
-function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
-  const writeTime = (item: T): number => {
-    try {
-      return statSync(pathOf(item)).mtimeMs;
-    } catch {
-      return Number.NEGATIVE_INFINITY;
-    }
-  };
-  return items
-    .map((item) => ({ item, time: writeTime(item) }))
-    .sort((a, b) => (a.time === b.time ? 0 : a.time < b.time ? -1 : 1))
-    .map(({ item }) => item);
-}
-
 /** Build a compact summary of the existing memory index for the LLM.
  *
  * Parses MEMORY.md (not a raw readdir) so the LLM sees entry descriptions,
@@ -702,14 +686,19 @@ function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
  * session) and a shared prefix is charged at the cache-read rate instead of
  * input. Two blocks achieve that:
  *
- * 1. EVERY stem, bare, in MEMORY.md order. Order matters: the writer replaces
- *    a superseded entry's line IN PLACE and splices a new one at the end of the
- *    live region (just above `## Archive`), so file order changes only by an
- *    append at the live tail. Ordering by topic-file mtime instead — what this
- *    did before — moved the entry to the tail on every overwrite, breaking the
- *    prefix at its OLD position, which for an old entry is early in the list.
- *    Supersession is the operation this reviewer performs most, so mtime order
- *    churned the prefix on nearly every call.
+ * 1. EVERY stem, bare, SORTED lexicographically. Order is what makes the block
+ *    stable, and the store's own line order is not stable: with
+ *    `demoteIndexOverflow` on (the default in the operator's config) every
+ *    index publish — including a plain in-place supersede — runs
+ *    fitIndexToExcerpt with a recency timestamp, which promotes every archived
+ *    link back into the live list and re-demotes by topic mtime. MEMORY.md's
+ *    order is therefore a freshly recomputed age order after any write, and
+ *    this store is 95% archived (108 live vs 1925 archived lines), so age order
+ *    churns almost the whole block. Measured on a copy of it: one supersede,
+ *    of a live entry or an archived one, moved the file-order prefix from 100%
+ *    to 0%. Sorted order is invariant under supersede, demotion, archiving and
+ *    deletion; only a genuinely new stem shifts anything, and then only from its
+ *    own sorted position. The model does not use the order, only the stems.
  * 2. A trailing block of SUMMARIES for the entries most related to the current
  *    chunk (BM25F over title, summary and filename, the ranker find_memory
  *    uses), keyed by the same stems. That set is genuinely chunk-dependent, so
@@ -718,8 +707,8 @@ function byWriteTime<T>(items: readonly T[], pathOf: (item: T) => string): T[] {
  *    entry — ~2.8K chars into a 108K prompt — broke the prefix for everything
  *    after it, and the measured cache-read rate was 2.4%.
  *
- * Without a chunk the budget is spent oldest first, so a new entry never takes
- * a summary away from an earlier one. Oldest-first alone described ~91 of 832
+ * Without a chunk the budget is spent from the front of the sorted list (the
+ * old code spent it oldest first). Oldest-first alone described ~91 of 832
  * entries in a real store and left every recent cluster as bare slugs (all 120
  * hp-78k0-* entries), and those are exactly the topics the conversation under
  * review re-derives; the reviewer could not see what they covered and minted
@@ -795,10 +784,21 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
           const stem = entry.href.split("/").pop()?.replace(/\.md$/, "") ?? entry.title;
           owned.push({ stem, summary: entry.summary, title: entry.title });
         }
+        // Lexicographic, NOT file order. The index is refitted on every write
+        // with `demoteIndexOverflow` on (the default here): fitIndexToExcerpt
+        // promotes every archived link back into the live list and re-demotes
+        // by topic mtime, so MEMORY.md's order after any write - including a
+        // plain in-place supersede - is a freshly computed age order, not an
+        // insertion order. Measured on this machine's 2033-entry store, a
+        // single supersede moved the file-order prefix from 100% to 0%.
+        // Sorting by stem is invariant under supersede, demotion, archiving and
+        // deletion; only a genuinely new stem shifts anything, and then only
+        // from its own sorted position. Order carries no meaning for the model.
+        owned.sort((a, b) => (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0));
         const described = chooseDescribed(owned, chunk);
-        // Identity block: bare stems only, in MEMORY.md order. Nothing here
-        // depends on the chunk, so it is byte-stable across reviews unless a
-        // topic is added (appended at the live tail) or demoted to the archive.
+        // Identity block: bare stems only, sorted. Nothing here depends on the
+        // chunk or on the store's own line order, so it is byte-stable across
+        // reviews unless a topic is added (then only from its sorted slot).
         for (const e of owned) lines.push(`- ${e.stem}`);
         if (external > 0) {
           lines.push(
@@ -823,7 +823,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         }
         if (trimmed > 0) {
           lines.push(
-            `(summaries omitted for ${trimmed} of ${parsed.entries.length} entries to bound size` +
+            `(summaries omitted for ${trimmed} of ${owned.length} entries to bound size` +
               (chunk?.trim()
                 ? "; the ones shown are those most related to this conversation"
                 : "") +
@@ -838,10 +838,10 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
         if (files.length === 0) {
           lines.push("(no entries)");
         } else {
-          // No parseable index: list every file stem, so identities stay
-          // complete. (This too was capped at 50, hiding files outright.)
-          for (const f of byWriteTime(files, (name) => join(dir.dir, name))) {
-            lines.push(`- ${f.replace(/\.md$/, "")}`);
+          // No parseable index: list every file stem, sorted for the same
+          // reason the parsed path sorts (order stability, not age).
+          for (const f of files.map((name: string) => name.replace(/\.md$/, "")).sort()) {
+            lines.push(`- ${f}`);
           }
         }
       }
