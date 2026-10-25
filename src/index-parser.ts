@@ -580,7 +580,7 @@ export function fitIndexToExcerpt(
   // Prose authored below the heading stays below it.
   const parked = archived.filter((line) => parseLinkLine(line) === null);
   const alreadyArchived = archived.filter((line) => parseLinkLine(line) !== null);
-  const live = promote ? [...livePre, ...alreadyArchived] : [...livePre];
+  let live = promote ? [...livePre, ...alreadyArchived] : [...livePre];
   const archivedLinks: string[] = promote ? [] : [...alreadyArchived];
   const demoted: string[] = [];
 
@@ -662,10 +662,30 @@ export function fitIndexToExcerpt(
       return file ? [file.toLowerCase()] : [];
     }),
   );
-  // Ages are computed once against the pre-splice positions and spliced in step
-  // with `live`, so the positional fallback does not drift as lines leave.
-  const ages = live.map((line, at) => {
+  // Every line's file, byte cost and demotion tier is computed once. The old
+  // loop recomputed them for each victim, which is quadratic: a promoted store
+  // of ~2,400 archived links spent 5 s of main-thread time per write scanning
+  // 2,500 lines and re-running a link regex for each of ~2,400 removals.
+  const fileByIndex: (string | null)[] = new Array(live.length);
+  const bytesByIndex: number[] = new Array(live.length);
+  const linkByIndex: boolean[] = new Array(live.length);
+  const ruleLineByIndex: boolean[] = new Array(live.length);
+  const clusterTierByIndex: number[] = new Array(live.length);
+  for (let at = 0; at < live.length; at++) {
+    const line = live[at] ?? "";
     const file = fileOf(line);
+    fileByIndex[at] = file;
+    bytesByIndex[at] = Buffer.byteLength(line, "utf8") + 1;
+    linkByIndex[at] = isDemotableLinkLine(line);
+    const rule = file !== null && ruleOf(file);
+    ruleLineByIndex[at] = rule;
+    const key = rule || file === null ? null : clusterOfFile(file);
+    clusterTierByIndex[at] = key !== null && big.has(key) ? 0 : 1;
+  }
+  // Ages are computed once against the pre-splice positions, so the positional
+  // fallback does not drift as lines leave.
+  let ages = live.map((_line, at) => {
+    const file = fileByIndex[at] ?? null;
     // Prose and headings are never victims, so their age never decides anything.
     if (file === null) return Number.POSITIVE_INFINITY;
     const known = recencyAt ? recencyAt(file) : 0;
@@ -677,36 +697,43 @@ export function fitIndexToExcerpt(
   // a flood of reviewer-minted rules cannot push everything else out.
   const ruleBudget = maxBytes * RULE_SHARE;
   let ruleBytes = 0;
-  for (const line of live) {
-    const file = fileOf(line);
-    if (file && isDemotableLinkLine(line) && ruleOf(file)) {
-      ruleBytes += Buffer.byteLength(line, "utf8") + 1;
-    }
+  for (let at = 0; at < live.length; at++) {
+    if (linkByIndex[at] && ruleLineByIndex[at]) ruleBytes += bytesByIndex[at] ?? 0;
   }
 
+  let ruleOverBudget = ruleBytes > ruleBudget;
   /** Demotion order: 0 = member of a big cluster (its signpost stands in for
    *  it), 1 = ordinary entry, 2 = standing rule while rules are within budget. */
-  const tierOf = (line: string): number => {
-    const file = fileOf(line);
-    if (file === null) return Number.POSITIVE_INFINITY;
-    if (ruleOf(file)) return ruleBytes > ruleBudget ? 1 : 2;
-    const key = clusterOfFile(file);
-    return key && big.has(key) ? 0 : 1;
+  const tierOf = (at: number): number => {
+    if (ruleLineByIndex[at]) return ruleOverBudget ? 1 : 2;
+    return clusterTierByIndex[at] ?? 1;
+  };
+  const order = (left: number, right: number): number => {
+    const tierDelta = tierOf(left) - tierOf(right);
+    if (tierDelta !== 0) return tierDelta;
+    const leftAge = ages[left] ?? Number.POSITIVE_INFINITY;
+    const rightAge = ages[right] ?? Number.POSITIVE_INFINITY;
+    if (leftAge !== rightAge) return leftAge - rightAge;
+    return left - right;
   };
 
-  while (!fitsExcerpt(live, fitLines, fitBytes)) {
+  // The same victim sequence the repeated-minimum scan produced, but sorted
+  // once: tier, then age, then position.
+  const candidates: number[] = [];
+  for (let at = 0; at < live.length; at++) if (linkByIndex[at]) candidates.push(at);
+  candidates.sort(order);
+  const removed = new Set<number>();
+  let liveCount = live.length;
+  let liveBytes = excerptBytes(live);
+  let cursor = 0;
+  while (liveCount > fitLines || liveBytes > fitBytes) {
     let victimIdx = -1;
-    let victimTier = Number.POSITIVE_INFINITY;
-    let victimAge = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < live.length; i++) {
-      const line = live[i];
-      if (line === undefined || !isDemotableLinkLine(line)) continue;
-      const tier = tierOf(line);
-      const age = ages[i] ?? Number.POSITIVE_INFINITY;
-      if (tier < victimTier || (tier === victimTier && age < victimAge)) {
-        victimTier = tier;
-        victimAge = age;
-        victimIdx = i;
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor] ?? 0;
+      cursor++;
+      if (!removed.has(candidate)) {
+        victimIdx = candidate;
+        break;
       }
     }
     if (victimIdx < 0) {
@@ -715,13 +742,37 @@ export function fitIndexToExcerpt(
       // failure this mechanism exists to prevent. Report instead.
       break;
     }
-    const moved = live.splice(victimIdx, 1)[0];
-    ages.splice(victimIdx, 1);
-    if (moved === undefined) continue;
-    const name = fileOf(moved) ?? moved;
-    if (ruleOf(name)) ruleBytes -= Buffer.byteLength(moved, "utf8") + 1;
+    const moved = live[victimIdx] ?? "";
+    removed.add(victimIdx);
+    liveCount--;
+    liveBytes -= bytesByIndex[victimIdx] ?? 0;
+    const name = fileByIndex[victimIdx] ?? moved;
+    if (ruleLineByIndex[victimIdx]) {
+      ruleBytes -= bytesByIndex[victimIdx] ?? 0;
+      // Rules only leave, so the budget flip happens at most once; re-sort the
+      // survivors when it does.
+      if (ruleOverBudget && ruleBytes <= ruleBudget) {
+        ruleOverBudget = false;
+        candidates.length = 0;
+        for (let at = 0; at < live.length; at++)
+          if (linkByIndex[at] && !removed.has(at)) candidates.push(at);
+        candidates.sort(order);
+        cursor = 0;
+      }
+    }
     if (!previouslyArchived.has(name.toLowerCase())) demoted.push(name);
     archivedLinks.push(moved);
+  }
+  if (removed.size > 0) {
+    const survivorsLines: string[] = [];
+    const survivorsAges: number[] = [];
+    for (let at = 0; at < live.length; at++) {
+      if (removed.has(at)) continue;
+      survivorsLines.push(live[at] ?? "");
+      survivorsAges.push(ages[at] ?? Number.POSITIVE_INFINITY);
+    }
+    live = survivorsLines;
+    ages = survivorsAges;
   }
 
   return assemble();

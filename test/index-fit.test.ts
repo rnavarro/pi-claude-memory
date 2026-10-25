@@ -28,6 +28,24 @@ const liveOf = (lines: string[]) => {
 };
 
 describe("fitIndexToExcerpt", () => {
+  it("fits a store far past the bound without rescanning per demotion", () => {
+    // 4,500 lines is the shape of a store with ~3,000 indexed topics: promote
+    // mode pulls every archived link back into `live` and then demotes most of
+    // them, which used to cost one full rescan per victim (11.7 s here) instead
+    // of a single sort.
+    const many: string[] = [];
+    for (let i = 0; i < 3000; i++) many.push(link(i));
+    many.push(ARCHIVE_HEADING);
+    for (let i = 0; i < 1500; i++) many.push(`- [A${i}](a${i}.md) — s${i}`);
+    const started = performance.now();
+    const result = fitIndexToExcerpt(many, { recencyAt: (file) => 1000 + file.length });
+    const elapsed = performance.now() - started;
+    expect(result.cannotFit).toBe(false);
+    const liveRegion = result.lines.slice(0, result.lines.indexOf(ARCHIVE_HEADING));
+    expect(fitsExcerpt(liveRegion)).toBe(true);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   it("moves the oldest links below the heading until the live region fits", () => {
     const fit = fitIndexToExcerpt([...links(10), ""], { maxLines: 4 });
 
