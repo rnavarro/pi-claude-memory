@@ -10,8 +10,9 @@
 // The parser preserves all non-link lines as-is for display. Only link entries
 // are structured for programmatic use (injection, patching, reconciliation).
 
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
+import { createPathCache, type PathCache } from "./path-cache.js";
 import type { IndexEntry, IndexLine, MemoryDir, ParsedIndex } from "./types.js";
 import {
   INDEX_MAX_BYTES,
@@ -52,13 +53,19 @@ export function parseLinkLine(line: string): ParsedLinkLine | null {
  * through a symlinked store component, and `resolveHref` already canonicalizes
  * the read side, so lexical comparison alone would report a false negative and
  * reintroduce the duplicate-line bug this guards against. */
-function sameTarget(path: string, target: string): boolean {
+function sameTarget(path: string, target: string, cache: PathCache): boolean {
   if (path === target) return true;
-  try {
-    return realpathSync(path) === realpathSync(target);
-  } catch {
-    return false;
-  }
+  // Both sides go through resolvePath, which reaches for realpathSync only when
+  // lstat shows a symlink; a plain path resolves to its canonical directory plus
+  // its own name, which is the string realpathSync would have returned. Both
+  // results are memoised, so a caller that walks every line of the index resolves
+  // the entry being written once and each distinct href once, not once per line.
+  //
+  // A path that cannot be resolved keeps its lexical spelling here rather than
+  // producing an error: the strings can only then be equal when they are
+  // literally the same string, which returned true above — so the outcome matches
+  // the old `try { realpathSync(a) === realpathSync(b) } catch { false }`.
+  return cache.resolvePath(path) === cache.resolvePath(target);
 }
 
 /** True when the index line links to `targetPath`, regardless of how the href
@@ -70,10 +77,15 @@ function sameTarget(path: string, target: string): boolean {
  * nor removed (the link kept pointing at a file already moved to .trash/,
  * while the tool reported success). Matching on the resolved target collapses
  * absolute, `./`-prefixed, and `dir/../` spellings onto the same file. */
-export function lineTargetsFile(line: string, baseDir: string, targetPath: string): boolean {
+export function lineTargetsFile(
+  line: string,
+  baseDir: string,
+  targetPath: string,
+  cache: PathCache = createPathCache(),
+): boolean {
   const parsed = parseLinkLine(line);
   if (!parsed) return false;
-  return sameTarget(resolveHref(parsed.href, baseDir), targetPath);
+  return sameTarget(resolveHref(parsed.href, baseDir, cache), targetPath, cache);
 }
 
 /** True when the index line's href resolves to ANY path in `identities`.
@@ -96,16 +108,19 @@ export function lineTargetsAnyIdentity(
   line: string,
   baseDir: string,
   identities: ReadonlySet<string>,
+  cache: PathCache = createPathCache(),
 ): boolean {
   const parsed = parseLinkLine(line);
   if (!parsed) return false;
   const lexical = isAbsolute(parsed.href) ? resolve(parsed.href) : resolve(baseDir, parsed.href);
   if (identities.has(lexical)) return true;
-  try {
-    return identities.has(realpathSync(lexical));
-  } catch {
-    return false;
-  }
+  // resolvePath, not realpathOf: the identities hold the topic's lexical AND
+  // canonical spellings, and a non-symlink leaf canonicalizes to exactly what
+  // realpathSync would return — so a store of 2,400 plain topics costs one
+  // realpath (its directory) instead of 2,400. Falling back to the lexical
+  // string when the path cannot be resolved is safe here: that string was
+  // already tested above, so it cannot match now either.
+  return identities.has(cache.resolvePath(lexical));
 }
 
 /** Parse a MEMORY.md file from disk.
@@ -117,7 +132,10 @@ export function lineTargetsAnyIdentity(
  * file), and must be within the size cap. Unlike topics the index is
  * allowed to sit at the project root (the Layout-2 anomaly the resolver
  * supports), so it is deliberately not containment-checked. */
-export function parseIndexFile(dir: MemoryDir): ParsedIndex | null {
+export function parseIndexFile(
+  dir: MemoryDir,
+  cache: PathCache = createPathCache(),
+): ParsedIndex | null {
   try {
     const st = lstatSync(dir.indexPath);
     if (st.isSymbolicLink() || !st.isFile()) return null;
@@ -128,7 +146,7 @@ export function parseIndexFile(dir: MemoryDir): ParsedIndex | null {
   }
   try {
     const content = readFileSync(dir.indexPath, "utf8");
-    return parseIndexContent(content, dir.dir);
+    return parseIndexContent(content, dir.dir, cache);
   } catch {
     return null;
   }
@@ -305,8 +323,16 @@ export function indexParseCapWarning(dir: MemoryDir): string | null {
   );
 }
 
-/** Parse MEMORY.md content string (separated for testing). */
-export function parseIndexContent(content: string, baseDir: string): ParsedIndex {
+/** Parse MEMORY.md content string (separated for testing).
+ *
+ * `cache` is one operation's path cache: pass the caller's own so a parse and a
+ * later ownership test over the same entries resolve each topic once between
+ * them. Omitted, the parse makes and drops its own. */
+export function parseIndexContent(
+  content: string,
+  baseDir: string,
+  cache: PathCache = createPathCache(),
+): ParsedIndex {
   const lines: (IndexEntry | IndexLine)[] = [];
   const entries: IndexEntry[] = [];
 
@@ -316,7 +342,7 @@ export function parseIndexContent(content: string, baseDir: string): ParsedIndex
     const link = parseLinkLine(line);
 
     if (link) {
-      const filePath = resolveHref(link.href, baseDir);
+      const filePath = resolveHref(link.href, baseDir, cache);
       const pinned = isPinnedLine(line, link.summary);
       const entry: IndexEntry = {
         title: link.title,
@@ -343,21 +369,22 @@ export function parseIndexContent(content: string, baseDir: string): ParsedIndex
  * `/./` in it reaches the injector as a different STRING than the canonical
  * path, and cross-tier ownership then compares two spellings of one file.
  *
- * When the target exists we canonicalize through realpathSync, because
- * owningTierOf compares against realpath'd store roots: if any component of
- * the store is itself a symlink (a dotfiles-managed ~/.claude), a lexical
- * path and the real path differ and the entry would be attributed to no store
- * at all. reconcileIndex resolves the same way, so its missing/unindexed
- * report agrees. Missing files keep the lexical path — they cannot be
- * realpath'd, and reconcileIndex reports them as missing. */
-function resolveHref(href: string, baseDir: string): string {
+ * When the target exists we canonicalize, because owningTierOf compares against
+ * realpath'd store roots: if any component of the store is itself a symlink (a
+ * dotfiles-managed ~/.claude), a lexical path and the real path differ and the
+ * entry would be attributed to no store at all. reconcileIndex resolves the
+ * same way, so its missing/unindexed report agrees. Missing files keep the
+ * lexical path — they cannot be canonicalized, and reconcileIndex reports them
+ * as missing.
+ *
+ * The canonicalization is the cache's (one per operation), and it only reaches
+ * for realpathSync when lstat shows the leaf is a symlink. Doing it per line
+ * here was the storm: an append to a 100-line index resolved the same topic 100
+ * times, and to a 2,400-line index, 2,400 times, all of it main-thread. */
+function resolveHref(href: string, baseDir: string, cache: PathCache): string {
   // Absolute path (cross-tier reference like /home/user/.claude/memory/file.md)
   const lexical = isAbsolute(href) ? resolve(href) : resolve(baseDir, href);
-  try {
-    return realpathSync(lexical);
-  } catch {
-    return lexical;
-  }
+  return cache.resolvePath(lexical);
 }
 
 /** Detect pin markers in a line: ⛔ prefix or [pin] in the title/summary. */

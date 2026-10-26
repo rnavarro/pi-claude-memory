@@ -35,6 +35,7 @@ import {
   parseLinkLine,
   startupLimitWarning,
 } from "./index-parser.js";
+import { createPathCache, type PathCache } from "./path-cache.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import {
   INDEX_MAX_BYTES,
@@ -67,13 +68,17 @@ export interface WriteMemoryRequest {
 /** Whether a topic is a standing rule (frontmatter type feedback or user),
  * for the fit planner's demotion order. Reads only a plain regular file of
  * modest size inside the store (lstat, so a symlink is never followed); on any
- * doubt it falls back to the slug convention the planner uses itself. */
-function topicIsRule(dir: MemoryDir, filename: string): boolean {
+ * doubt it falls back to the slug convention the planner uses itself.
+ *
+ * `cache` is the calling operation's path cache, so the lstat is shared with
+ * everything else that operation touched and the answer is not recomputed for a
+ * second line naming the same topic. */
+function topicIsRule(dir: MemoryDir, filename: string, cache: PathCache): boolean {
   const bySlug = /^(feedback|user)[-_]/i.test(filename);
   const p = join(dir.dir, basename(filename));
+  const st = cache.lstatOf(p);
+  if (st === null || !st.isFile() || st.size > 64 * 1024) return bySlug;
   try {
-    const st = lstatSync(p);
-    if (!st.isFile() || st.size > 64 * 1024) return bySlug;
     const type = parseMemoryContent(readFileSync(p, "utf8"), basename(filename), st.mtimeMs).type;
     return type === null ? bySlug : type === "feedback" || type === "user";
   } catch {
@@ -811,25 +816,23 @@ function patchIndexAppend(
   // that a store over the bound may need to fit. The replace branch used to
   // return before the fit ran, so an overwrite never demoted — a store could sit
   // permanently past the cut while its entries were being rewritten.
-  const publish = (lines: string[]): string => {
+  const publish = (lines: string[], cache: PathCache): string => {
     // Off by default. When on, the live region is refitted on every write, so the
     // archive catches up in one publish and stays caught up as Claude Code
     // appends into it.
     lastFit = options.demoteOverflow
       ? fitIndexToExcerpt(lines, {
-          // Topic mtime is the recency signal. It costs one stat per link line on
-          // a write that is over the bound, which is what buys the ability to tell
+          // Topic mtime is the recency signal. It costs one stat per topic on a
+          // write that is over the bound, which is what buys the ability to tell
           // an entry Claude Code appended at the end of the file from one this
           // planner archived earlier. Frontmatter `metadata.modified` would be
           // more precise and costs a parse per topic instead of a stat.
-          recencyAt: (filename) => {
-            try {
-              return statSync(join(dir.dir, filename)).mtimeMs;
-            } catch {
-              return 0;
-            }
-          },
-          isRule: (filename) => topicIsRule(dir, filename),
+          //
+          // Memoised through the attempt's cache: the planner asks once per
+          // LINE, and an index holding duplicate lines for one topic asked once
+          // per line too — the same file, stat'd again for each copy.
+          recencyAt: (filename) => cache.mtimeMs(join(dir.dir, filename)),
+          isRule: (filename) => topicIsRule(dir, filename, cache),
         })
       : null;
     return (lastFit ? lastFit.lines : lines).join("\n");
@@ -837,18 +840,24 @@ function patchIndexAppend(
   withIndexRetry(
     indexPath,
     (content) => {
+      // ONE path cache for this attempt: every line of the index is compared
+      // against this entry, and every one of those comparisons used to be a
+      // realpathSync (an lstat walk per component) on the main thread. Scoped to
+      // the attempt, not the write, because a retry re-reads an index another
+      // writer has just changed — including files appearing or disappearing.
+      const cache = createPathCache();
       // Check if an entry for this target already exists — if so, replace its
       // line. `linkRegex` is the cheap literal fast path; the target check
       // catches differently-spelled hrefs for the same file.
       const lines = content.split("\n");
       const existingIdx = lines.findIndex(
-        (l) => linkRegex.test(l) || lineTargetsFile(l, dir.dir, targetPath),
+        (l) => linkRegex.test(l) || lineTargetsFile(l, dir.dir, targetPath, cache),
       );
 
       if (existingIdx >= 0) {
         // Replace the existing line in place
         lines[existingIdx] = newLine;
-        return publish(lines);
+        return publish(lines, cache);
       }
 
       // Insert the new line at the END OF THE LIVE REGION, preserving trailing
@@ -868,7 +877,7 @@ function patchIndexAppend(
       } else {
         lines.push(newLine, "");
       }
-      return publish(lines);
+      return publish(lines, cache);
     },
     () => existsSync(join(dir.dir, entry.filename)),
   );
@@ -1008,8 +1017,14 @@ function removeFromIndex(dir: MemoryDir, identities: ReadonlySet<string>): boole
   // spelling-independent and tier-correct.
   let removed = false;
   withIndexRetry(indexPath, (content) => {
+    // One path cache for this attempt: every line of the OTHER tier's index is
+    // tested against the same identity set, and each test used to be a
+    // realpathSync of its own. Created here — after the topic was moved to
+    // .trash/ — so a cached answer always describes the filesystem as it is now
+    // rather than how it was before the rename.
+    const cache = createPathCache();
     const lines = content.split("\n");
-    const filtered = lines.filter((l) => !lineTargetsAnyIdentity(l, dir.dir, identities));
+    const filtered = lines.filter((l) => !lineTargetsAnyIdentity(l, dir.dir, identities, cache));
     if (filtered.length === lines.length) return null; // nothing to remove
     removed = true;
     return filtered.join("\n");
