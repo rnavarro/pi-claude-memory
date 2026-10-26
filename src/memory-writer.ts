@@ -17,13 +17,14 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { debugLog } from "./debug-log.js";
+import type { PreparedText } from "./find-rank.js";
+import { prepareText } from "./find-rank.js";
 import { parseMemoryContent } from "./frontmatter.js";
 import {
   fitIndexToExcerpt,
@@ -35,6 +36,7 @@ import {
   parseLinkLine,
   startupLimitWarning,
 } from "./index-parser.js";
+import { type FileFacts, factsOf, invalidateCachedIndex, topicTextCache } from "./memory-cache.js";
 import { createPathCache, type PathCache } from "./path-cache.js";
 import type { MemoryDir, MemoryType, ParsedFrontmatter } from "./types.js";
 import {
@@ -133,8 +135,17 @@ export function isUnsafeMemoryName(name: string): boolean {
 }
 
 /** Validate one candidate filename as a plain, contained, non-reserved child
- * of `base`, returning its absolute path or null. */
-function containedChild(base: string, c: string): string | null {
+ * of `base`, returning its absolute path and the lstat that proved it.
+ *
+ * The stat is returned rather than discarded because it is the one syscall a
+ * read needs anyway: for a plain regular file (the only kind accepted here)
+ * lstat and stat report the same size and mtime, so the read path can use it
+ * for both the size cap and the cache's freshness key instead of statting the
+ * same file a second time. */
+function containedChildStat(
+  base: string,
+  c: string,
+): { filePath: string; stat: import("node:fs").Stats } | null {
   // Direct children only: a separator-bearing candidate is a nested path —
   // lexically contained here, but this store never writes nested topics,
   // and restricting it flattens a whole class of containment tricks.
@@ -154,10 +165,19 @@ function containedChild(base: string, c: string): string | null {
   // Only plain regular files: a symlinked "topic" could point outside the
   // store (read would leak, removal semantics get murky).
   if (st.isSymbolicLink() || !st.isFile()) return null;
-  return p;
+  return { filePath: p, stat: st };
 }
 
 function resolveTopicFile(dir: MemoryDir, name: string): string | null {
+  return resolveTopicFileStat(dir, name)?.filePath ?? null;
+}
+
+/** Resolve a topic name to its file AND the stat that proved it is a plain,
+ * contained regular file. See {@link resolveTopicFile}. */
+function resolveTopicFileStat(
+  dir: MemoryDir,
+  name: string,
+): { filePath: string; stat: import("node:fs").Stats } | null {
   // Unsafe names are rejected outright — never slugified. Slugify would
   // neutralize the separator and silently resolve a different topic than
   // the caller named.
@@ -177,7 +197,7 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   // already ends in `.md` this is unchanged: the raw candidate is the name and
   // the slug candidate is the `.md.md` shape.
   for (const c of [rawCandidate, `${slug}.md`]) {
-    const p = containedChild(base, c);
+    const p = containedChildStat(base, c);
     if (p) return p;
   }
 
@@ -189,14 +209,14 @@ function resolveTopicFile(dir: MemoryDir, name: string): string | null {
   // Ambiguous matches (two files slugifying alike) resolve to nothing rather
   // than to an arbitrary one.
   if (!slug) return null;
-  let found: string | null = null;
+  let found: { filePath: string; stat: import("node:fs").Stats } | null = null;
   const matchingNames: string[] = [];
   try {
     for (const e of readdirSync(base, { withFileTypes: true })) {
       if (!e.isFile() || !e.name.endsWith(".md") || e.name === "MEMORY.md") continue;
       if (slugify(e.name.replace(/\.md$/, "")) !== slug) continue;
       matchingNames.push(e.name);
-      found = containedChild(base, e.name);
+      found = containedChildStat(base, e.name);
     }
   } catch {
     return null;
@@ -913,6 +933,9 @@ export function removeMemory(dir: MemoryDir, req: RemoveMemoryRequest): MemoryOp
   // href entirely.
   const identities = topicIdentities(filePath);
   renameSync(filePath, trashPath);
+  // A body cached before the move must not be served for a file that is no
+  // longer there.
+  topicTextCache.invalidate(filePath);
 
   // Remove the link entry from MEMORY.md. Report honestly when no line was
   // removed: the topic is already in .trash/, so saying "and removed its
@@ -1056,58 +1079,110 @@ export function resolveWikilinks(
   return { text, resolved, unresolved };
 }
 
+/** Resolve a name to a topic that this store will let a reader open, and to
+ * the stat that proves it: plain regular file, contained, and within
+ * TOPIC_FILE_MAX_BYTES.
+ *
+ * This is the single guarded read path for topic bodies — every reader goes
+ * through it, so a search can never read a file that a recall would refuse.
+ * The stat is the lstat that containment already took (for a plain regular
+ * file it reports the same size and mtime as stat), so the cap costs no extra
+ * syscall and the answer doubles as a cache freshness key.
+ *
+ * It logs only failures: find_memory calls this once per candidate, and a
+ * success line per file would flood the debug log on every search. */
+function resolveReadableTopic(
+  dir: MemoryDir,
+  name: string,
+): { ok: true; filePath: string; facts: FileFacts } | { ok: false; message: string } {
+  const resolved = resolveTopicFileStat(dir, name);
+  if (!resolved) {
+    debugLog("writer.read_not_found", { name, tier: dir.tier, label: dir.label });
+    return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
+  }
+  const { filePath, stat } = resolved;
+
+  // Size cap shared with the injector's read side. Without it recall_memory is
+  // an uncapped read of any file in the store, and the routing anchor directs
+  // the model to recall entries by name on demand — so a topic over this cap
+  // would be advertised by the injected index while being unreadable through
+  // the only interface that can read it. A file that grew past the cap must
+  // also drop whatever body was cached before it did, or a search would keep
+  // matching text the read path now refuses.
+  if (stat.size > TOPIC_FILE_MAX_BYTES) {
+    topicTextCache.invalidate(filePath);
+    debugLog("writer.read_oversize", {
+      name,
+      tier: dir.tier,
+      size: stat.size,
+      cap: TOPIC_FILE_MAX_BYTES,
+    });
+    return {
+      ok: false,
+      message: `Memory ${name} is too large to read (${stat.size} bytes, cap ${TOPIC_FILE_MAX_BYTES})`,
+    };
+  }
+  return { ok: true, filePath, facts: factsOf(stat) };
+}
+
 /** Read and parse one topic file by name through the store's read guards.
  *
- * This is the single guarded read path for topic bodies: exact containment and
- * plain-regular-file resolution (resolveTopicFile, which lstats and rejects
- * symlinks, directories and FIFOs), then the TOPIC_FILE_MAX_BYTES cap, then the
- * read. recall_memory and find_memory both go through it, so a search can never
- * read a file that a recall would refuse. It logs only failures: find_memory
- * calls it once per candidate, and a success line per file would flood the debug
- * log on every search.
- *
- * A failed read or parse is returned as ok:false rather than thrown, so one bad
- * file cannot take down a caller that is iterating the store. */
+ * Returns the whole file and its parsed frontmatter; recall_memory uses it.
+ * find_memory uses {@link readTopicBody}, which shares the same guards and
+ * memoises what the scorer needs. */
 export function readTopicFile(
   dir: MemoryDir,
   name: string,
 ):
   | { ok: true; raw: string; filePath: string; frontmatter: ParsedFrontmatter }
   | { ok: false; message: string } {
-  const filePath = resolveTopicFile(dir, name);
-  if (!filePath) {
-    debugLog("writer.read_not_found", { name, tier: dir.tier, label: dir.label });
-    return { ok: false, message: `Memory not found: ${name} in ${dir.label} tier` };
-  }
-
-  // Size cap shared with the injector's read side. Without it recall_memory is
-  // an uncapped read of any file in the store, and the routing anchor directs
-  // the model to recall entries by name on demand — so a topic over this cap
-  // would be advertised by the injected index while being unreadable through
-  // the only interface that can read it.
-  try {
-    const st = statSync(filePath);
-    if (st.size > TOPIC_FILE_MAX_BYTES) {
-      debugLog("writer.read_oversize", {
-        name,
-        tier: dir.tier,
-        size: st.size,
-        cap: TOPIC_FILE_MAX_BYTES,
-      });
-      return {
-        ok: false,
-        message: `Memory ${name} is too large to read (${st.size} bytes, cap ${TOPIC_FILE_MAX_BYTES})`,
-      };
-    }
-  } catch (err) {
-    debugLog("writer.read_stat_error", { name, tier: dir.tier, error: String(err) });
-    return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
-  }
+  const readable = resolveReadableTopic(dir, name);
+  if (!readable.ok) return readable;
+  const { filePath } = readable;
 
   try {
     const raw = readFileSync(filePath, "utf8");
     const frontmatter = parseMemoryContent(raw, basename(filePath), Date.now());
     return { ok: true, raw, filePath, frontmatter };
+  } catch (err) {
+    debugLog("writer.read_error", { name, tier: dir.tier, error: String(err) });
+    return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
+  }
+}
+
+/** Read one topic body for SEARCH: the body text, and the same text lowercased
+ * and tokenised the way the scorer consumes it.
+ *
+ * find_memory calls this once per candidate. The whole store used to be read,
+ * parsed and tokenised on every query (~195 ms of main-thread work for the live
+ * store, and an identical repeat cost the same); the memo in memory-cache.ts is
+ * keyed on the file's mtime/size/inode, so a repeat query pays one lstat per
+ * topic and re-reads only the files that changed. A miss is always a real read
+ * through {@link resolveReadableTopic}, so eviction can only cost time.
+ *
+ * Returns ok:false exactly where readTopicFile would (missing, symlinked,
+ * not a regular file, oversize, unreadable), so a search and a recall agree on
+ * which topics exist. */
+export function readTopicBody(
+  dir: MemoryDir,
+  name: string,
+): { ok: true; body: string; prepared: PreparedText } | { ok: false; message: string } {
+  const readable = resolveReadableTopic(dir, name);
+  if (!readable.ok) return readable;
+  const { filePath, facts } = readable;
+
+  const cached = topicTextCache.get(filePath, facts);
+  if (cached) return { ok: true, body: cached.body, prepared: cached.prepared };
+
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const body = parseMemoryContent(raw, basename(filePath), facts.mtimeMs).body;
+    const prepared = prepareText(body);
+    // Keyed on the stat taken BEFORE the read: content read through a
+    // concurrent change is newer than its key, which can only force a
+    // redundant re-read later, never serve a stale body.
+    topicTextCache.set(filePath, facts, { body, prepared });
+    return { ok: true, body, prepared };
   } catch (err) {
     debugLog("writer.read_error", { name, tier: dir.tier, error: String(err) });
     return { ok: false, message: `Memory not readable: ${name} in ${dir.label} tier` };
@@ -1183,6 +1258,12 @@ export function atomicWriteFile(filePath: string, content: string): void {
   const tmpPath = createTempFile(dir, filePath, content);
   try {
     renameSync(tmpPath, filePath);
+    // Publication renames a NEW inode into place, so the cache's key already
+    // misses. Invalidate anyway: this is the one place a write from this
+    // process is guaranteed to pass through, and relying on mtime resolution
+    // for a same-millisecond rewrite is not a property worth depending on.
+    topicTextCache.invalidate(filePath);
+    invalidateCachedIndex(filePath);
   } catch (err) {
     // Don't leave the temp file behind on a failed publish. It is invisible
     // to the .md scans (both require .endsWith(".md")), but it accumulates
@@ -1208,6 +1289,8 @@ export function atomicWriteFileNoClobber(filePath: string, content: string): boo
   const tmpPath = createTempFile(dir, filePath, content);
   try {
     linkSync(tmpPath, filePath);
+    topicTextCache.invalidate(filePath);
+    invalidateCachedIndex(filePath);
     return true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;

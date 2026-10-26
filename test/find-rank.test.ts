@@ -24,6 +24,7 @@ import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   findRankStats,
+  prepareText,
   queryTerms,
   type RankInput,
   type RankResult,
@@ -175,6 +176,84 @@ describe.skipIf(corpus.length === 0)("equivalence over the live memory store", (
     expect(ties).toBeGreaterThan(50);
     expect(rankedOrder(next)).toEqual(rankedOrder(old));
     expect(next.map((r) => r.score)).toEqual(old.map((r) => r.score));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 1b. Equivalence with a pre-tokenised body
+//
+// find_memory caches each topic's lowercased, tokenised body so a repeat query
+// does not re-tokenise the store. rankEntries consumes it in place of the raw
+// string; every score must still match the reference scan TO THE BIT, because
+// ties break on the exact float.
+// ---------------------------------------------------------------------------
+
+describe("a pre-tokenised body scores exactly like the raw one", () => {
+  const withPrepared = (inputs: RankInput[]): RankInput[] =>
+    inputs.map((e) => (e.body === null ? e : { ...e, bodyPrepared: prepareText(e.body) }));
+
+  const compared = (query: string, inputs: RankInput[]) => {
+    const prepared = rankEntries(query, withPrepared(inputs));
+    const raw = rankEntries(query, inputs);
+    const reference = rankEntriesScan(query, inputs);
+    expect(prepared).toHaveLength(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+      expect((prepared[i] as RankResult).score).toBe((raw[i] as RankResult).score);
+      expect(prepared[i]).toEqual(raw[i]);
+      expect((prepared[i] as RankResult).score).toBe((reference[i] as RankResult).score);
+      expect((prepared[i] as RankResult).tier).toBe((reference[i] as RankResult).tier);
+      expect((prepared[i] as RankResult).fields).toEqual((reference[i] as RankResult).fields);
+    }
+    expect(rankedOrder(prepared)).toEqual(rankedOrder(reference));
+  };
+
+  it("matches over the live store, including a chunk-sized query", { timeout: 120_000 }, () => {
+    for (const query of ["deploy", "memory index budget", "pnpm-lock.yaml"]) {
+      compared(query, largestCorpus);
+    }
+    compared(chunkQuery(largestCorpus, 20), largestCorpus);
+  });
+
+  it("matches on synthetic entries, bodies empty, null and unicode", () => {
+    const docs: RankInput[] = [
+      {
+        title: "Deploy Notes",
+        summary: "how deploys work",
+        filename: "deploy.md",
+        body: `${"pnpm ".repeat(40)}deploy`,
+      },
+      {
+        title: "memory index",
+        summary: "the index budget",
+        filename: "index.md",
+        body: "BUDGET budget Budget",
+      },
+      {
+        title: "café",
+        summary: "☕ near-miss",
+        filename: "cafe.md",
+        body: "café ☕ mémoire\nline two",
+      },
+      { title: "empty body", summary: "", filename: "empty.md", body: "" },
+      { title: "null body", summary: "deploy", filename: "null.md", body: null },
+    ];
+    for (const query of [
+      "deploy",
+      "memory index budget",
+      "café mémoire",
+      "",
+      "the and of",
+      "zzabsent",
+    ]) {
+      compared(query, docs);
+    }
+  });
+
+  it("prepareText is exactly the lowercasing and tokenising rank does", () => {
+    const raw = "Mixed CASE: 51820/udp — near-miss, 2 of them.\nSecond line.";
+    const prepared = prepareText(raw);
+    expect(prepared.lowered).toBe(raw.toLowerCase());
+    expect(prepared.tokens).toEqual(raw.toLowerCase().match(/[a-z0-9]+/g));
   });
 });
 

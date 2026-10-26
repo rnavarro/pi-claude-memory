@@ -64,6 +64,34 @@ export interface RankInput {
   summary: string;
   filename: string;
   body: string | null;
+  /** The body field already run through {@link prepareText}.
+   *
+   * A caller that had to lowercase and tokenise this body anyway (find_memory
+   * caches it per topic, keyed on mtime) passes it here instead of the scorer
+   * doing that work again on every query. It must be exactly what
+   * `prepareText(body)` returns, or the scores change — which is what the
+   * equivalence test pins. */
+  bodyPrepared?: PreparedText;
+}
+
+/** A text field lowercased and tokenised, in the order the scorer wants.
+ *
+ * `rankEntries` derives this for every field of every entry; a caller holding
+ * a body across calls can derive it once and hand it back via
+ * {@link RankInput.bodyPrepared}. Both paths do the same two operations in the
+ * same order, so the numbers that follow are identical to the last bit — which
+ * matters because ties break on the exact float. */
+export interface PreparedText {
+  /** `text.toLowerCase()`. */
+  lowered: string;
+  /** `tokenize(lowered)`. */
+  tokens: readonly string[];
+}
+
+/** Lowercase and tokenise one field, exactly as {@link rankEntries} does. */
+export function prepareText(text: string): PreparedText {
+  const lowered = text.toLowerCase();
+  return { lowered, tokens: tokenize(lowered) };
 }
 
 export interface RankResult {
@@ -173,9 +201,12 @@ export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
     const lowered: string[] = [];
     for (const [field, text] of fieldsOf(e)) {
       const w = FIELD_WEIGHT[field];
-      const low = text.toLowerCase();
+      // A prepared body is the same `lowered` and `tokens` this loop would
+      // compute; the metadata fields are short and always derived here.
+      const cached = field === "body" ? e.bodyPrepared : undefined;
+      const low = cached?.lowered ?? text.toLowerCase();
       lowered.push(low);
-      const tokens = tokenize(low);
+      const tokens = cached?.tokens ?? tokenize(low);
       length += w * tokens.length;
       let hit = false;
       for (const tok of tokens) {

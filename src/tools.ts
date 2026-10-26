@@ -11,12 +11,13 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.js";
 import { scanWriteToolInput } from "./content-scan.js";
 import { debugLog } from "./debug-log.js";
-import { type FindField, queryTerms, rankEntries } from "./find-rank.js";
+import { type FindField, type PreparedText, queryTerms, rankEntries } from "./find-rank.js";
 import { withToolLogContext } from "./index.js";
-import { parseIndexFile, reconcileIndex } from "./index-parser.js";
+import { reconcileIndex } from "./index-parser.js";
 import { MEMORY_NOTE_BOUNDARY, MEMORY_SEARCH_BOUNDARY, wrapStoredMemory } from "./injector.js";
+import { cachedParseIndex } from "./memory-cache.js";
 import type { MemoryOpResult } from "./memory-writer.js";
-import { readMemory, readTopicFile, removeMemory, writeMemory } from "./memory-writer.js";
+import { readMemory, readTopicBody, removeMemory, writeMemory } from "./memory-writer.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir } from "./types.js";
 
@@ -132,10 +133,11 @@ interface FindHit {
  *
  * Any keyword matches; results are ranked by rankEntries (field-weighted BM25
  * over title, summary, filename and body, with exact-phrase and all-keyword hits
- * first). Bodies are read through readTopicFile, the same guarded path
- * recall_memory uses (containment, plain regular file, size cap); a file it
- * refuses is matched on its metadata alone rather than failing the search. It
- * writes nothing, so it cannot disturb the store or race the writer. */
+ * first). Bodies are read through readTopicBody, the same guarded path
+ * recall_memory uses (containment, plain regular file, size cap) with a
+ * bounded, mtime-keyed memo on top; a file it refuses is matched on its
+ * metadata alone rather than failing the search. It writes nothing, so it
+ * cannot disturb the store or race the writer. */
 const findTool = defineTool({
   name: "find_memory",
   label: "Search Memory",
@@ -191,21 +193,24 @@ const findTool = defineTool({
         : FIND_DEFAULT_LIMIT;
     const limit = Math.max(1, Math.min(FIND_MAX_LIMIT, requested));
 
-    const parsed = parseIndexFile(dir);
+    // The index parse (554 KB + one lstat per href) is memoised on the index
+    // file's own mtime/size/inode, so a repeat query re-reads neither it nor
+    // the topic bodies. Both memos live in memory-cache.ts.
+    const parsed = cachedParseIndex(dir);
     const recon = reconcileIndex(parsed ?? { lines: [], entries: [] }, dir.dir);
     // An index line whose file is gone has no body to search. Skipping it here
     // also keeps the read path's slug-scan fallback (a directory listing per
     // unresolved name) from running once per dangling line.
     const missing = new Set(recon.missing.map((e) => basename(e.href).toLowerCase()));
     let unreadable = 0;
-    const bodyOf = (name: string): string | null => {
+    const bodyOf = (name: string): { body: string; prepared: PreparedText } | null => {
       if (missing.has(name.toLowerCase())) return null;
-      const read = readTopicFile(dir, name);
+      const read = readTopicBody(dir, name);
       if (!read.ok) {
         unreadable++;
         return null;
       }
-      return read.frontmatter.body;
+      return { body: read.body, prepared: read.prepared };
     };
 
     // Candidates: every indexed entry (first line wins for a duplicated file),
@@ -236,14 +241,19 @@ const findTool = defineTool({
       });
     }
 
+    const bodies = candidates.map((c) => bodyOf(c.name));
     const results = rankEntries(
       params.query,
-      candidates.map((c) => ({
-        title: c.title,
-        summary: c.summary,
-        filename: c.name,
-        body: bodyOf(c.name),
-      })),
+      candidates.map((c, i) => {
+        const body = bodies[i] ?? null;
+        return {
+          title: c.title,
+          summary: c.summary,
+          filename: c.name,
+          body: body === null ? null : body.body,
+          bodyPrepared: body?.prepared,
+        };
+      }),
     );
     const hits: FindHit[] = [];
     candidates.forEach((c, i) => {
