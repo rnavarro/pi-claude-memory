@@ -102,6 +102,31 @@ function tierOf(score: number, phrase: string, terms: readonly string[], all: st
       : 0;
 }
 
+/** Counters for the work one ranking call did, so the equivalence test can
+ * observe which loop ran instead of inferring it from a wall clock.
+ *
+ * `termDocProbes` counts entry x term membership tests used to derive document
+ * frequencies: the reference scan makes one per term per entry. `entriesScored`
+ * counts entries whose scoring loop ran at all. Neither is a diagnostic for
+ * operators; nothing reads them outside `test/find-rank.test.ts`. */
+export interface FindRankStats {
+  termDocProbes: number;
+  entriesScored: number;
+}
+
+let termDocProbes = 0;
+let entriesScored = 0;
+
+/** Work counters for the scorer since the last reset. */
+export function findRankStats(): FindRankStats {
+  return { termDocProbes, entriesScored };
+}
+
+export function resetFindRankStats(): void {
+  termDocProbes = 0;
+  entriesScored = 0;
+}
+
 /** Rank every entry against `query`. Returns one result per input, in input
  * order; callers sort. IDF is computed over `inputs`, i.e. per call over the
  * store being searched. */
@@ -149,10 +174,12 @@ export function rankEntriesScan(query: string, inputs: RankInput[]): RankResult[
   const avgLength = n > 0 ? docs.reduce((s, d) => s + d.length, 0) / n || 1 : 1;
   const idf = new Map<string, number>();
   for (const t of terms) {
+    termDocProbes += n;
     const df = docs.filter((d) => d.tf.has(t)).length;
     idf.set(t, Math.log(1 + (n - df + 0.5) / (df + 0.5)));
   }
 
+  entriesScored += n;
   return docs.map((d) => {
     let score = 0;
     for (const [t, f] of d.tf) {

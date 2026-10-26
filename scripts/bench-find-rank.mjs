@@ -131,6 +131,10 @@ const corpora = [
 // Queries: one word, a phrase, a question, and a review chunk. The chunk is real
 // prose from the store, which is what auto-learn's relevance selection hands the
 // scorer, and it is where the term count explodes.
+const longQuestion =
+  "why does the rotating backup policy for the proxmox guest disks keep failing verification " +
+  "when the retention schedule says the restore should already have been tested against the " +
+  "snapshot before promoting the archive to the offsite bucket";
 const chunkText = all
   .slice(0, 60)
   .map((d) => `${d.title}\n${d.summary}\n${d.body}`)
@@ -138,7 +142,8 @@ const chunkText = all
 const queries = [
   ["1 term", "deploy"],
   ["3 terms", "memory index budget"],
-  ["10 terms", "rotating backup policy for the proxmox guest disks"],
+  ["10 terms", "proxmox guest disk backup policy rotation schedule retention verification restore"],
+  ["30 terms", longQuestion],
   ["chunk", chunkText],
 ];
 
@@ -148,6 +153,7 @@ const bytes = all.reduce(
 );
 const fmt = (n, d = 1) => n.toFixed(d);
 const best = (xs) => Math.min(...xs);
+const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 
 console.log(
   `find-rank: ${all.length} docs across ${byStore.size} stores, ${(bytes / 1024 / 1024).toFixed(2)} MiB of text`,
@@ -177,9 +183,14 @@ for (const [label, where, corpus] of corpora) {
             .length;
         }
       }
-      timings.push([impl, best(times)]);
+      timings.push([impl, best(times), median(times)]);
     }
-    const line = timings.map(([impl, ms]) => `${impl} ${fmt(ms).padStart(8)} ms`).join("   ");
+    // The pre-index path allocates one filtered array per term, so its runs
+    // swing with GC; the minimum and the median are both printed rather than
+    // picking whichever one flatters the change.
+    const line = timings
+      .map(([impl, ms, med]) => `${impl} ${fmt(ms).padStart(8)} ms (median ${fmt(med).padStart(8)})`)
+      .join("   ");
     console.log(`  ${qname.padEnd(8)} ${String(terms).padStart(4)} terms   ${line}`);
     if (mismatch > 0) console.log(`    !! ${mismatch} results differ from the pre-index scorer`);
   }
