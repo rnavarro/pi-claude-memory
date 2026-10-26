@@ -37,14 +37,83 @@ export interface ParsedLinkLine {
   summary: string;
 }
 
+/** How many times the link grammar has actually been run in this process, and
+ * how many asks a per-operation memo answered without running it. Counterpart
+ * of `frontmatterParserStats`: the fit planner parses every index line several
+ * times over, and "the memo is wired up" is only true if these numbers show it.
+ * Counters only; they never affect what is parsed. */
+let linkParses = 0;
+let linkMemoHits = 0;
+
+export interface LinkParseStats {
+  /** Times the link grammar actually ran. */
+  parses: number;
+  /** Times a per-operation memo answered instead of running it. */
+  memoHits: number;
+}
+
+/** Read the link-parse counters. */
+export function linkParseStats(): LinkParseStats {
+  return { parses: linkParses, memoHits: linkMemoHits };
+}
+
+/** Zero the link-parse counters. */
+export function resetLinkParseStats(): void {
+  linkParses = 0;
+  linkMemoHits = 0;
+}
+
 /** Parse a single index link line, ignoring pin markers. Returns null for
  * prose lines. Shared by the parser and by the writer's replace/remove
  * matching so the two can never disagree about what is a link line. */
 export function parseLinkLine(line: string): ParsedLinkLine | null {
+  linkParses++;
   const match = line.match(LINK_PATTERN);
   if (!match) return null;
   const [, title, href, summary] = match;
   return { title: title.trim(), href, summary: (summary ?? "").trim() };
+}
+
+/** One operation's per-line parse memo: line text → its parse (`null` for
+ * prose, which is a real answer and is cached as one).
+ *
+ * Keyed on the LINE TEXT because the text is all the grammar reads: the function
+ * above is pure in its single argument. Anything else a caller knows about a
+ * line — its position, the store its href belongs to, the file the href
+ * resolves to — is the caller's business and is computed from the parse, never
+ * inside it, so two identical lines are two identical parses. A CHANGED line is
+ * a different key, and a memo lives for one operation (one publish attempt, one
+ * planner call); it is never module-level, so it can neither serve a parse from
+ * before a write nor grow with the store. */
+export type LinkLineMemo = Map<string, ParsedLinkLine | null>;
+
+/** A fresh memo for one operation. */
+export function createLinkLineMemo(): LinkLineMemo {
+  return new Map();
+}
+
+/** `parseLinkLine` answered from one operation's memo.
+ *
+ * The fit planner asks about the same line from half a dozen passes (parked vs
+ * already-archived, cluster sizes, per-line file/byte/tier, archived counts,
+ * the previously-archived set) and the writer's replace/append scan asks again
+ * before the fit even starts; unmemoized that was 24,627 grammar runs for 2,830
+ * lines on the live store, measured. A miss delegates to `parseLinkLine`, so
+ * this can only ever return what the unmemoized path returns.
+ *
+ * The returned object is shared between asks and callers must treat it as
+ * read-only (every caller today reads `title`/`href`/`summary` and copies them). */
+export function parseLinkLineCached(line: string, memo: LinkLineMemo): ParsedLinkLine | null {
+  // `undefined` is "absent" and `null` is "parsed and it is not a link", so a
+  // stored null is served without re-running the grammar.
+  const cached = memo.get(line);
+  if (cached !== undefined) {
+    linkMemoHits++;
+    return cached;
+  }
+  const parsed = parseLinkLine(line);
+  memo.set(line, parsed);
+  return parsed;
 }
 
 /** True when `path` and `target` name the same file.
@@ -82,8 +151,9 @@ export function lineTargetsFile(
   baseDir: string,
   targetPath: string,
   cache: PathCache = createPathCache(),
+  memo?: LinkLineMemo,
 ): boolean {
-  const parsed = parseLinkLine(line);
+  const parsed = memo ? parseLinkLineCached(line, memo) : parseLinkLine(line);
   if (!parsed) return false;
   return sameTarget(resolveHref(parsed.href, baseDir, cache), targetPath, cache);
 }
@@ -109,8 +179,9 @@ export function lineTargetsAnyIdentity(
   baseDir: string,
   identities: ReadonlySet<string>,
   cache: PathCache = createPathCache(),
+  memo?: LinkLineMemo,
 ): boolean {
-  const parsed = parseLinkLine(line);
+  const parsed = memo ? parseLinkLineCached(line, memo) : parseLinkLine(line);
   if (!parsed) return false;
   const lexical = isAbsolute(parsed.href) ? resolve(parsed.href) : resolve(baseDir, parsed.href);
   if (identities.has(lexical)) return true;
@@ -472,15 +543,18 @@ export function isArchiveHeading(line: string): boolean {
  * Exported so the fit planner ranks pins with the parser's own rule (`⛔`
  * anywhere in the line, or `[pin]` in the summary) instead of keeping a second
  * copy of the marker syntax that can drift away from this one. */
-export function isPinnedIndexLine(line: string): boolean {
-  const link = parseLinkLine(line);
+export function isPinnedIndexLine(line: string, memo?: LinkLineMemo): boolean {
+  const link = memo ? parseLinkLineCached(line, memo) : parseLinkLine(line);
   return link !== null && isPinnedLine(line, link.summary);
 }
 
 /** True when a line is a link the fit planner may move below the archive
  *  heading. Prose, headings, blank lines and pinned links are never moved. */
-function isDemotableLinkLine(line: string): boolean {
-  return parseLinkLine(line) !== null && !isPinnedIndexLine(line);
+function isDemotableLinkLine(line: string, memo?: LinkLineMemo): boolean {
+  const link = memo ? parseLinkLineCached(line, memo) : parseLinkLine(line);
+  // The pin test is applied to the parse in hand rather than through
+  // isPinnedIndexLine, so one line costs one parse here instead of two.
+  return link !== null && !isPinnedLine(line, link.summary);
 }
 
 /** Bytes a run of lines occupies under the excerpt reader's arithmetic: UTF-8
@@ -524,6 +598,14 @@ export interface IndexFitOptions {
   isRule?: (filename: string) => boolean;
   /** Members a slug-prefix cluster needs to be demoted first (default 5). */
   clusterMin?: number;
+  /**
+   * One operation's line-parse memo. Pass one to share the parse of every line
+   * with the caller's own scan of the same content (the writer's replace/append
+   * pass runs one immediately before this); omit it and the planner makes its
+   * own for this call. Never carry one across operations: it holds the parses of
+   * the lines it was built from, and a write can change them.
+   */
+  memo?: LinkLineMemo;
 }
 
 export interface IndexFitResult {
@@ -590,6 +672,10 @@ export function fitIndexToExcerpt(
   const isRule = options.isRule ?? isRuleBySlug;
   const clusterMin = options.clusterMin ?? CLUSTER_MIN_MEMBERS;
   const promote = recencyAt !== undefined;
+  // One parse per distinct line for this call. Every pass below asks through
+  // this, so a line is parsed once however many passes look at it.
+  const memo = options.memo ?? createLinkLineMemo();
+  const parse = (line: string): ParsedLinkLine | null => parseLinkLineCached(line, memo);
 
   // Signposts are derived, never authored: strip every one up front and
   // regenerate them at the end, so a pass is a pure function of the links.
@@ -605,14 +691,14 @@ export function fitIndexToExcerpt(
 
   // Only link lines are ever demoted, so only link lines are promoted back.
   // Prose authored below the heading stays below it.
-  const parked = archived.filter((line) => parseLinkLine(line) === null);
-  const alreadyArchived = archived.filter((line) => parseLinkLine(line) !== null);
+  const parked = archived.filter((line) => parse(line) === null);
+  const alreadyArchived = archived.filter((line) => parse(line) !== null);
   let live = promote ? [...livePre, ...alreadyArchived] : [...livePre];
   const archivedLinks: string[] = promote ? [] : [...alreadyArchived];
   const demoted: string[] = [];
 
   const fileOf = (line: string): string | null => {
-    const link = parseLinkLine(line);
+    const link = parse(line);
     return link ? basename(link.href) : null;
   };
   const ruleCache = new Map<string, boolean>();
@@ -703,7 +789,7 @@ export function fitIndexToExcerpt(
     const file = fileOf(line);
     fileByIndex[at] = file;
     bytesByIndex[at] = Buffer.byteLength(line, "utf8") + 1;
-    linkByIndex[at] = isDemotableLinkLine(line);
+    linkByIndex[at] = isDemotableLinkLine(line, memo);
     const rule = file !== null && ruleOf(file);
     ruleLineByIndex[at] = rule;
     const key = rule || file === null ? null : clusterOfFile(file);
