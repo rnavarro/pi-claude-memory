@@ -53,6 +53,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 let tmpHome: string;
 let origHome: string | undefined;
 let origAgentDir: string | undefined;
+let origSubagentChild: string | undefined;
 
 beforeEach(() => {
   origHome = process.env.HOME;
@@ -60,6 +61,19 @@ beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), "pcm-correction-"));
   process.env.HOME = tmpHome;
   delete process.env.PI_CODING_AGENT_DIR;
+  // This file drives the extension through its real entry point, so it must
+  // not inherit the parent PROCESS's identity either. Suite runs launched from
+  // inside a pi subagent carry PI_SUBAGENT_CHILD=1 in the environment, and
+  // piClaudeMemory() turns autoLearn off for a subagent unless
+  // subagentAutoLearn is set, which unregisters turn_end, tool_result,
+  // agent_settled, input, session_before_compact and session_shutdown all at
+  // once. Every test that expects a launch then fails on an empty recorder
+  // (the run reports 13 failed / 5 passed), and the 5 that pass are exactly
+  // the ones asserting that nothing happens. The subagent describe block below
+  // sets the variable itself for the tests that want it, so clear it here and
+  // restore it afterwards.
+  origSubagentChild = process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_CHILD;
   fake.launches = [];
   fake.active = 0;
   fake.maxActive = 0;
@@ -71,6 +85,8 @@ afterEach(() => {
   if (origHome === undefined) delete process.env.HOME;
   else process.env.HOME = origHome;
   if (origAgentDir !== undefined) process.env.PI_CODING_AGENT_DIR = origAgentDir;
+  if (origSubagentChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+  else process.env.PI_SUBAGENT_CHILD = origSubagentChild;
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
@@ -151,6 +167,15 @@ async function load(settings: Record<string, unknown>) {
     shutdown: () => fire("session_shutdown", { type: "session_shutdown", reason: "quit" }),
   };
 }
+
+describe("environment isolation", () => {
+  // Guard for the failure mode described in beforeEach: this is the assertion
+  // that fails, in a suite launched from a subagent, if the PI_SUBAGENT_CHILD
+  // sanitisation is ever removed. It is a precondition of every test below.
+  it("does not inherit PI_SUBAGENT_CHILD from the parent process", () => {
+    expect(process.env.PI_SUBAGENT_CHILD).toBeUndefined();
+  });
+});
 
 describe("correction trigger", () => {
   it("a correction triggers exactly one review at settle, containing the correction", async () => {
