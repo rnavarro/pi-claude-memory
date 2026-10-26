@@ -75,25 +75,52 @@ export interface RankResult {
   fields: FindField[];
 }
 
+/** The entry's searchable fields, in the order they are displayed. */
+function fieldsOf(e: RankInput): [FindField, string][] {
+  const out: [FindField, string][] = [
+    ["title", e.title],
+    ["summary", e.summary],
+    ["filename", e.filename],
+  ];
+  if (e.body !== null) out.push(["body", e.body]);
+  return out;
+}
+
+/** The query as written, whitespace-collapsed, for the exact-phrase tier. */
+function phraseOf(query: string): string {
+  return query.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+/** Which exact tier a scored entry earns. The tiers use substring matching over
+ * the raw text, which is what find_memory's all-words mode always did, so every
+ * hit that mode found still ranks above a partial match. */
+function tierOf(score: number, phrase: string, terms: readonly string[], all: string): 0 | 1 | 2 {
+  return score > 0 && phrase.length > 0 && all.includes(phrase)
+    ? 2
+    : score > 0 && terms.every((t) => all.includes(t))
+      ? 1
+      : 0;
+}
+
 /** Rank every entry against `query`. Returns one result per input, in input
  * order; callers sort. IDF is computed over `inputs`, i.e. per call over the
  * store being searched. */
 export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
+  return rankEntriesScan(query, inputs);
+}
+
+/** The pre-inverted-index scorer: one full pass over every entry per query term
+ * to count document frequencies, then a second pass that scans each entry's term
+ * frequencies. Kept as the reference the equivalence test compares against, so a
+ * change to the scoring maths cannot pass by being identical to itself. Slow by
+ * construction (O(terms x entries)) and never used in production. */
+export function rankEntriesScan(query: string, inputs: RankInput[]): RankResult[] {
   const terms = queryTerms(query);
   // A Set for the per-token membership test: a review chunk used as the query
   // carries thousands of terms, and a linear scan per token made ranking a
   // large store quadratic in practice.
   const termSet = new Set(terms);
-  const phrase = query.toLowerCase().trim().replace(/\s+/g, " ");
-  const fieldsOf = (e: RankInput): [FindField, string][] => {
-    const out: [FindField, string][] = [
-      ["title", e.title],
-      ["summary", e.summary],
-      ["filename", e.filename],
-    ];
-    if (e.body !== null) out.push(["body", e.body]);
-    return out;
-  };
+  const phrase = phraseOf(query);
 
   // Per entry: weighted term frequencies, weighted length, and which fields hit.
   const docs = inputs.map((e) => {
@@ -132,16 +159,7 @@ export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
       const norm = f + K1 * (1 - B + (B * d.length) / avgLength);
       score += (idf.get(t) ?? 0) * ((f * (K1 + 1)) / norm);
     }
-    // The exact tiers use substring matching over the raw text, which is what
-    // find_memory's all-words mode always did, so every hit that mode found
-    // still ranks above a partial match.
-    const all = d.lowered.join("\n");
-    const tier: 0 | 1 | 2 =
-      score > 0 && phrase.length > 0 && all.includes(phrase)
-        ? 2
-        : score > 0 && terms.every((t) => all.includes(t))
-          ? 1
-          : 0;
+    const tier = tierOf(score, phrase, terms, d.lowered.join("\n"));
     return { score, tier, fields: d.hitFields };
   });
 }
