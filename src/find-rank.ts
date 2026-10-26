@@ -129,9 +129,114 @@ export function resetFindRankStats(): void {
 
 /** Rank every entry against `query`. Returns one result per input, in input
  * order; callers sort. IDF is computed over `inputs`, i.e. per call over the
- * store being searched. */
+ * store being searched.
+ *
+ * One pass over the entries builds the inverted index: per query term, the
+ * documents holding it and the term's weight in each, in the order the term
+ * first appeared in that entry. Document frequency is then the posting's
+ * length, so IDF costs O(terms) instead of one full scan of the entries per
+ * term, and only entries that contain a query term are scored at all. The same
+ * entry x term pairs are summed in the same order as the reference scan, so the
+ * scores are identical to the last bit rather than merely close. */
 export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
-  return rankEntriesScan(query, inputs);
+  const terms = queryTerms(query);
+  const n = inputs.length;
+  const phrase = phraseOf(query);
+  const results: RankResult[] = new Array(n);
+  if (n === 0) return results;
+
+  // Query term -> its index in `terms` (queryTerms already deduplicated, so no
+  // term appears twice and the index is stable).
+  const termIndex = new Map<string, number>();
+  for (let i = 0; i < terms.length; i++) termIndex.set(terms[i] as string, i);
+
+  // The postings, flat: entry `d` owns slots [docStart[d], docStart[d] + docCount[d]),
+  // pushed in entry order and, within an entry, in term-first-seen order.
+  const slotTerm: number[] = [];
+  const slotWeight: number[] = [];
+  const docStart = new Int32Array(n);
+  const docCount = new Int32Array(n);
+  const docLength = new Float64Array(n);
+  const matched: number[] = [];
+  const matchedFields: FindField[][] = [];
+  const matchedLowered: string[][] = [];
+
+  // Reused across entries: an entry's term frequencies are copied into the
+  // postings as it is read, so no Map per entry is retained.
+  const tf = new Map<string, number>();
+  let totalLength = 0;
+  for (let d = 0; d < n; d++) {
+    const e = inputs[d] as RankInput;
+    tf.clear();
+    let length = 0;
+    const hitFields: FindField[] = [];
+    const lowered: string[] = [];
+    for (const [field, text] of fieldsOf(e)) {
+      const w = FIELD_WEIGHT[field];
+      const low = text.toLowerCase();
+      lowered.push(low);
+      const tokens = tokenize(low);
+      length += w * tokens.length;
+      let hit = false;
+      for (const tok of tokens) {
+        if (!termIndex.has(tok)) continue;
+        tf.set(tok, (tf.get(tok) ?? 0) + w);
+        hit = true;
+      }
+      if (hit) hitFields.push(field);
+    }
+    docLength[d] = length;
+    totalLength += length;
+    if (tf.size === 0) continue;
+    matched.push(d);
+    docStart[d] = slotTerm.length;
+    docCount[d] = tf.size;
+    matchedFields.push(hitFields);
+    matchedLowered.push(lowered);
+    for (const [t, w] of tf) {
+      slotTerm.push(termIndex.get(t) as number);
+      slotWeight.push(w);
+    }
+  }
+
+  // Total length is summed in entry order, as the reference does, so the average
+  // (and everything scaled by it) is bit-identical.
+  const avgLength = totalLength / n || 1;
+
+  const df = new Int32Array(terms.length);
+  for (let s = 0; s < slotTerm.length; s++) df[slotTerm[s] as number]++;
+  const idf = new Float64Array(terms.length);
+  for (let t = 0; t < terms.length; t++) {
+    const seen = df[t] as number;
+    idf[t] = Math.log(1 + (n - seen + 0.5) / (seen + 0.5));
+  }
+
+  entriesScored += matched.length;
+  for (let m = 0; m < matched.length; m++) {
+    const d = matched[m] as number;
+    const start = docStart[d] as number;
+    const end = start + (docCount[d] as number);
+    // Depends only on the entry's length, so it is computed once per entry
+    // rather than once per term. Same arithmetic, same result.
+    const denom = K1 * (1 - B + (B * (docLength[d] as number)) / avgLength);
+    let score = 0;
+    for (let s = start; s < end; s++) {
+      const w = slotWeight[s] as number;
+      score += (idf[slotTerm[s] as number] as number) * ((w * (K1 + 1)) / (w + denom));
+    }
+    const all = (matchedLowered[m] as string[]).join("\n");
+    results[d] = {
+      score,
+      tier: tierOf(score, phrase, terms, all),
+      fields: matchedFields[m] as FindField[],
+    };
+  }
+  for (let d = 0; d < n; d++) {
+    // No query term in this entry: the reference's score is 0 by construction,
+    // which forces tier 0 and no matching fields without looking at the text.
+    if (docCount[d] === 0) results[d] = { score: 0, tier: 0, fields: [] };
+  }
+  return results;
 }
 
 /** The pre-inverted-index scorer: one full pass over every entry per query term
