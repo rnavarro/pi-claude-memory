@@ -75,25 +75,182 @@ export interface RankResult {
   fields: FindField[];
 }
 
+/** The entry's searchable fields, in the order they are displayed. */
+function fieldsOf(e: RankInput): [FindField, string][] {
+  const out: [FindField, string][] = [
+    ["title", e.title],
+    ["summary", e.summary],
+    ["filename", e.filename],
+  ];
+  if (e.body !== null) out.push(["body", e.body]);
+  return out;
+}
+
+/** The query as written, whitespace-collapsed, for the exact-phrase tier. */
+function phraseOf(query: string): string {
+  return query.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+/** Which exact tier a scored entry earns. The tiers use substring matching over
+ * the raw text, which is what find_memory's all-words mode always did, so every
+ * hit that mode found still ranks above a partial match. */
+function tierOf(score: number, phrase: string, terms: readonly string[], all: string): 0 | 1 | 2 {
+  return score > 0 && phrase.length > 0 && all.includes(phrase)
+    ? 2
+    : score > 0 && terms.every((t) => all.includes(t))
+      ? 1
+      : 0;
+}
+
+/** Counters for the work one ranking call did, so the equivalence test can
+ * observe which loop ran instead of inferring it from a wall clock.
+ *
+ * `termDocProbes` counts entry x term membership tests used to derive document
+ * frequencies: the reference scan makes one per term per entry. `entriesScored`
+ * counts entries whose scoring loop ran at all. Neither is a diagnostic for
+ * operators; nothing reads them outside `test/find-rank.test.ts`. */
+export interface FindRankStats {
+  termDocProbes: number;
+  entriesScored: number;
+}
+
+let termDocProbes = 0;
+let entriesScored = 0;
+
+/** Work counters for the scorer since the last reset. */
+export function findRankStats(): FindRankStats {
+  return { termDocProbes, entriesScored };
+}
+
+export function resetFindRankStats(): void {
+  termDocProbes = 0;
+  entriesScored = 0;
+}
+
 /** Rank every entry against `query`. Returns one result per input, in input
  * order; callers sort. IDF is computed over `inputs`, i.e. per call over the
- * store being searched. */
+ * store being searched.
+ *
+ * One pass over the entries builds the inverted index: per query term, the
+ * documents holding it and the term's weight in each, in the order the term
+ * first appeared in that entry. Document frequency is then the posting's
+ * length, so IDF costs O(terms) instead of one full scan of the entries per
+ * term, and only entries that contain a query term are scored at all. The same
+ * entry x term pairs are summed in the same order as the reference scan, so the
+ * scores are identical to the last bit rather than merely close. */
 export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
+  const terms = queryTerms(query);
+  const n = inputs.length;
+  const phrase = phraseOf(query);
+  const results: RankResult[] = new Array(n);
+  if (n === 0) return results;
+
+  // Query term -> its index in `terms` (queryTerms already deduplicated, so no
+  // term appears twice and the index is stable).
+  const termIndex = new Map<string, number>();
+  for (let i = 0; i < terms.length; i++) termIndex.set(terms[i] as string, i);
+
+  // The postings, flat: entry `d` owns slots [docStart[d], docStart[d] + docCount[d]),
+  // pushed in entry order and, within an entry, in term-first-seen order.
+  const slotTerm: number[] = [];
+  const slotWeight: number[] = [];
+  const docStart = new Int32Array(n);
+  const docCount = new Int32Array(n);
+  const docLength = new Float64Array(n);
+  const matched: number[] = [];
+  const matchedFields: FindField[][] = [];
+  const matchedLowered: string[][] = [];
+
+  // Reused across entries: an entry's term frequencies are copied into the
+  // postings as it is read, so no Map per entry is retained.
+  const tf = new Map<string, number>();
+  let totalLength = 0;
+  for (let d = 0; d < n; d++) {
+    const e = inputs[d] as RankInput;
+    tf.clear();
+    let length = 0;
+    const hitFields: FindField[] = [];
+    const lowered: string[] = [];
+    for (const [field, text] of fieldsOf(e)) {
+      const w = FIELD_WEIGHT[field];
+      const low = text.toLowerCase();
+      lowered.push(low);
+      const tokens = tokenize(low);
+      length += w * tokens.length;
+      let hit = false;
+      for (const tok of tokens) {
+        if (!termIndex.has(tok)) continue;
+        tf.set(tok, (tf.get(tok) ?? 0) + w);
+        hit = true;
+      }
+      if (hit) hitFields.push(field);
+    }
+    docLength[d] = length;
+    totalLength += length;
+    if (tf.size === 0) continue;
+    matched.push(d);
+    docStart[d] = slotTerm.length;
+    docCount[d] = tf.size;
+    matchedFields.push(hitFields);
+    matchedLowered.push(lowered);
+    for (const [t, w] of tf) {
+      slotTerm.push(termIndex.get(t) as number);
+      slotWeight.push(w);
+    }
+  }
+
+  // Total length is summed in entry order, as the reference does, so the average
+  // (and everything scaled by it) is bit-identical.
+  const avgLength = totalLength / n || 1;
+
+  const df = new Int32Array(terms.length);
+  for (let s = 0; s < slotTerm.length; s++) df[slotTerm[s] as number]++;
+  const idf = new Float64Array(terms.length);
+  for (let t = 0; t < terms.length; t++) {
+    const seen = df[t] as number;
+    idf[t] = Math.log(1 + (n - seen + 0.5) / (seen + 0.5));
+  }
+
+  entriesScored += matched.length;
+  for (let m = 0; m < matched.length; m++) {
+    const d = matched[m] as number;
+    const start = docStart[d] as number;
+    const end = start + (docCount[d] as number);
+    // Depends only on the entry's length, so it is computed once per entry
+    // rather than once per term. Same arithmetic, same result.
+    const denom = K1 * (1 - B + (B * (docLength[d] as number)) / avgLength);
+    let score = 0;
+    for (let s = start; s < end; s++) {
+      const w = slotWeight[s] as number;
+      score += (idf[slotTerm[s] as number] as number) * ((w * (K1 + 1)) / (w + denom));
+    }
+    const all = (matchedLowered[m] as string[]).join("\n");
+    results[d] = {
+      score,
+      tier: tierOf(score, phrase, terms, all),
+      fields: matchedFields[m] as FindField[],
+    };
+  }
+  for (let d = 0; d < n; d++) {
+    // No query term in this entry: the reference's score is 0 by construction,
+    // which forces tier 0 and no matching fields without looking at the text.
+    if (docCount[d] === 0) results[d] = { score: 0, tier: 0, fields: [] };
+  }
+  return results;
+}
+
+/** The pre-inverted-index scorer: one full pass over every entry per query term
+ * to count document frequencies, then a second pass that scans each entry's term
+ * frequencies. Kept as the reference the equivalence test compares against, so a
+ * change to the scoring maths cannot pass by being identical to itself. Slow by
+ * construction (O(terms x entries)) and never used in production. */
+export function rankEntriesScan(query: string, inputs: RankInput[]): RankResult[] {
   const terms = queryTerms(query);
   // A Set for the per-token membership test: a review chunk used as the query
   // carries thousands of terms, and a linear scan per token made ranking a
   // large store quadratic in practice.
   const termSet = new Set(terms);
-  const phrase = query.toLowerCase().trim().replace(/\s+/g, " ");
-  const fieldsOf = (e: RankInput): [FindField, string][] => {
-    const out: [FindField, string][] = [
-      ["title", e.title],
-      ["summary", e.summary],
-      ["filename", e.filename],
-    ];
-    if (e.body !== null) out.push(["body", e.body]);
-    return out;
-  };
+  const phrase = phraseOf(query);
 
   // Per entry: weighted term frequencies, weighted length, and which fields hit.
   const docs = inputs.map((e) => {
@@ -122,26 +279,19 @@ export function rankEntries(query: string, inputs: RankInput[]): RankResult[] {
   const avgLength = n > 0 ? docs.reduce((s, d) => s + d.length, 0) / n || 1 : 1;
   const idf = new Map<string, number>();
   for (const t of terms) {
+    termDocProbes += n;
     const df = docs.filter((d) => d.tf.has(t)).length;
     idf.set(t, Math.log(1 + (n - df + 0.5) / (df + 0.5)));
   }
 
+  entriesScored += n;
   return docs.map((d) => {
     let score = 0;
     for (const [t, f] of d.tf) {
       const norm = f + K1 * (1 - B + (B * d.length) / avgLength);
       score += (idf.get(t) ?? 0) * ((f * (K1 + 1)) / norm);
     }
-    // The exact tiers use substring matching over the raw text, which is what
-    // find_memory's all-words mode always did, so every hit that mode found
-    // still ranks above a partial match.
-    const all = d.lowered.join("\n");
-    const tier: 0 | 1 | 2 =
-      score > 0 && phrase.length > 0 && all.includes(phrase)
-        ? 2
-        : score > 0 && terms.every((t) => all.includes(t))
-          ? 1
-          : 0;
+    const tier = tierOf(score, phrase, terms, d.lowered.join("\n"));
     return { score, tier, fields: d.hitFields };
   });
 }
