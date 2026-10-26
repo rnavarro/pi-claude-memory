@@ -9,7 +9,7 @@
 // Fire-and-forget: never blocks the user's turn. All errors are caught and
 // recorded in the debug log.
 
-import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Api, Context, Model, TranscriptContext } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -20,6 +20,7 @@ import { rankEntries } from "./find-rank.js";
 import { parseMemoryFile } from "./frontmatter.js";
 import { parseIndexFile } from "./index-parser.js";
 import { resolveWriteTarget, slugify, writeMemory } from "./memory-writer.js";
+import { createPathCache } from "./path-cache.js";
 import { createProjectMemoryDir, resolveMemoryDirs } from "./resolver.js";
 import type { MemoryDir, ResolveResult } from "./types.js";
 
@@ -763,21 +764,25 @@ function topicCreatedAt(filePath: string): number | null {
  * supersession is never blocked by the budget. */
 export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: string): string {
   const lines: string[] = [];
+  // ONE path cache for this review pass, shared by the parse and the ownership
+  // test below. Without it the parse resolved every href (a realpathSync each)
+  // and the ownership test then resolved every entry AGAIN to compare it with
+  // the store root — the second most expensive frame in the stall profile, on a
+  // store whose index holds a few hundred entries. Sharing the cache means the
+  // second ask for an already-resolved path costs a Map lookup.
+  const pathCache = createPathCache();
   // Both sides of the ownership test are canonicalized: entry.filePath comes
-  // from resolveHref, which realpath's the target, while MemoryDir.dir is built
-  // lexically from homedir(). With a symlinked store component (a
+  // from resolveHref, which canonicalizes the target, while MemoryDir.dir is
+  // built lexically from homedir(). With a symlinked store component (a
   // dotfiles-managed ~/.claude) a lexical prefix test fails on every entry and
   // every external entry would look local — the opposite of the intent.
   const canonicalRoots = new Map<MemoryDir, string>();
   const canonicalDir = (dir: MemoryDir): string => {
     const cached = canonicalRoots.get(dir);
     if (cached !== undefined) return cached;
-    let root: string;
-    try {
-      root = realpathSync(dir.dir);
-    } catch {
-      root = dir.dir; // missing store — the lexical path is all we have
-    }
+    // canonicalDir, not raw realpath: one realpath per store per pass, with the
+    // lexical path as the fallback for a store that does not exist yet.
+    const root = pathCache.canonicalDir(dir.dir);
     canonicalRoots.set(dir, root);
     return root;
   };
@@ -789,12 +794,10 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
    * this store, so advertising an external stem would invite overwriting an
    * unrelated local file whose stem matches. */
   const isOwnedBy = (filePath: string, dir: MemoryDir): boolean => {
-    let canonicalPath = filePath;
-    try {
-      canonicalPath = realpathSync(filePath);
-    } catch {
-      // Missing target keeps the lexical path (resolveHref does the same).
-    }
+    // Missing target keeps the lexical path (resolveHref does the same). For a
+    // path the parse just resolved this is a cache hit, so the ownership test
+    // adds no syscall per entry.
+    const canonicalPath = pathCache.realpathOf(filePath) ?? filePath;
     const root = canonicalDir(dir);
     return canonicalPath === root || canonicalPath.startsWith(`${root}/`);
   };
@@ -802,7 +805,7 @@ export function buildExistingIndexSummary(resolved: ResolveResult, chunk?: strin
   const dir = resolved.project;
   if (dir) {
     try {
-      const parsed = parseIndexFile(dir);
+      const parsed = parseIndexFile(dir, pathCache);
       if (parsed && parsed.entries.length > 0) {
         // EVERY local entry is listed by identity. The previous slice(0, 50)
         // hid the rest from the reviewer permanently on a large store (this
