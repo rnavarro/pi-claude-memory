@@ -253,10 +253,10 @@ describe("the topic memo is bounded", () => {
   const stat = (mtimeMs: number, size: number, ino = 1) => ({ mtimeMs, size, ino });
 
   it("evicts oldest entries to stay within its byte budget", () => {
-    // One entry ("word") estimates at 2*(4+4) + 15 = 31 bytes, so this holds
-    // two of the six.
-    const cache = createTopicCache({ maxBytes: 70 });
-    for (let i = 0; i < 6; i++) cache.set(`/store/t${i}.md`, stat(1000 + i, 4), text("word"));
+    // One entry ("word") estimates at 192 (ENTRY_BYTES) + 2*(4+4) + 15 = 223
+    // bytes, so this holds two of the six.
+    const cache = createTopicCache({ maxBytes: 500 });
+    for (let i = 0; i < 6; i++) cache.set(`/store/t${i}.md`, stat(1000 + i, 4), text("word"), null);
 
     const retained = [...Array(6).keys()].filter(
       (i) => cache.get(`/store/t${i}.md`, stat(1000 + i, 4)) !== null,
@@ -264,21 +264,34 @@ describe("the topic memo is bounded", () => {
     expect(retained.length).toBeLessThan(6);
     // Whatever survives is the newest set, never an arbitrary hole in the middle.
     expect(retained).toEqual(retained.map((_r, i) => retained[0] + i));
-    expect(cache.stats().bytes).toBeLessThanOrEqual(70);
+    expect(cache.stats().bytes).toBeLessThanOrEqual(500);
+  });
+
+  it("bounds an entry that holds only a frontmatter type", () => {
+    // The publish path records types, not bodies. Those entries retain no text,
+    // so without the fixed per-entry charge they would sit under the byte budget
+    // forever and the "bounded" claim would be about text only.
+    const cache = createTopicCache({ maxBytes: 500 });
+    for (let i = 0; i < 6; i++) cache.setType(`/store/p${i}.md`, stat(i, 5), "reference");
+    expect(cache.stats().entries).toBeLessThan(6);
+    expect(cache.stats().bytes).toBeLessThanOrEqual(500);
+    // An evicted type is a miss, whose fallback is a real read, not a verdict.
+    expect(cache.getType("/store/p0.md", stat(0, 5))).toBeNull();
+    expect(cache.getType("/store/p5.md", stat(5, 5))?.type).toBe("reference");
   });
 
   it("serves an evicted entry on a miss, so results never depend on eviction", () => {
-    const cache = createTopicCache({ maxBytes: 40 }); // exactly one 31-byte entry
-    cache.set("/store/a.md", stat(1, 2), text("aa"));
-    cache.set("/store/b.md", stat(2, 2), text("bb"));
+    const cache = createTopicCache({ maxBytes: 250 }); // exactly one 223-byte entry
+    cache.set("/store/a.md", stat(1, 2), text("aa"), null);
+    cache.set("/store/b.md", stat(2, 2), text("bb"), null);
     expect(cache.get("/store/a.md", stat(1, 2))).toBeNull(); // evicted
-    cache.set("/store/a.md", stat(1, 2), text("aa")); // repopulated by a re-read
+    cache.set("/store/a.md", stat(1, 2), text("aa"), null); // repopulated by a re-read
     expect(cache.get("/store/a.md", stat(1, 2))?.body).toBe("aa");
   });
 
   it("misses when the mtime, the size or the inode changes", () => {
     const cache = createTopicCache();
-    cache.set("/store/x.md", stat(10, 5, 7), text("hello"));
+    cache.set("/store/x.md", stat(10, 5, 7), text("hello"), null);
     expect(cache.get("/store/x.md", stat(10, 5, 7))?.body).toBe("hello");
     expect(cache.get("/store/x.md", stat(11, 5, 7))).toBeNull();
     expect(cache.get("/store/x.md", stat(10, 6, 7))).toBeNull();
@@ -287,7 +300,7 @@ describe("the topic memo is bounded", () => {
 
   it("drops an entry on demand, so a write from this process cannot be served stale", () => {
     const cache = createTopicCache();
-    cache.set("/store/y.md", stat(10, 5), text("hello"));
+    cache.set("/store/y.md", stat(10, 5), text("hello"), null);
     cache.invalidate("/store/y.md");
     expect(cache.get("/store/y.md", stat(10, 5))).toBeNull();
   });
@@ -297,7 +310,7 @@ describe("the topic memo is bounded", () => {
     // tokenised body. If these ever diverge the search silently changes.
     const cache = createTopicCache();
     const raw = "Mixed CASE: 51820/udp — near-miss, 2 of them.\nSecond line.";
-    cache.set("/store/z.md", stat(1, raw.length), text(raw));
+    cache.set("/store/z.md", stat(1, raw.length), text(raw), "reference");
     const got = cache.get("/store/z.md", stat(1, raw.length));
     expect(got?.prepared.lowered).toBe(raw.toLowerCase());
     expect(got?.prepared.tokens).toEqual(raw.toLowerCase().match(/[a-z0-9]+/g));
