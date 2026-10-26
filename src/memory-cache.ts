@@ -13,9 +13,24 @@
 //
 //   topicTextCache     body text per topic file, already lowercased and
 //                      tokenised the way rankEntries consumes it, so a repeat
-//                      query re-reads and re-tokenises nothing.
+//                      query re-reads and re-tokenises nothing. The same entry
+//                      also holds the file's frontmatter `type` — see below.
 //   cachedParseIndex   the parsed MEMORY.md, so a repeat query does not re-read
 //                      554 KB and re-resolve 2,767 hrefs (one lstat each).
+//
+// The type facet exists for the WRITE path. Every publish asks the fit planner
+// for `isRule()` once per distinct topic, and the writer answered each of those
+// by reading and parsing the whole topic file to learn one frontmatter field.
+// Three consecutive live stall reports put the busiest frame of a 336-456 ms
+// event-loop delay inside exactly that chain (readFileUtf8 <- readFileSync <-
+// topicIsRule <- isRule <- ruleOf <- clusterOfFile <- fitIndexToExcerpt <-
+// publish), at 16-19% of the slice. Both facets come from one parse of one
+// read, so they share an entry and a freshness key: whichever path reads a
+// topic first fills in what it learned, and neither can be served for a version
+// the other has seen expire. Measured on a copy of the live store: a second
+// publish in the same process drops from 2,797 topic reads to 1 (the one topic
+// it just wrote) while its stat count is unchanged, and from 99.3 ms to 57.7 ms
+// wall (median of 5 runs, load average 3.4-4.4).
 //
 // What is retained, and what the ceiling is — this is a long-lived interactive
 // process, and an unbounded per-store token cache would be a slower leak than
@@ -25,11 +40,16 @@
 //     token. The token STRINGS are shared through an intern table, so a token
 //     that occurs in 500 entries is stored once. Estimated cost per entry is
 //     `2 * (body.length + lowered.length) + 15 * tokens.length` bytes — see
-//     estimatedBytes for the coefficients and how they were measured.
+//     estimatedBytes for the coefficients and how they were measured — plus a
+//     fixed ENTRY_BYTES for the entry itself. That fixed charge is what keeps
+//     the budget meaningful for a frontmatter-only entry, which retains no body
+//     at all: without it, a long-lived process that touched many topics would
+//     hold one map slot per path under a byte budget it never filled.
 //   * `maxBytes` (default 24 MiB estimated) caps the entries. Eviction is
 //     insertion-ordered (FIFO) — no touch-on-read bookkeeping, so a hit costs
-//     nothing. The live store (2,768 topics, 2.4 MiB of bodies, 289,611
-//     tokens) estimates at 11.4 MB.
+//     nothing. The live store (2,796 topics, 2.4 MiB of bodies) estimates at
+//     11.5 MiB / 12.1 MB: 10.99 MiB of body text plus 0.51 MiB of the per-entry
+//     charge (4,312 bytes per topic on average).
 //   * the intern table is capped separately (200,000 distinct tokens). Past
 //     that cap the whole memo is dropped: rare, correct, and only ever costs a
 //     cold first query.
@@ -66,7 +86,7 @@
 import { lstatSync } from "node:fs";
 import type { PreparedText } from "./find-rank.js";
 import { parseIndexFile } from "./index-parser.js";
-import type { MemoryDir, ParsedIndex } from "./types.js";
+import type { MemoryDir, MemoryType, ParsedIndex } from "./types.js";
 import { INDEX_MAX_BYTES } from "./types.js";
 
 /** What a cached body must match to be served. `ino` catches a same-size,
@@ -85,12 +105,27 @@ export interface CachedTopicText {
   prepared: PreparedText;
 }
 
+/** The one frontmatter field the write path needs, from the same parse that
+ * produced a {@link CachedTopicText}. */
+export interface CachedTopicType {
+  /** `parseMemoryContent(...).type` — the declared type, or null when the file
+   * declares none and its name does not imply one. */
+  type: MemoryType;
+}
+
 export interface TopicCache {
-  /** The cached text, or null when absent or describing a different version. */
+  /** The cached text, or null when absent, describing a different version, or
+   * cached by a caller that only recorded the frontmatter type. */
   get(filePath: string, facts: FileFacts): CachedTopicText | null;
-  /** Retain one body under `facts`. The stored arrays are frozen, so a caller
-   * that keeps the reference cannot mutate what a later reader sees. */
-  set(filePath: string, facts: FileFacts, text: CachedTopicText): void;
+  /** The cached frontmatter type, or null on the same conditions as {@link get}. */
+  getType(filePath: string, facts: FileFacts): CachedTopicType | null;
+  /** Retain one body under `facts`, plus the frontmatter type from the same
+   * parse. The stored arrays are frozen, so a caller that keeps the reference
+   * cannot mutate what a later reader sees. */
+  set(filePath: string, facts: FileFacts, text: CachedTopicText, type: MemoryType): void;
+  /** Retain just the frontmatter type under `facts` — what the write path's rule
+   * check records, so a publish does not pay for a body no query asked for. */
+  setType(filePath: string, facts: FileFacts, type: MemoryType): void;
   /** Drop one file: what a write from this process calls, so a rewrite cannot
    * be served from a body read before it. */
   invalidate(filePath: string): void;
@@ -115,6 +150,11 @@ export const TOPIC_CACHE_MAX_INTERNED = 200_000;
  * (12.4 MB retained with tokens, 8.2 MB with bodies and lowered text alone),
  * i.e. an 8-byte array slot plus a share of the shared string table. */
 const TOKEN_BYTES = 15;
+/** Retained bytes of an entry that are not its text: the map slot, the absolute
+ * path key, the facts and the two facet objects. Charged to every entry so an
+ * entry holding only a frontmatter type (a few bytes) is still bounded by the
+ * byte budget rather than by the number of paths a process happens to touch. */
+const ENTRY_BYTES = 192;
 /** Characters are not bytes: the measured store keeps 3.56 M chars of body and
  * lowered text in 8.0 MB, so V8 held them as two-byte strings. Counting two
  * bytes per character keeps this an over-estimate rather than an under-estimate. */
@@ -122,6 +162,7 @@ const CHARS_TO_BYTES = 2;
 
 function estimatedBytes(text: CachedTopicText): number {
   return (
+    ENTRY_BYTES +
     CHARS_TO_BYTES * (text.body.length + text.prepared.lowered.length) +
     TOKEN_BYTES * text.prepared.tokens.length
   );
@@ -129,7 +170,10 @@ function estimatedBytes(text: CachedTopicText): number {
 
 interface Entry {
   facts: FileFacts;
-  text: CachedTopicText;
+  /** Body facet, present once a search prepared this version. */
+  text: CachedTopicText | null;
+  /** Frontmatter facet, present once anything parsed this version. */
+  frontmatter: CachedTopicType | null;
   bytes: number;
 }
 
@@ -187,36 +231,78 @@ export function createTopicCache(
     return Object.freeze(out);
   };
 
+  /** The entry, or null when absent or holding a different version of the file
+   * (which is dropped, so the caller's re-read is recorded cleanly). */
+  const live = (filePath: string, facts: FileFacts): Entry | null => {
+    const entry = entries.get(filePath);
+    if (!entry) return null;
+    if (!sameFacts(entry.facts, facts)) {
+      // Changed on disk: hold the budget while the caller re-reads it.
+      drop(filePath);
+      return null;
+    }
+    return entry;
+  };
+
+  const evictToBudget = (): void => {
+    for (const oldest of entries.keys()) {
+      if (bytes <= maxBytes) break;
+      drop(oldest);
+    }
+  };
+
   return {
     get(filePath, facts) {
-      const entry = entries.get(filePath);
-      if (!entry) return null;
-      if (!sameFacts(entry.facts, facts)) {
-        // Changed on disk: hold the budget while the caller re-reads it.
-        drop(filePath);
-        return null;
-      }
-      return entry.text;
+      return live(filePath, facts)?.text ?? null;
     },
-    set(filePath, facts, text) {
-      drop(filePath);
+    getType(filePath, facts) {
+      return live(filePath, facts)?.frontmatter ?? null;
+    },
+    set(filePath, facts, text, type) {
       const size = estimatedBytes(text);
       // Size is measured before interning so a file that will not be cached
       // cannot leave its tokens behind in the shared table.
-      if (size > maxBytes) return; // never cache something that alone blows the budget
-      const frozen: CachedTopicText = Object.freeze({
+      if (size > maxBytes) {
+        drop(filePath); // never cache something that alone blows the budget
+        return;
+      }
+      const frozenText: CachedTopicText = Object.freeze({
         body: text.body,
         prepared: Object.freeze({
           lowered: text.prepared.lowered,
           tokens: intern(text.prepared.tokens),
         }),
       });
-      entries.set(filePath, { facts, text: frozen, bytes: size });
-      bytes += size;
-      for (const oldest of entries.keys()) {
-        if (bytes <= maxBytes) break;
-        drop(oldest);
+      const frontmatter: CachedTopicType = Object.freeze({ type });
+      // Read the entry AFTER interning: filling the intern table past its cap
+      // clears every entry, so a reference taken before it can be stale.
+      const sameVersion = live(filePath, facts);
+      if (sameVersion) {
+        // Same version, new facet: keep the FIFO slot rather than moving a busy
+        // entry to the young end of the eviction order.
+        bytes += size - sameVersion.bytes;
+        sameVersion.text = frozenText;
+        sameVersion.frontmatter = frontmatter;
+        sameVersion.bytes = size;
+      } else {
+        entries.set(filePath, { facts, text: frozenText, frontmatter, bytes: size });
+        bytes += size;
       }
+      evictToBudget();
+    },
+    setType(filePath, facts, type) {
+      const frontmatter: CachedTopicType = Object.freeze({ type });
+      const sameVersion = live(filePath, facts);
+      if (sameVersion) {
+        // Same version: record the type and leave the body (and the FIFO slot)
+        // alone. Neither facet can disagree with the other — both come from one
+        // parse of the same bytes.
+        sameVersion.frontmatter = frontmatter;
+        return;
+      }
+      entries.set(filePath, { facts, text: null, frontmatter, bytes: ENTRY_BYTES });
+      bytes += ENTRY_BYTES;
+      evictToBudget();
     },
     invalidate(filePath) {
       drop(filePath);

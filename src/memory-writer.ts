@@ -69,22 +69,93 @@ export interface WriteMemoryRequest {
   allowOverwrite: boolean;
 }
 
+/** Bytes of topic frontmatter the rule check is willing to read. A standing
+ * rule is a short directive, so a file past this is not one — and the cap is
+ * what keeps the publish path's per-topic read from being an unbounded read of
+ * whatever the index happens to link. */
+export const RULE_TYPE_MAX_BYTES = 64 * 1024;
+
+/** The store's slug convention for a rule, which the planner also uses itself. */
+const RULE_SLUG = /^(feedback|user)[-_]/i;
+
+/** The frontmatter type, as a rule verdict. `type === null` hands the answer to
+ * the slug convention — one function so a cached type and a fresh read cannot
+ * be judged differently. */
+function typeIsRule(type: MemoryType, bySlug: boolean): boolean {
+  return type === null ? bySlug : type === "feedback" || type === "user";
+}
+
+/** The lstat that decides whether a topic may be read at all: a plain regular
+ * file (never a symlink, so a link cannot point the read outside the store)
+ * within the size cap. Null means refused — and a refused file is never served
+ * from the cache, because this runs before the cache is consulted. */
+function ruleSourceStat(p: string, cache: PathCache): import("node:fs").Stats | null {
+  const st = cache.lstatOf(p);
+  if (st === null || !st.isFile() || st.size > RULE_TYPE_MAX_BYTES) return null;
+  return st;
+}
+
 /** Whether a topic is a standing rule (frontmatter type feedback or user),
- * for the fit planner's demotion order. Reads only a plain regular file of
- * modest size inside the store (lstat, so a symlink is never followed); on any
- * doubt it falls back to the slug convention the planner uses itself.
+ * for the fit planner's demotion order.
+ *
+ * This is asked once per DISTINCT topic on every publish — the fit planner runs
+ * over the whole index, not just the entry being written — and it used to answer
+ * by reading and parsing the whole topic file every time. Three consecutive live
+ * stall reports put 16-19% of a 336-456 ms event-loop delay inside that read. The
+ * frontmatter type is now memoised in memory-cache.ts on (abs path, mtime, size,
+ * inode), so after the first publish in a process this costs one lstat per topic
+ * and no read at all (the planner's recency stat is separate and unchanged).
+ *
+ * Freshness is the memo's, unchanged: a type that changed on disk — this
+ * process's own write (which also invalidates explicitly), Claude Code's, or a
+ * same-millisecond rewrite that only a new inode reveals — misses the memo and
+ * is re-read. A miss is always a real read through the same guards, so eviction
+ * can only cost time, never change a verdict.
  *
  * `cache` is the calling operation's path cache, so the lstat is shared with
  * everything else that operation touched and the answer is not recomputed for a
  * second line naming the same topic. */
-function topicIsRule(dir: MemoryDir, filename: string, cache: PathCache): boolean {
-  const bySlug = /^(feedback|user)[-_]/i.test(filename);
-  const p = join(dir.dir, basename(filename));
-  const st = cache.lstatOf(p);
-  if (st === null || !st.isFile() || st.size > 64 * 1024) return bySlug;
+export function topicIsRule(dir: MemoryDir, filename: string, cache: PathCache): boolean {
+  const bySlug = RULE_SLUG.test(filename);
+  // `resolve`, not `join`, so this is the same key the guarded body read in
+  // resolveTopicFileStat produces for the same file: one cache entry per topic,
+  // not two spellings of it.
+  const p = resolve(dir.dir, basename(filename));
+  const st = ruleSourceStat(p, cache);
+  if (st === null) return bySlug;
+
+  const facts = factsOf(st);
+  const cached = topicTextCache.getType(p, facts);
+  if (cached !== null) return typeIsRule(cached.type, bySlug);
+
   try {
     const type = parseMemoryContent(readFileSync(p, "utf8"), basename(filename), st.mtimeMs).type;
-    return type === null ? bySlug : type === "feedback" || type === "user";
+    // Keyed on the stat taken BEFORE the read, exactly as readTopicBody does:
+    // content read through a concurrent change is newer than its key, which can
+    // only force a redundant re-read later, never serve a stale type.
+    topicTextCache.setType(p, facts, type);
+    return typeIsRule(type, bySlug);
+  } catch {
+    // Unreadable, or unparseable frontmatter: the slug convention, as before.
+    // Nothing is cached, so a file that becomes readable is read next time.
+    return bySlug;
+  }
+}
+
+/** The pre-cache rule check: one lstat, then a read and a parse per call.
+ *
+ * Kept as the reference the equivalence test compares against, so a change to
+ * the cached path cannot pass by being identical to itself. Slow by
+ * construction (a whole file read to learn one field) and never used in
+ * production. */
+export function topicIsRuleScan(dir: MemoryDir, filename: string, cache: PathCache): boolean {
+  const bySlug = RULE_SLUG.test(filename);
+  const p = join(dir.dir, basename(filename));
+  const st = ruleSourceStat(p, cache);
+  if (st === null) return bySlug;
+  try {
+    const type = parseMemoryContent(readFileSync(p, "utf8"), basename(filename), st.mtimeMs).type;
+    return typeIsRule(type, bySlug);
   } catch {
     return bySlug;
   }
@@ -1188,12 +1259,15 @@ export function readTopicBody(
 
   try {
     const raw = readFileSync(filePath, "utf8");
-    const body = parseMemoryContent(raw, basename(filePath), facts.mtimeMs).body;
+    const parsed = parseMemoryContent(raw, basename(filePath), facts.mtimeMs);
+    const body = parsed.body;
     const prepared = prepareText(body);
     // Keyed on the stat taken BEFORE the read: content read through a
     // concurrent change is newer than its key, which can only force a
-    // redundant re-read later, never serve a stale body.
-    topicTextCache.set(filePath, facts, { body, prepared });
+    // redundant re-read later, never serve a stale body. The frontmatter type
+    // comes from the same parse, so the write path's rule check is answered for
+    // this file without a second read.
+    topicTextCache.set(filePath, facts, { body, prepared }, parsed.type);
     return { ok: true, body, prepared };
   } catch (err) {
     debugLog("writer.read_error", { name, tier: dir.tier, error: String(err) });
